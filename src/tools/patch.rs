@@ -37,3 +37,55 @@ impl Tool for ApplyPatch {
         else { bail!("patch failed:\n{}\n{}\nCheck that context lines match the current file contents (read_file first) or use edit_file.", out.stdout.trim(), out.stderr.trim()) }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static N: AtomicU64 = AtomicU64::new(0);
+    fn ctx() -> (ToolCtx, PathBuf) {
+        let d = std::env::temp_dir().join(format!("harness-patch-test-{}-{}", std::process::id(), N.fetch_add(1, Ordering::Relaxed)));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        (ToolCtx { workdir: d.clone(), timeout: std::time::Duration::from_secs(30), max_output: 16000, net: crate::config::NetConfig::default(), memory: None, subagent: None, redact_secrets: true, hooks: Default::default(), todos: Default::default() }, d)
+    }
+
+    #[tokio::test]
+    async fn applies_unified_diff() {
+        let (c, d) = ctx();
+        std::fs::write(d.join("app.txt"), "alpha\nbeta\ngamma\n").unwrap();
+        let patch = "--- a/app.txt\n+++ b/app.txt\n@@ -1,3 +1,3 @@\n alpha\n-beta\n+BETA\n gamma\n";
+        let out = ApplyPatch.call(json!({"patch": patch}), &c).await.unwrap();
+        assert!(out.text.contains("app.txt"), "{}", out.text);
+        let after = std::fs::read_to_string(d.join("app.txt")).unwrap();
+        assert_eq!(after, "alpha\nBETA\ngamma\n", "file should be patched");
+    }
+
+    #[tokio::test]
+    async fn mismatched_context_fails() {
+        let (c, d) = ctx();
+        std::fs::write(d.join("app.txt"), "alpha\nbeta\ngamma\n").unwrap();
+        let patch = "--- a/app.txt\n+++ b/app.txt\n@@ -1,3 +1,3 @@\n alpha\n-DELTA\n+BETA\n gamma\n";
+        let err = ApplyPatch.call(json!({"patch": patch}), &c).await.unwrap_err().to_string();
+        assert!(err.contains("patch failed"), "{}", err);
+        let after = std::fs::read_to_string(d.join("app.txt")).unwrap();
+        assert_eq!(after, "alpha\nbeta\ngamma\n", "file must be unchanged");
+    }
+
+    #[tokio::test]
+    async fn rejects_non_diff() {
+        let (c, _) = ctx();
+        let err = ApplyPatch.call(json!({"patch": "not a diff at all"}), &c).await.unwrap_err().to_string();
+        assert!(err.contains("unified diff"), "{}", err);
+    }
+
+    #[tokio::test]
+    async fn rejects_path_escape() {
+        let (c, _) = ctx();
+        let patch = "--- /etc/passwd\n+++ /etc/passwd\n@@ -1 +1 @@\n-x\n+y\n";
+        let err = ApplyPatch.call(json!({"patch": patch}), &c).await.unwrap_err().to_string();
+        assert!(err.contains("escapes workdir"), "{}", err);
+    }
+}
