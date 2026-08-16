@@ -7,7 +7,6 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunSummary { pub passed: usize, pub total: usize, pub per_task: BTreeMap<String, bool>, pub wall_secs: f64, pub tokens: u64 }
