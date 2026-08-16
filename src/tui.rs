@@ -117,7 +117,7 @@ fn pal() -> Pal {
 const SPINNER: [&str; 10] = ["✻", "✼", "✽", "✾", "✿", "❀", "✿", "✾", "✽", "✼"];
 const WORDS: [&str; 12] = ["Thinking", "Pondering", "Working", "Reasoning", "Cooking", "Tinkering", "Brewing", "Mulling", "Crunching", "Percolating", "Noodling", "Computing"];
 
-enum Msg { Title(String), Question(harness::permissions::Question, tokio::sync::oneshot::Sender<harness::permissions::Answer>), SubEnv(Arc<harness::agent::SubAgentEnv>), Policy(Arc<harness::permissions::Policy>), CcSession(Arc<harness::claude_code::ClaudeCodeSession>), CcSid(String), Block(Block), Ask(harness::permissions::ApprovalRequest, tokio::sync::oneshot::Sender<harness::permissions::Approval>), Ev(Event), Done(Result<(String, harness::agent::RunStats), String>), Sys(SysSample), CtxLen(u64), Pasted(Result<PathBuf, String>), Frames(Result<(PathBuf, f64, Vec<(f64, PathBuf)>), String>), Toolset(Arc<Toolset>), Catalog(Result<harness::plugins::Catalog, String>), Notice(String), Improve(harness::selfimprove::Stage) }
+enum Msg { Toast(String), Title(String), Question(harness::permissions::Question, tokio::sync::oneshot::Sender<harness::permissions::Answer>), SubEnv(Arc<harness::agent::SubAgentEnv>), Policy(Arc<harness::permissions::Policy>), CcSession(Arc<harness::claude_code::ClaudeCodeSession>), CcSid(String), Block(Block), Ask(harness::permissions::ApprovalRequest, tokio::sync::oneshot::Sender<harness::permissions::Approval>), Ev(Event), Done(Result<(String, harness::agent::RunStats), String>), Sys(SysSample), CtxLen(u64), Pasted(Result<PathBuf, String>), Frames(Result<(PathBuf, f64, Vec<(f64, PathBuf)>), String>), Toolset(Arc<Toolset>), Catalog(Result<harness::plugins::Catalog, String>), Notice(String), Improve(harness::selfimprove::Stage) }
 
 /// Video scrubber state (modal over the transcript).
 struct VideoPicker { path: PathBuf, duration: f64, frames: Vec<(f64, PathBuf, String)>, cur: usize, selected: std::collections::BTreeSet<usize>, loading: bool, error: Option<String> }
@@ -409,6 +409,10 @@ struct App {
     perm_mode: harness::permissions::Mode,
     vim: bool, vim_normal: bool,
     keymap: Keymap,
+    // mouse text selection (left-drag in the transcript) + toast
+    sel_anchor: Option<(u16, u16)>, sel_cur: Option<(u16, u16)>, sel_dragging: bool,
+    visible_text: Vec<String>,
+    toast: Option<(String, Instant)>,
     tool_view: String,               // summary | hidden | full
     tool_groups_open: std::collections::HashSet<usize>, // first block index of an expanded tool burst
     settings_open: bool, settings_cursor: usize,
@@ -450,7 +454,7 @@ pub async fn run(cfg: Config, resume: Option<String>) -> Result<()> {
         quit: false, restart: false, improve: None, improve_cancel: Default::default(), restart_at: None, tick: 0, word: 0, models: vec![],
         metrics: Metrics::new(0), panel: None, attachments: vec![], tool_previews: Default::default(),
         picker, images: Default::default(), img_seq: 0,
-        think_scroll: 0, toolset: None, perm_mode: harness::permissions::Mode::Auto, vim: false, vim_normal: false, keymap: Keymap::load(), tool_view: "summary".into(), tool_groups_open: Default::default(), settings_open: false, settings_cursor: 0, live_policy: None, cc_rate: None, extra_roots: vec![], wt_cwd: harness::worktree::new_cell(), cc: None, cc_last_session: None, compact_progress: None, session_meta: harness::sessions::Meta::default(), todos: Default::default(), inbox: Default::default(), event_log: None, pending_ask: None, pending_q: None, subenv: None, attached: None, video: None, strip_rects: vec![], tr_rect: Rect::default(), panel_rect: Rect::default(), tr_start: 0, line_map: vec![],
+        think_scroll: 0, toolset: None, perm_mode: harness::permissions::Mode::Auto, vim: false, vim_normal: false, keymap: Keymap::load(), sel_anchor: None, sel_cur: None, sel_dragging: false, visible_text: vec![], toast: None, tool_view: "summary".into(), tool_groups_open: Default::default(), settings_open: false, settings_cursor: 0, live_policy: None, cc_rate: None, extra_roots: vec![], wt_cwd: harness::worktree::new_cell(), cc: None, cc_last_session: None, compact_progress: None, session_meta: harness::sessions::Meta::default(), todos: Default::default(), inbox: Default::default(), event_log: None, pending_ask: None, pending_q: None, subenv: None, attached: None, video: None, strip_rects: vec![], tr_rect: Rect::default(), panel_rect: Rect::default(), tr_start: 0, line_map: vec![],
     };
     app.metrics.ctx_len = app.cfg.llm.context_budget_tokens.unwrap_or(0);
     app.perm_mode = app.cfg.permissions.mode;
@@ -642,12 +646,17 @@ impl App {
                 match m.kind {
                     MouseEventKind::ScrollUp => { if in_panel { self.think_scroll += 3; } else { self.scroll_up += 3; } }
                     MouseEventKind::ScrollDown => { if in_panel { self.think_scroll = self.think_scroll.saturating_sub(3); } else { self.scroll_up = self.scroll_up.saturating_sub(3); } }
-                    MouseEventKind::Down(MouseButton::Left) if !in_panel => {
-                        let r = self.tr_rect;
-                        if m.row >= r.y && m.row < r.y + r.height && m.column >= r.x && m.column < r.x + r.width {
-                            let line = self.tr_start + (m.row - r.y) as usize;
-                            if let Some(&(_, _, idx)) = self.line_map.iter().find(|(a, b, _)| line >= *a && line < *b) { self.toggle_fold(idx); }
+                    MouseEventKind::Down(MouseButton::Left) => { self.sel_anchor = Some((m.column, m.row)); self.sel_cur = Some((m.column, m.row)); self.sel_dragging = false; }
+                    MouseEventKind::Drag(MouseButton::Left) => { if self.sel_anchor.is_some() { self.sel_cur = Some((m.column, m.row)); self.sel_dragging = true; } }
+                    MouseEventKind::Up(MouseButton::Left) => {
+                        if let (Some(a), Some(c)) = (self.sel_anchor, self.sel_cur) {
+                            if self.sel_dragging && a != c { self.copy_selection(a, c); }
+                            else if !in_panel {
+                                let r = self.tr_rect;
+                                if m.row >= r.y && m.row < r.y + r.height { let line = self.tr_start + (m.row - r.y) as usize; if let Some(&(_, _, idx)) = self.line_map.iter().find(|(x, y, _)| line >= *x && line < *y) { self.toggle_fold(idx); } }
+                            }
                         }
+                        self.sel_anchor = None; self.sel_cur = None; self.sel_dragging = false;
                     }
                     _ => {}
                 }
@@ -889,7 +898,7 @@ impl App {
                 for (c, d) in COMMANDS { lines.push(format!("  {c:<14} {d}")); }
                 lines.push(String::new());
                 lines.push("Keys: enter send · alt+enter/ctrl+j newline · esc interrupt · ctrl+c clear/exit · ctrl+o expand tools · ctrl+t thinking · ctrl+p panel · ctrl+v paste image · ctrl+n next task · pgup/pgdn scroll · ↑/↓ history".into());
-                lines.push("Mouse: wheel/trackpad scrolls the transcript and the thinking panel; click a tool call, answer or thought to fold/unfold it. Hold shift (or fn/option in Terminal) to select text.".into());
+                lines.push("Mouse: wheel/trackpad scrolls; click a block to fold/unfold; left-drag selects text and copies it to the clipboard (toast confirms). Shift-drag (or fn/option in Terminal.app) uses the terminal's own selection.".into());
                 lines.push("Video: paste/drag a video (mp4/mov/webm/mkv/gif) or /video <path> → frame scrubber; select frames, enter attaches them as images with timestamps.".into());
                 lines.push("Images: ctrl+v pastes from the clipboard; typing or dragging an image path attaches it. Previews render as a color mosaic; the model sees the full image.".into());
                 self.blocks.push(Block::Banner(lines));
@@ -1139,7 +1148,8 @@ impl App {
                     "  pgup / pgdn, ctrl+↑/↓, mouse wheel   scroll transcript (wheel over the panel scrolls thinking)".into(),
                     "  y / a / n        answer a permission prompt (once / always / deny)".into(),
                     "  video scrubber:  ←/→ frames · space select · a all · enter attach · esc cancel".into(),
-                    "  text selection:  hold shift (kitty/wezterm/iterm) or fn/option (Terminal.app) while dragging".into(),
+                    "  left-drag        select text in the transcript → copied to the clipboard (toast)".into(),
+                    "  text selection:  shift-drag (kitty/wezterm/iterm) or fn/option (Terminal.app) = terminal-native selection".into(),
                 ]));
             }
             "/status" => {
@@ -1647,6 +1657,7 @@ impl App {
             Msg::Policy(p) => { p.set_mode(self.perm_mode); self.live_policy = Some(p); }
             Msg::SubEnv(e) => { self.subenv = Some(e); }
             Msg::Title(t) => { self.session_meta.title = t; self.save_session(); }
+            Msg::Toast(t) => { self.toast = Some((t, Instant::now())); }
             Msg::Question(q, tx) => {
                 let mut lines = vec![format!("❓ {}", q.question)];
                 for (i, o) in q.options.iter().enumerate() { lines.push(format!("   [{}] {}{}", i + 1, o.label, if o.description.is_empty() { String::new() } else { format!(" — {}", o.description) })); }
@@ -1769,6 +1780,30 @@ impl App {
             Event::Permission { tool, summary, decision } => { if decision.starts_with("denied") { self.blocks.push(Block::Error(format!("🔒 {tool}({}) {decision}", truncate(&summary, 80)))); } }
         }
     }
+    /// Extract the selected text from the visible transcript rows and put it on the clipboard.
+    fn copy_selection(&mut self, a: (u16, u16), c: (u16, u16)) {
+        let (mut p1, mut p2) = (a, c); if (p1.1, p1.0) > (p2.1, p2.0) { std::mem::swap(&mut p1, &mut p2); }
+        // rectangle vs stream: a drag within one column range across rows behaves like a stream selection (like terminals)
+        let mut out = Vec::new();
+        for row in p1.1..=p2.1 {
+            let Some(text) = self.visible_text.get(row as usize) else { continue };
+            let chars: Vec<char> = text.chars().collect();
+            let from = if row == p1.1 { p1.0 as usize } else { 0 };
+            let to = if row == p2.1 { (p2.0 as usize + 1).min(chars.len()) } else { chars.len() };
+            if from < to { out.push(chars[from..to].iter().collect::<String>().trim_end().to_string()); } else { out.push(String::new()); }
+        }
+        let text = out.join("\n").trim_end().to_string();
+        if text.is_empty() { return; }
+        let n = text.chars().count(); let lines = out.len();
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            let cmd = if cfg!(target_os = "macos") { "pbcopy" } else if cfg!(windows) { "clip" } else { "xclip -selection clipboard 2>/dev/null || wl-copy" };
+            let (prog, flag) = harness::sandbox::shell_program();
+            let mut c = tokio::process::Command::new(prog); c.arg(flag).arg(cmd).stdin(std::process::Stdio::piped());
+            match c.spawn() { Ok(mut ch) => { if let Some(mut si) = ch.stdin.take() { use tokio::io::AsyncWriteExt; let _ = si.write_all(text.as_bytes()).await; } let ok = ch.wait().await.map(|s| s.success()).unwrap_or(false); let _ = tx.send(Msg::Toast(if ok { format!("✓ copied {n} chars, {lines} line{}", if lines == 1 { "" } else { "s" }) } else { "✗ clipboard tool failed".into() })); } Err(e) => { let _ = tx.send(Msg::Toast(format!("✗ clipboard: {e}"))); } }
+        });
+    }
+
     /// Click on a block: fold/unfold it (a summarized tool burst opens/closes as a group).
     fn toggle_fold(&mut self, idx: usize) {
         if matches!(self.blocks.get(idx), Some(Block::Tool { .. })) && self.tool_view != "full" {
@@ -2020,6 +2055,25 @@ fn draw(f: &mut Frame, app: &mut App) {
     let pad = width.saturating_sub(lw + right.chars().count() + 1);
     st.push(Span::raw(" ".repeat(pad))); st.push(Span::styled(right, Style::default().fg(pal().dim)));
     f.render_widget(Paragraph::new(Line::from(st)), st_area);
+
+    // ── whole-screen text snapshot (for drag-to-copy) + selection highlight + toast ──
+    let full_area = f.area();
+    {
+        let buf = f.buffer_mut();
+        let mut rows: Vec<String> = Vec::with_capacity(full_area.height as usize);
+        for y in 0..full_area.height { let mut row = String::new(); for x in 0..full_area.width { let sym = buf[(x, y)].symbol(); if sym.is_empty() { row.push(' '); } else { row.push_str(sym); } } rows.push(row); }
+        app.visible_text = rows;
+        if let (Some(a), Some(c)) = (app.sel_anchor, app.sel_cur) {
+            if app.sel_dragging && a != c {
+                let (mut p1, mut p2) = (a, c); if (p1.1, p1.0) > (p2.1, p2.0) { std::mem::swap(&mut p1, &mut p2); }
+                for y in p1.1..=p2.1.min(full_area.height.saturating_sub(1)) {
+                    let x0 = if y == p1.1 { p1.0 } else { 0 }; let x1 = if y == p2.1 { p2.0 } else { full_area.width.saturating_sub(1) };
+                    for x in x0..=x1.min(full_area.width.saturating_sub(1)) { buf[(x, y)].set_style(Style::default().fg(Color::Black).bg(pal().cyan)); }
+                }
+            }
+        }
+    }
+    if let Some((t, at)) = &app.toast { if at.elapsed() < Duration::from_millis(2500) { let w = (t.chars().count() as u16 + 4).min(full_area.width); let r = Rect { x: full_area.width.saturating_sub(w + 1), y: full_area.height.saturating_sub(4), width: w, height: 1 }; f.render_widget(Paragraph::new(Span::styled(format!("  {t}  "), Style::default().fg(Color::Black).bg(pal().ok).bold())), r); } else { app.toast = None; } }
 }
 
 // ───────────────────────── settings panel ─────────────────────────
