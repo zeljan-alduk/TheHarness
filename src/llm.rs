@@ -123,6 +123,7 @@ pub struct Client {
     max_tokens: u32,
     aux_model: Option<String>,
     provider: Provider,
+    thinking_budget: Option<u32>,
 }
 
 impl Client {
@@ -144,6 +145,7 @@ impl Client {
             max_tokens: cfg.max_tokens,
             aux_model: cfg.aux_model.clone().filter(|m| !m.trim().is_empty()),
             provider,
+            thinking_budget: cfg.thinking_budget,
         })
     }
     pub fn provider(&self) -> Provider { self.provider }
@@ -327,6 +329,7 @@ impl Client {
         let (system, msgs) = to_anthropic_messages(messages);
         let a_tools: Vec<Value> = tools.iter().map(|t| json!({"name": t.function.name, "description": t.function.description, "input_schema": t.function.parameters})).collect();
         let mut body = json!({"model": self.model, "max_tokens": self.max_tokens, "messages": msgs, "stream": true, "temperature": self.temperature});
+        if let Some(b) = self.thinking_budget { if b > 0 { body["thinking"] = json!({"type": "enabled", "budget_tokens": b.max(1024)}); body.as_object_mut().unwrap().remove("temperature"); if self.max_tokens <= b { body["max_tokens"] = json!(b + 4096); } } }
         if !system.is_empty() { body["system"] = json!(system); }
         if !a_tools.is_empty() { body["tools"] = json!(a_tools); }
         let url = format!("{}/v1/messages", self.base_url.trim_end_matches("/v1"));

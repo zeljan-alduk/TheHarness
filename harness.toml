@@ -11,6 +11,8 @@ model = "qwen3.8-27b-mlx"
 # the harness bridges its own tools to it over MCP. In the TUI: /backend claude
 # provider = "claude-code"
 # model = "claude-fable-5"
+# Anthropic API with summarized thinking streamed back (Claude Code's headless mode hides thinking):
+# provider = "anthropic"   model = "claude-fable-5"   thinking_budget = 8000
 temperature = 0.2
 # Reasoning models spend a lot of this budget on thinking; keep it generous.
 max_tokens = 16384

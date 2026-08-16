@@ -80,6 +80,9 @@ pub struct LlmConfig {
     pub context_budget_tokens: Option<u64>,
     #[serde(default = "d_compact_frac")]
     pub compact_at_fraction: f64,
+    /// Anthropic API: enable extended thinking with this token budget (summarized thinking is streamed back).
+    #[serde(default)]
+    pub thinking_budget: Option<u32>,
     /// Optional smaller/faster model for auxiliary calls (memory reflection, compaction, consolidation).
     #[serde(default)]
     pub aux_model: Option<String>,

@@ -114,6 +114,8 @@ impl ClaudeCodeSession {
                     let ok = ev["subtype"] == "success" && !ev["is_error"].as_bool().unwrap_or(false);
                     stats.stop_reason = if ok { "done".into() } else { format!("error: {}", ev["subtype"].as_str().unwrap_or("?")) };
                     stats.wall_secs = secs;
+                    if let Some(mu) = ev["modelUsage"].as_object() { for (m, v) in mu { if let Some(w) = v["contextWindow"].as_u64() { sink.emit(&Event::ContextInfo { window: w, source: format!("Claude Code ({m})") }); } } }
+                    if let Some(th) = ev["usage"]["output_tokens_details"]["thinking_tokens"].as_u64() { if th > 0 { sink.emit(&Event::ThinkingStatus { est_tokens: th, done: true }); } }
                     if let Some(u) = ev["usage"].as_object() { let inp = u.get("input_tokens").and_then(|x| x.as_u64()).unwrap_or(0) + u.get("cache_read_input_tokens").and_then(|x| x.as_u64()).unwrap_or(0) + u.get("cache_creation_input_tokens").and_then(|x| x.as_u64()).unwrap_or(0); if inp > 0 { stats.prompt_tokens = inp; } if let Some(o) = u.get("output_tokens").and_then(|x| x.as_u64()) { stats.completion_tokens = o; } }
                     sink.emit(&Event::ModelResponse { prompt_tokens: stats.prompt_tokens, completion_tokens: stats.completion_tokens, ttft_secs: 0.0, secs, tool_calls: stats.tool_calls });
                     if let Some(c) = ev["total_cost_usd"].as_f64() { sink.emit(&Event::Memory { file: "claude-code".into(), section: "cost".into(), text: format!("this turn ≈ ${c:.4} (subscription: informational)") }); }
