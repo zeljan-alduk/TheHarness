@@ -133,6 +133,10 @@ pub struct LlmConfig {
     /// Optional smaller/faster model for auxiliary calls (memory reflection, compaction, consolidation).
     #[serde(default)]
     pub aux_model: Option<String>,
+    /// Tool calling for models/servers without a function-calling API: "auto" (default — native first,
+    /// switch to the text protocol when the server rejects tools), "on" (always shim), "off".
+    #[serde(default)]
+    pub tool_shim: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -273,6 +277,7 @@ impl Config {
             "llm.effort" => self.llm.effort = if val.is_empty() || val == "default" { None } else { Some(val.into()) },
             "llm.provider" => self.llm.provider = if val.is_empty() || val == "local" { None } else { Some(val.into()) },
             "llm.model" => self.llm.model = val.into(),
+            "llm.tool_shim" => self.llm.tool_shim = if val.is_empty() || val == "auto" { None } else { Some(val.into()) },
             "memory.auto_reflect" => self.memory.auto_reflect = b(val),
             "memory.enabled" => self.memory.enabled = b(val),
             "security.redact_secrets" => self.security.redact_secrets = b(val),

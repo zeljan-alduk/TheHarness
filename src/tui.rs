@@ -64,6 +64,8 @@ const SETTINGS: &[(&str, &str, &[&str], &str)] = &[
     ("ui.event_log", "Event log", &["on", "off"], "~/.config/harness/logs/<date>/"),
     ("ui.font_size", "Font size (pt)", &["0", "11", "12", "13", "14", "15", "16", "18", "20"], "0 = leave the terminal alone · ctrl+= / ctrl+- / ctrl+0 (kitty, iTerm2, Terminal.app)"),
     ("sandbox.mode", "Sandbox", &["none", "seatbelt", "bwrap"], "confine shell writes (macOS seatbelt / Linux bubblewrap)"),
+    ("checkpoints.enabled", "File checkpoints", &["on", "off"], "snapshot the working tree before every change so /undo and /rewind can restore it"),
+    ("llm.tool_shim", "Tool-call shim", &["auto", "on", "off"], "text <tool_call> protocol for servers/models without function calling (auto switches on demand)"),
     ("llm.provider", "Backend", &[], "change with /backend"),
     ("llm.model", "Model", &[], "change with /model or /backend"),
 ];
