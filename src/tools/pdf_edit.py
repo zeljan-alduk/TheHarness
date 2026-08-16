@@ -154,7 +154,7 @@ def save(doc, in_path, args, notes):
         if os.path.abspath(in_path) == out:
             out = None
     if out:
-        doc.save(out, garbage=3, deflate=True)
+        doc.save(out, garbage=4, deflate=True)
         return out
     # in place: keep a backup unless disabled, then rewrite (incremental keeps original bytes when possible)
     if args.get("backup", True):
@@ -168,7 +168,7 @@ def save(doc, in_path, args, notes):
         doc.save(in_path, incremental=True, encryption=fitz.PDF_ENCRYPT_KEEP)
     except Exception:
         tmp = in_path + ".tmp"
-        doc.save(tmp, garbage=3, deflate=True)
+        doc.save(tmp, garbage=4, deflate=True)
         os.replace(tmp, in_path)
     return in_path
 
