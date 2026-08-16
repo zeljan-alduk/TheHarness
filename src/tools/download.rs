@@ -9,7 +9,13 @@ use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::os::unix::fs::FileExt;
+#[cfg(unix)] use std::os::unix::fs::FileExt;
+#[cfg(windows)] use std::os::windows::fs::FileExt;
+
+fn write_at(f: &std::fs::File, buf: &[u8], off: u64) -> std::io::Result<()> {
+    #[cfg(unix)] { f.write_all_at(buf, off) }
+    #[cfg(windows)] { let mut done = 0usize; while done < buf.len() { let n = f.seek_write(&buf[done..], off + done as u64)?; if n == 0 { return Err(std::io::Error::new(std::io::ErrorKind::WriteZero, "write zero")); } done += n; } Ok(()) }
+}
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -94,7 +100,7 @@ async fn run_segment(http: reqwest::Client, url: String, file: Arc<std::fs::File
                 let len = bytes.len() as u64;
                 let f = file.clone();
                 let o = off;
-                tokio::task::spawn_blocking(move || f.write_all_at(&bytes, o)).await??;
+                tokio::task::spawn_blocking(move || write_at(&f, &bytes, o)).await??;
                 off += len;
                 since_save += len;
                 { let mut s = state.lock().unwrap(); s.segments[idx].done = off - start; }

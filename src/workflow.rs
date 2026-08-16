@@ -39,14 +39,13 @@ pub struct WorkflowEnv { pub env: Arc<SubAgentEnv>, pub ctx: ToolCtx, pub sink: 
 
 pub fn dirs(workdir: &Path) -> Vec<PathBuf> {
     let mut v = Vec::new();
-    if let Ok(h) = std::env::var("HOME") { v.push(PathBuf::from(h).join(".config/harness/workflows")); }
+    v.push(crate::setup::config_dir().join("workflows"));
     v.push(workdir.join(".harness/workflows"));
     v
 }
 
 pub fn ensure_examples() {
-    let Ok(h) = std::env::var("HOME") else { return };
-    let d = PathBuf::from(h).join(".config/harness/workflows");
+    let d = crate::setup::config_dir().join("workflows");
     let _ = std::fs::create_dir_all(&d);
     let review = r#"name = "review"
 description = "Review the working-tree diff from three lenses in parallel, then merge into one prioritized list"

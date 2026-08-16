@@ -34,7 +34,7 @@ pub fn configure_seatbelt(enabled: bool, deny_network: bool, allow_write: Vec<St
     let _ = SEATBELT.set(if enabled { Some((deny_network, allow_write)) } else { None });
 }
 fn seatbelt_profile(cwd: &Path, deny_network: bool, extra: &[String]) -> String {
-    let home = std::env::var("HOME").unwrap_or_default();
+    let home = crate::setup::home_dir().display().to_string();
     let mut writable = vec![cwd.canonicalize().unwrap_or(cwd.to_path_buf()).display().to_string(), std::env::temp_dir().display().to_string(), "/private/tmp".into(), "/tmp".into(), format!("{home}/.config/harness"), format!("{home}/.cargo/registry"), format!("{home}/.cargo/git"), format!("{home}/.cache"), format!("{home}/.npm"), "/dev".into()];
     writable.extend(extra.iter().cloned());
     let allows: String = writable.iter().map(|p| format!("(subpath \"{}\")", p.replace('"', ""))).collect::<Vec<_>>().join(" ");
@@ -42,14 +42,26 @@ fn seatbelt_profile(cwd: &Path, deny_network: bool, extra: &[String]) -> String 
     format!("(version 1) (allow default) (deny file-write*) (allow file-write* {allows}) (allow file-write* (literal \"/dev/null\") (literal \"/dev/tty\") (regex #\"^/dev/tty\")) {net}")
 }
 
+/// The shell used for `bash` tool commands: /bin/sh on unix; on Windows Git Bash (`bash -c`) if
+/// installed (POSIX semantics the prompts assume), else `cmd /C`.
+pub fn shell_program() -> (String, &'static str) {
+    if cfg!(windows) {
+        for cand in ["C:\\Program Files\\Git\\bin\\bash.exe", "C:\\Program Files\\Git\\usr\\bin\\bash.exe"] { if Path::new(cand).exists() { return (cand.to_string(), "-c"); } }
+        if let Some(p) = crate::setup::which("bash") { return (p.display().to_string(), "-c"); }
+        return ("cmd".to_string(), "/C");
+    }
+    ("/bin/sh".to_string(), "-c")
+}
+
 pub async fn run_shell(cmd: &str, cwd: &Path, timeout: Duration, max_output: usize) -> Result<ProcOutput> {
     let start = std::time::Instant::now();
     let seatbelt = SEATBELT.get().cloned().flatten().filter(|_| cfg!(target_os = "macos") && Path::new("/usr/bin/sandbox-exec").exists());
+    let (prog, flag) = shell_program();
     let mut c = match &seatbelt {
-        Some((deny_net, extra)) => { let mut c = Command::new("/usr/bin/sandbox-exec"); c.arg("-p").arg(seatbelt_profile(cwd, *deny_net, extra)).arg("/bin/sh"); c }
-        None => Command::new("/bin/sh"),
+        Some((deny_net, extra)) => { let mut c = Command::new("/usr/bin/sandbox-exec"); c.arg("-p").arg(seatbelt_profile(cwd, *deny_net, extra)).arg(&prog); c }
+        None => Command::new(&prog),
     };
-    c.arg("-c").arg(cmd)
+    c.arg(flag).arg(cmd)
         .current_dir(cwd)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -62,10 +74,10 @@ pub async fn run_shell(cmd: &str, cwd: &Path, timeout: Duration, max_output: usi
     c.env("HARNESS", "1").env("CI", "1").env("GIT_TERMINAL_PROMPT", "0").env("TERM", "dumb");
     c.env("PATH", crate::setup::path_with_bin_dir(cwd));
     // New session => own process group, so we can kill the whole tree on timeout.
-    unsafe { c.pre_exec(|| { libc::setsid(); Ok(()) }); }
+    #[cfg(unix)] unsafe { c.pre_exec(|| { libc::setsid(); Ok(()) }); }
 
     let child = c.spawn()?;
-    let pid = child.id().map(|p| p as i32);
+    #[cfg(unix)] let pid = child.id().map(|p| p as i32);
     match tokio::time::timeout(timeout, child.wait_with_output()).await {
         Ok(out) => {
             let out = out?;
@@ -78,7 +90,8 @@ pub async fn run_shell(cmd: &str, cwd: &Path, timeout: Duration, max_output: usi
             })
         }
         Err(_) => {
-            if let Some(pid) = pid { unsafe { libc::kill(-pid, libc::SIGKILL); } }
+            #[cfg(unix)] { if let Some(pid) = pid { unsafe { libc::kill(-pid, libc::SIGKILL); } } }
+            // (windows: kill_on_drop terminates the shell when the future is dropped)
             Ok(ProcOutput { stdout: String::new(), stderr: format!("killed after {}s timeout", timeout.as_secs()), code: None, timed_out: true, elapsed: start.elapsed() })
         }
     }
@@ -95,7 +108,7 @@ pub fn truncate_middle(s: &str, max: usize) -> String {
     format!("{h}\n…[{} chars elided]…\n{t}", n - max)
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     #[tokio::test]

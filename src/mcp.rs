@@ -45,7 +45,7 @@ pub struct McpFile {
 /// Collect server configs from all standard locations. Later files override earlier ones by name.
 pub fn discover(workdir: &Path, extra_files: &[PathBuf]) -> Vec<(String, ServerConfig, PathBuf)> {
     let mut files: Vec<PathBuf> = Vec::new();
-    if let Ok(h) = std::env::var("HOME") { files.push(PathBuf::from(h).join(".config/harness/mcp.json")); }
+    files.push(crate::setup::config_dir().join("mcp.json"));
     files.push(workdir.join(".harness/mcp.json"));
     files.push(workdir.join(".mcp.json"));
     files.extend(extra_files.iter().cloned());
@@ -199,7 +199,7 @@ impl McpServer {
 
 fn expand_env(s: &str) -> String {
     let mut out = s.to_string();
-    if let Some(h) = std::env::var_os("HOME") { out = out.replace("${HOME}", &h.to_string_lossy()).replace("~/", &format!("{}/", h.to_string_lossy())); }
+    { let h = crate::setup::home_dir().display().to_string(); out = out.replace("${HOME}", &h).replace("~/", &format!("{h}/")); }
     // ${VAR} substitution
     let mut res = String::new(); let mut rest = out.as_str();
     while let Some(i) = rest.find("${") {

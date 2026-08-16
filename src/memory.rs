@@ -4,7 +4,7 @@
 //! reflection step. Files live in `~/.config/harness/` by default.
 
 use crate::llm::{Client, Message};
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -50,7 +50,7 @@ impl MemoryStore {
             Some(d) => PathBuf::from(d),
             None => match &cfg.dir {
                 Some(d) => PathBuf::from(shellexpand(d)),
-                None => PathBuf::from(std::env::var("HOME").context("HOME not set")?).join(".config/harness"),
+                None => crate::setup::config_dir(),
             },
         };
         std::fs::create_dir_all(&dir)?;
@@ -268,7 +268,7 @@ pub fn canonical_name(file: &str) -> Result<&'static str> {
 }
 
 fn shellexpand(p: &str) -> String {
-    if let Some(rest) = p.strip_prefix('~') { format!("{}{}", std::env::var("HOME").unwrap_or_default(), rest) } else { p.to_string() }
+    if let Some(rest) = p.strip_prefix('~') { format!("{}{}", crate::setup::home_dir().display().to_string(), rest) } else { p.to_string() }
 }
 
 /// Compact a transcript for reflection: user text, assistant text, tool names + short args/results.

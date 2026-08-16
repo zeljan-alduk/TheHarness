@@ -37,7 +37,7 @@ fn run_eval(bin: &Path, cwd: &Path, filter: Option<&str>, out: &Path) -> Result<
 fn mean(runs: &[RunSummary]) -> f64 { if runs.is_empty() { 0.0 } else { runs.iter().map(|r| if r.total == 0 { 0.0 } else { r.passed as f64 / r.total as f64 }).sum::<f64>() / runs.len() as f64 } }
 fn always(runs: &[RunSummary], task: &str, val: bool) -> bool { !runs.is_empty() && runs.iter().all(|r| r.per_task.get(task).copied() == Some(val)) }
 
-pub fn cache_dir() -> PathBuf { PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".config/harness/arbiter") }
+pub fn cache_dir() -> PathBuf { crate::setup::config_dir().join("arbiter") }
 
 pub fn judge(repo: &Path, branch: &str, runs: usize, filter: Option<&str>, merge: bool, log: &mut dyn FnMut(&str)) -> Result<Verdict> {
     let (ok, _) = sh(&format!("git rev-parse --verify {}", shell_quote(branch)), repo, 30)?;

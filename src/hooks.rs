@@ -23,8 +23,9 @@ pub struct HooksConfig {
 fn d_timeout() -> u64 { 30 }
 
 async fn run_hook(cmd: &str, input: &serde_json::Value, cwd: &Path, timeout: Duration) -> (i32, String) {
-    let mut c = tokio::process::Command::new("/bin/sh");
-    c.arg("-c").arg(cmd).current_dir(cwd).stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).kill_on_drop(true);
+    let (prog, flag) = crate::sandbox::shell_program();
+    let mut c = tokio::process::Command::new(prog);
+    c.arg(flag).arg(cmd).current_dir(cwd).stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).kill_on_drop(true);
     c.env("PATH", crate::setup::path_with_bin_dir(cwd));
     let Ok(mut child) = c.spawn() else { return (1, format!("hook failed to start: {cmd}")) };
     if let Some(mut stdin) = child.stdin.take() { use tokio::io::AsyncWriteExt; let _ = stdin.write_all(input.to_string().as_bytes()).await; }

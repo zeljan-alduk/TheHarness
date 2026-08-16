@@ -149,8 +149,7 @@ pub fn system_prompt(workdir: &str, tools: &[&str], extra: Option<&str>) -> Stri
 /// tuned by the user — or proposed by `harness self` and judged by the arbiter.
 pub fn base_prompt_template() -> String {
     let default = DEFAULT_PROMPT.to_string();
-    let Some(home) = std::env::var_os("HOME") else { return default };
-    let dir = std::path::PathBuf::from(home).join(".config/harness/prompts");
+    let dir = crate::setup::config_dir().join("prompts");
     let p = dir.join("system.md");
     if let Ok(t) = std::fs::read_to_string(&p) { if t.trim().len() > 50 { return t; } }
     let _ = std::fs::create_dir_all(&dir); let _ = std::fs::write(&p, &default);

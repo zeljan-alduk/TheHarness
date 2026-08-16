@@ -19,10 +19,11 @@ pub async fn start(cmd: &str, cwd: &std::path::Path) -> Result<(u32, PathBuf)> {
     let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let log = log_dir().join(format!("proc-{}-{id}.log", std::process::id()));
     let f = std::fs::File::create(&log)?;
-    let mut c = tokio::process::Command::new("/bin/sh");
-    c.arg("-c").arg(cmd).current_dir(cwd).stdin(std::process::Stdio::null()).stdout(f.try_clone()?).stderr(f).kill_on_drop(true);
+    let (prog, flag) = crate::sandbox::shell_program();
+    let mut c = tokio::process::Command::new(prog);
+    c.arg(flag).arg(cmd).current_dir(cwd).stdin(std::process::Stdio::null()).stdout(f.try_clone()?).stderr(f).kill_on_drop(true);
     c.env("PATH", crate::setup::path_with_bin_dir(cwd)).env("HARNESS", "1").env("CI", "1").env("TERM", "dumb");
-    unsafe { c.pre_exec(|| { libc::setsid(); Ok(()) }); }
+    #[cfg(unix)] unsafe { c.pre_exec(|| { libc::setsid(); Ok(()) }); }
     let child = c.spawn()?;
     let pid = child.id().unwrap_or(0);
     table().lock().unwrap().insert(id, Proc { id, pid, cmd: cmd.to_string(), log: log.clone(), started: Instant::now(), child });
@@ -52,9 +53,8 @@ pub fn tail(id: u32, lines: usize) -> Result<String> {
 pub async fn kill(id: u32) -> Result<String> {
     let pid = { let t = table().lock().unwrap(); t.get(&id).map(|p| p.pid) };
     let Some(pid) = pid else { bail!("no background process #{id}") };
-    unsafe { libc::kill(-(pid as i32), libc::SIGTERM); }
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-    unsafe { libc::kill(-(pid as i32), libc::SIGKILL); }
+    #[cfg(unix)] { unsafe { libc::kill(-(pid as i32), libc::SIGTERM); } tokio::time::sleep(std::time::Duration::from_millis(500)).await; unsafe { libc::kill(-(pid as i32), libc::SIGKILL); } }
+    #[cfg(windows)] { let _ = tokio::process::Command::new("taskkill").args(["/PID", &pid.to_string(), "/T", "/F"]).output().await; }
     let mut t = table().lock().unwrap();
     if let Some(p) = t.get_mut(&id) { let _ = p.child.start_kill(); }
     Ok(format!("sent SIGTERM/SIGKILL to process group of #{id} (pid {pid})"))

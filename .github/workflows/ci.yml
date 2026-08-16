@@ -5,16 +5,21 @@ on:
   pull_request:
 jobs:
   build-test:
-    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Build
-        run: cargo build --release
+        run: cargo build --release -p harness
       - name: Unit tests
-        run: cargo test
+        run: cargo test -p harness
       - name: Tool smoke tests (no model)
+        if: runner.os != 'Windows'
         run: |
           mkdir -p /tmp/w && cd /tmp/w && git init -q
           H=$GITHUB_WORKSPACE/target/release/harness
@@ -22,7 +27,17 @@ jobs:
           $H --config $GITHUB_WORKSPACE/harness.toml tool write_file '{"path":"a.txt","content":"hello\n"}'
           $H --config $GITHUB_WORKSPACE/harness.toml tool grep '{"pattern":"hello"}' | grep -q a.txt
           $H --config $GITHUB_WORKSPACE/harness.toml tool glob '{"pattern":"*.txt"}' | grep -q a.txt
+      - name: Tool smoke tests (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          mkdir -p /tmp/w && cd /tmp/w && git init -q
+          H=$GITHUB_WORKSPACE/target/release/harness.exe
+          "$H" --config "$GITHUB_WORKSPACE/harness.toml" tool bash '{"cmd":"echo ok"}' | grep -q ok
+          "$H" --config "$GITHUB_WORKSPACE/harness.toml" tool write_file '{"path":"a.txt","content":"hello\n"}'
+          "$H" --config "$GITHUB_WORKSPACE/harness.toml" tool glob '{"pattern":"*.txt"}' | grep -q a.txt
       - name: Headless TUI e2e (pty + VT100 emulator)
+        if: runner.os != 'Windows'
         run: |
           pip3 install --break-system-packages pyte >/dev/null 2>&1 || pip3 install pyte
           HARNESS_BIN=$GITHUB_WORKSPACE/target/release/harness python3 scripts/e2e_tui.py --no-model

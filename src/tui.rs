@@ -5,6 +5,7 @@ use anyhow::Result;
 use crossterm::event::{Event as CEvent, EventStream, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind};
 use futures_util::StreamExt;
 use harness::agent::Agent;
+fn config_dir() -> PathBuf { harness::setup::config_dir() }
 use harness::config::Config;
 use harness::events::{Event, Sink};
 use harness::llm::{Client, Content, Message};
@@ -122,15 +123,26 @@ fn graphics_terminal() -> bool {
 async fn clipboard_image(store: Option<harness::memory::MemoryStore>) -> Result<PathBuf, String> {
     // 1) image data
     let tmp = std::env::temp_dir().join(format!("harness-paste-{}.png", std::process::id()));
-    let script = format!("set f to open for access POSIX file \"{}\" with write permission\nset eof of f to 0\nwrite (the clipboard as «class PNGf») to f\nclose access f", tmp.display());
-    let o = tokio::process::Command::new("osascript").arg("-e").arg(&script).output().await.map_err(|e| e.to_string())?;
-    if o.status.success() {
+    let o = if cfg!(target_os = "macos") {
+        let script = format!("set f to open for access POSIX file \"{}\" with write permission\nset eof of f to 0\nwrite (the clipboard as «class PNGf») to f\nclose access f", tmp.display());
+        tokio::process::Command::new("osascript").arg("-e").arg(&script).output().await.map_err(|e| e.to_string())?
+    } else if cfg!(windows) {
+        let ps = format!("Add-Type -AssemblyName System.Windows.Forms; $img=[Windows.Forms.Clipboard]::GetImage(); if($img){{ $img.Save('{}', [System.Drawing.Imaging.ImageFormat]::Png); exit 0 }} else {{ exit 1 }}", tmp.display().to_string().replace('\'', "''"));
+        tokio::process::Command::new("powershell").args(["-NoProfile", "-Command", &ps]).output().await.map_err(|e| e.to_string())?
+    } else {
+        // linux: wl-paste (wayland) or xclip (x11)
+        let cmd = format!("(command -v wl-paste >/dev/null && wl-paste --type image/png > '{0}') || (command -v xclip >/dev/null && xclip -selection clipboard -t image/png -o > '{0}')", tmp.display());
+        tokio::process::Command::new("sh").args(["-c", &cmd]).output().await.map_err(|e| e.to_string())?
+    };
+    if o.status.success() && std::fs::metadata(&tmp).map(|m| m.len() > 0).unwrap_or(false) {
         let bytes = std::fs::read(&tmp).map_err(|e| e.to_string())?; let _ = std::fs::remove_file(&tmp);
         return match &store { Some(st) => st.save_paste("png", &bytes).map_err(|e| e.to_string()), None => { std::fs::write(&tmp, &bytes).map_err(|e| e.to_string())?; Ok(tmp) } };
     }
     let _ = std::fs::remove_file(&tmp);
-    // 2) a file reference (copied in Finder)
-    let o = tokio::process::Command::new("osascript").arg("-e").arg("POSIX path of (the clipboard as «class furl»)").output().await.map_err(|e| e.to_string())?;
+    // 2) a file reference (copied in Finder / Explorer)
+    let o = if cfg!(target_os = "macos") { tokio::process::Command::new("osascript").arg("-e").arg("POSIX path of (the clipboard as «class furl»)").output().await.map_err(|e| e.to_string())? }
+        else if cfg!(windows) { tokio::process::Command::new("powershell").args(["-NoProfile", "-Command", "Add-Type -AssemblyName System.Windows.Forms; $f=[Windows.Forms.Clipboard]::GetFileDropList(); if($f.Count -gt 0){ Write-Output $f[0]; exit 0 } else { exit 1 }"]).output().await.map_err(|e| e.to_string())? }
+        else { tokio::process::Command::new("sh").args(["-c", "command -v xclip >/dev/null && xclip -selection clipboard -o | head -1 | sed 's#^file://##'"]).output().await.map_err(|e| e.to_string())? };
     if o.status.success() {
         let p = PathBuf::from(String::from_utf8_lossy(&o.stdout).trim());
         if p.exists() { return Ok(p); }
@@ -239,6 +251,7 @@ async fn gpu_stats() -> (Option<f32>, Option<u64>) {
     }
     (None, None)
 }
+#[allow(dead_code)]
 fn grab_num(s: &str, key: &str) -> Option<u64> {
     let i = s.find(key)? + key.len();
     let digits: String = s[i..].chars().take_while(|c| c.is_ascii_digit()).collect();
@@ -353,7 +366,7 @@ pub async fn run(cfg: Config, resume: Option<String>) -> Result<()> {
     };
     app.metrics.ctx_len = app.cfg.llm.context_budget_tokens.unwrap_or(0);
     app.perm_mode = app.cfg.permissions.mode;
-    if app.cfg.ui.event_log { if let Ok(h) = std::env::var("HOME") { let d = std::path::PathBuf::from(h).join(".config/harness/logs").join(harness::memory::today_iso()); let _ = std::fs::create_dir_all(&d); app.event_log = std::fs::OpenOptions::new().create(true).append(true).open(d.join(format!("tui-{}.jsonl", std::process::id()))).ok(); } }
+    if app.cfg.ui.event_log { { let d = config_dir().join("logs").join(harness::memory::today_iso()); let _ = std::fs::create_dir_all(&d); app.event_log = std::fs::OpenOptions::new().create(true).append(true).open(d.join(format!("tui-{}.jsonl", std::process::id()))).ok(); } }
     if app.cfg.ui.theme == "light" { LIGHT.store(true, std::sync::atomic::Ordering::Relaxed); }
     app.banner();
     if let Some(r) = resume { app.resume_session(&r); }
@@ -597,7 +610,7 @@ impl App {
     fn harvest_image_paths(&mut self, text: &str) {
         let toks: Vec<String> = text.split_whitespace().map(|t| t.trim_matches(|c| c == '"' || c == '\'' || c == ',').replace("\\ ", " ")).collect();
         for t in toks {
-            let p = if t.starts_with('~') { PathBuf::from(t.replacen('~', &std::env::var("HOME").unwrap_or_default(), 1)) } else if PathBuf::from(&t).is_absolute() { PathBuf::from(&t) } else { self.workdir.join(&t) };
+            let p = if t.starts_with('~') { PathBuf::from(t.replacen('~', &harness::setup::home_dir().display().to_string(), 1)) } else if PathBuf::from(&t).is_absolute() { PathBuf::from(&t) } else { self.workdir.join(&t) };
             if image_mime(&p).is_some() && p.is_file() && !self.attachments.iter().any(|a| a.path == p) {
                 if let Ok(a) = load_attachment(&p) { self.attachments.push(a); }
             }
@@ -610,7 +623,7 @@ impl App {
         // a bare video path (or one among the words) opens the scrubber first
         for t in text.split_whitespace() {
             let t = t.trim_matches(|c| c == '"' || c == '\'');
-            let p = if t.starts_with('~') { PathBuf::from(t.replacen('~', &std::env::var("HOME").unwrap_or_default(), 1)) } else if PathBuf::from(t).is_absolute() { PathBuf::from(t) } else { self.workdir.join(t) };
+            let p = if t.starts_with('~') { PathBuf::from(t.replacen('~', &harness::setup::home_dir().display().to_string(), 1)) } else if PathBuf::from(t).is_absolute() { PathBuf::from(t) } else { self.workdir.join(t) };
             if video_ext(&p) && p.is_file() && !self.input.contains("@") { self.open_video(&p); return; }
         }
         let text = if text.is_empty() { "Look at the attached image(s).".to_string() } else { text };
@@ -659,8 +672,8 @@ impl App {
                 } else { self.model = arg.clone(); self.cfg.llm.model = arg.clone(); self.blocks.push(Block::System(format!("model → {arg}"))); tokio::spawn(fetch_ctx_len(self.cfg.llm.base_url.clone(), arg.clone(), self.tx.clone())); }
             }
             "/cd" => {
-                let p = if arg.is_empty() { std::env::var("HOME").unwrap_or_default() } else { arg.clone() };
-                let p = if p.starts_with('~') { p.replacen('~', &std::env::var("HOME").unwrap_or_default(), 1) } else { p };
+                let p = if arg.is_empty() { harness::setup::home_dir().display().to_string() } else { arg.clone() };
+                let p = if p.starts_with('~') { p.replacen('~', &harness::setup::home_dir().display().to_string(), 1) } else { p };
                 let p = if PathBuf::from(&p).is_absolute() { PathBuf::from(&p) } else { self.workdir.join(&p) };
                 match p.canonicalize() { Ok(p) if p.is_dir() => { self.workdir = p.clone(); let _ = std::env::set_current_dir(&p); self.blocks.push(Block::System(format!("cwd → {}", short_path(&p)))); }
                     _ => self.blocks.push(Block::Error(format!("no such directory: {}", p.display()))) }
@@ -746,7 +759,7 @@ impl App {
                     });
                 }
             }
-            "/video" => { if arg.is_empty() { self.blocks.push(Block::Error("usage: /video <path>".into())); } else { let p = if arg.starts_with('~') { PathBuf::from(arg.replacen('~', &std::env::var("HOME").unwrap_or_default(), 1)) } else { PathBuf::from(&arg) }; if p.is_file() { self.open_video(&p); } else { self.blocks.push(Block::Error(format!("no such file: {arg}"))); } } }
+            "/video" => { if arg.is_empty() { self.blocks.push(Block::Error("usage: /video <path>".into())); } else { let p = if arg.starts_with('~') { PathBuf::from(arg.replacen('~', &harness::setup::home_dir().display().to_string(), 1)) } else { PathBuf::from(&arg) }; if p.is_file() { self.open_video(&p); } else { self.blocks.push(Block::Error(format!("no such file: {arg}"))); } } }
             "/permissions" | "/perm" | "/mode" => {
                 if arg.is_empty() {
                     let rules = harness::permissions::persisted_rules();
@@ -1109,8 +1122,12 @@ impl App {
                 if self.cfg.ui.notify && self.run_started.elapsed() > Duration::from_secs(20) {
                     let title = match &res { Ok(_) => "Harness: task finished", Err(_) => "Harness: task stopped" };
                     let body = truncate(&self.blocks.iter().rev().find_map(|b| if let Block::User(t, _) = b { Some(t.clone()) } else { None }).unwrap_or_default(), 80).replace('"', "'");
-                    let script = format!("display notification \"{body}\" with title \"{title}\" sound name \"Glass\"");
-                    tokio::spawn(async move { let _ = tokio::process::Command::new("osascript").arg("-e").arg(script).output().await; });
+                    let title = title.to_string();
+                    tokio::spawn(async move {
+                        if cfg!(target_os = "macos") { let script = format!("display notification \"{body}\" with title \"{title}\" sound name \"Glass\""); let _ = tokio::process::Command::new("osascript").arg("-e").arg(script).output().await; }
+                        else if cfg!(target_os = "linux") { let _ = tokio::process::Command::new("notify-send").arg(&title).arg(&body).output().await; }
+                        else if cfg!(windows) { let ps = format!("[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] > $null; $t=[Windows.UI.Notifications.ToastNotificationManager]::GetTemplateContent(1); $t.GetElementsByTagName('text')[0].AppendChild($t.CreateTextNode('{title}: {body}')) > $null; [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('harness').Show([Windows.UI.Notifications.ToastNotification]::new($t))"); let _ = tokio::process::Command::new("powershell").args(["-NoProfile", "-Command", &ps]).output().await; }
+                    });
                 }
                 self.save_session();
                 match res {
@@ -1753,4 +1770,4 @@ fn cursor_pos(input: &str, cursor: usize, width: usize) -> (usize, usize) {
 
 fn truncate(s: &str, n: usize) -> String { if s.chars().count() <= n { s.to_string() } else { format!("{}…", s.chars().take(n.saturating_sub(1)).collect::<String>()) } }
 fn fmt_k(n: u64) -> String { if n < 1000 { n.to_string() } else if n < 100_000 { format!("{:.1}k", n as f64 / 1000.0) } else { format!("{}k", n / 1000) } }
-fn short_path(p: &std::path::Path) -> String { let s = p.display().to_string(); if let Ok(h) = std::env::var("HOME") { if let Some(r) = s.strip_prefix(&h) { return format!("~{r}"); } } s }
+fn short_path(p: &std::path::Path) -> String { let s = p.display().to_string(); let h = harness::setup::home_dir().display().to_string(); if let Some(r) = s.strip_prefix(&h) { return format!("~{r}"); } s }

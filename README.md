@@ -9,6 +9,12 @@ tools) **and its own source**, but only let it improve itself through an
 **eval-gated loop** — proposals land on git branches and are judged by a benchmark score,
 never by the agent's own opinion.
 
+## Platforms
+macOS (primary; Kitty for inline images, seatbelt sandbox, temps via macmon), Linux (notify-send,
+wl-paste/xclip for clipboard), Windows (`harness.exe`; install **Git for Windows** so the `bash` tool has a
+POSIX shell — falls back to `cmd /C`; WezTerm shows inline images). State lives in `~/.config/harness`
+(`%USERPROFILE%\.config\harness` on Windows). CI builds and unit-tests all three.
+
 ## Install & use (interactive, Claude-Code-style)
 
 ```sh

@@ -16,7 +16,7 @@ Priority: P0 = decisive for daily use, P1 = strong differentiator, P2 = polish/b
 | **Permission system** (allow/deny rules, approval prompts, sandbox levels) | ✅ bypass/auto/ask/plan, rules, TUI/desktop/web prompts, seatbelt | Claude Code, Codex sandbox | rules in config; TUI approval prompt; per-tool allowlist; "ask on network / write outside cwd" | **P0** |
 | Hooks (pre/post tool, on stop, on prompt) | ✅ `[hooks]` | Claude Code hooks, DSH hooks pkg | shell hooks in config; JSON on stdin; block/allow/rewrite | P1 |
 | Task list / TODO tracking visible in UI | ✅ `todo` tool + Tasks panel | Claude Code TodoWrite, OpenCode todowrite, dsh-web-ui task board | `todo` tool + panel section | P1 |
-| Deterministic multi-agent workflows (scripts) | ❌ | Claude Code `Workflow` | after sub-agents: a small workflow runner (pipeline/parallel/judge) | P2 |
+| Deterministic multi-agent workflows (scripts) | ✅ TOML workflows (`/workflow`, `harness workflow`) | Claude Code `Workflow` | after sub-agents: a small workflow runner (pipeline/parallel/judge) | P2 |
 | Retry / recovery from server hiccups | ✅ | — | — | |
 | Cost/latency accounting per turn | ✅ | Claude Code `/cost` | per-tool timing table | P2 |
 
@@ -28,7 +28,7 @@ Priority: P0 = decisive for daily use, P1 = strong differentiator, P2 = polish/b
 | Web fetch/search, downloads | ✅ (+segmented downloads) | — | search provider choice (SearXNG, Brave, Exa) | P2 |
 | Vision (view_image), image paste, video frames | ✅ | Claude Code image paste | screenshots tool (`screenshot {app/url}`) via `screencapture` / headless browser | P1 |
 | **Browser automation** (Chrome DevTools MCP / Playwright) | ◐ via MCP | Claude Code (chrome-devtools MCP), Gemini CLI | ship a default `mcp.json` with chrome-devtools + playwright, one-command enable | P1 |
-| LSP (diagnostics, go-to-def, rename) | ◐ `diagnostics` tool (cargo/python/tsc/node/go); no LSP client yet | Claude Code LSP, OpenCode lsp | rust-analyzer/pyright/tsserver via LSP client; `diagnostics` after edits | P1 |
+| LSP (diagnostics, go-to-def, rename) | ✅ `lsp` tool + `diagnostics` | Claude Code LSP, OpenCode lsp | rust-analyzer/pyright/tsserver via LSP client; `diagnostics` after edits | P1 |
 | PDF, archives | ✅ (agent-built) | — | — | |
 | Notebook editing | ✅ `notebook_edit` | Claude Code | `notebook_edit` | P2 |
 | MCP client (stdio + streamable HTTP) | ✅ | all | OAuth, resources & prompts, sampling | P2 |
@@ -55,7 +55,7 @@ Priority: P0 = decisive for daily use, P1 = strong differentiator, P2 = polish/b
 ## 5. Model & provider
 | Capability | Us | Best | Gap | Prio |
 |---|---|---|---|---|
-| OpenAI-compatible servers (local or cloud), model switch, aux model routing | ✅ | all | native Anthropic API adapter | P2 |
+| OpenAI-compatible servers, Anthropic Messages API (provider=anthropic), model switch, aux routing | ✅ | all | — | |
 | Prompt caching awareness | ❌ | Claude Code | keep system prompt stable & prefix-cache friendly; measure TTFT | P2 |
 | Structured output / JSON mode for reflection & compaction | ◐ | — | use server JSON schema mode when available | P2 |
 
@@ -71,6 +71,7 @@ Priority: P0 = decisive for daily use, P1 = strong differentiator, P2 = polish/b
 Done: permissions, sub-agents, grep/glob/apply_patch, sessions, arbiter, 14-task corpus, background
 processes, hooks, todo panel, diffs, HTTP MCP, diagnostics, notebook edit, seatbelt, secrets redaction,
 notifications, event logs, theme, web UI, CI, task hand-off (queue/next/loop detection).
-Remaining: real LSP client, browser-MCP defaults, native Anthropic adapter, container sandbox,
-MCP resources/prompts/OAuth, deterministic workflows, syntax highlighting, prompt-as-data for self-tuning,
-larger eval corpus (30–50) and nightly arbiter.
+Closed since: LSP client, workflows, Anthropic adapter, syntax highlighting, prompt-as-data, browser-MCP
+defaults, /context map, compaction progress + map, temps/power in dashboard, Windows build (harness.exe
+links; CI matrix macOS/Linux/Windows). Remaining: container sandbox, MCP resources/prompts/OAuth,
+larger eval corpus, runtime validation on Windows/Linux (CI does unit tests + tool smoke there).

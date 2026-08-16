@@ -4,6 +4,7 @@ use harness::{agent, config, eval, events, llm, sandbox, tools};
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
+#[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -359,12 +360,10 @@ fn reexec_from_temp_copy() -> Result<()> {
     let exe = std::env::current_exe()?;
     let tmp = std::env::temp_dir().join(format!("harness-self-{}", std::process::id()));
     std::fs::copy(&exe, &tmp).context("copying harness binary to temp")?;
-    let err = std::process::Command::new(&tmp)
-        .args(std::env::args_os().skip(1))
-        .env("HARNESS_SELF_EXEC", "1")
-        .env("HARNESS_ORIG_EXE", &exe)
-        .exec();
-    bail!("failed to re-exec {}: {err}", tmp.display())
+    let mut cmd = std::process::Command::new(&tmp);
+    cmd.args(std::env::args_os().skip(1)).env("HARNESS_SELF_EXEC", "1").env("HARNESS_ORIG_EXE", &exe);
+    #[cfg(unix)] { let err = cmd.exec(); bail!("failed to re-exec {}: {err}", tmp.display()) }
+    #[cfg(not(unix))] { let st = cmd.status().with_context(|| format!("failed to run {}", tmp.display()))?; std::process::exit(st.code().unwrap_or(1)); }
 }
 
 fn repo_root() -> Result<PathBuf> {

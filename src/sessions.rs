@@ -26,7 +26,7 @@ fn now() -> u64 { std::time::SystemTime::now().duration_since(std::time::UNIX_EP
 impl SessionStore {
     pub fn open() -> Result<Self> {
         let dir = std::env::var_os("HARNESS_SESSIONS_DIR").map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".config/harness/sessions"));
+            .unwrap_or_else(|| crate::setup::config_dir().join("sessions"));
         std::fs::create_dir_all(&dir)?;
         Ok(Self { dir })
     }

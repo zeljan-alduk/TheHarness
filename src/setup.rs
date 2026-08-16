@@ -35,17 +35,24 @@ pub const TOOLS: &[ExtTool] = &[
 pub struct Status { pub name: &'static str, pub found: Vec<(String, PathBuf)>, pub missing: Vec<&'static str>, pub purpose: &'static str, pub required: bool, pub install: Option<String> }
 impl Status { pub fn ok(&self) -> bool { self.missing.is_empty() } }
 
+/// The user's home directory (HOME, or USERPROFILE on Windows).
+pub fn home_dir() -> PathBuf {
+    std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")).map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."))
+}
+/// ~/.config/harness (all harness state lives here on every platform).
+pub fn config_dir() -> PathBuf { home_dir().join(".config/harness") }
+
 pub fn bin_dir() -> PathBuf {
-    std::env::var_os("HARNESS_BIN_DIR").map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".config/harness/bin"))
+    std::env::var_os("HARNESS_BIN_DIR").map(PathBuf::from).unwrap_or_else(|| config_dir().join("bin"))
 }
 
-fn which(bin: &str) -> Option<PathBuf> {
+pub fn which(bin: &str) -> Option<PathBuf> {
     let extra = ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin", "/Applications/kitty.app/Contents/MacOS"];
     let mut dirs: Vec<PathBuf> = std::env::var_os("PATH").map(|p| std::env::split_paths(&p).collect()).unwrap_or_default();
     dirs.extend(extra.iter().map(PathBuf::from));
-    if let Ok(h) = std::env::var("HOME") { dirs.push(PathBuf::from(&h).join(".cargo/bin")); dirs.push(PathBuf::from(&h).join(".local/bin")); }
-    dirs.into_iter().map(|d| d.join(bin)).find(|p| p.is_file())
+    let h = home_dir(); dirs.push(h.join(".cargo/bin")); dirs.push(h.join(".local/bin"));
+    let exts: &[&str] = if cfg!(windows) { &["", ".exe", ".cmd", ".bat"] } else { &[""] };
+    dirs.into_iter().flat_map(|d| exts.iter().map(move |e| d.join(format!("{bin}{e}")))).find(|p| p.is_file())
 }
 
 pub fn check() -> Vec<Status> {
@@ -71,6 +78,7 @@ pub fn link_all(statuses: &[Status]) -> Result<(usize, PathBuf)> {
             if link.read_link().map(|t| &t == path).unwrap_or(false) { n += 1; continue; }
             let _ = std::fs::remove_file(&link);
             #[cfg(unix)] { std::os::unix::fs::symlink(path, &link)?; }
+            #[cfg(windows)] { let shim = dir.join(format!("{bin}.cmd")); std::fs::write(&shim, format!("@echo off\r\n\"{}\" %*\r\n", path.display()))?; }
             n += 1;
         }
     }
@@ -83,7 +91,8 @@ pub fn install_missing(statuses: &[Status]) -> Result<Vec<String>> {
     for s in statuses.iter().filter(|s| !s.ok()) {
         let Some(cmd) = &s.install else { eprintln!("  {}: no installer known (system tool?)", s.name); continue };
         eprintln!("→ {cmd}");
-        let st = std::process::Command::new("/bin/sh").arg("-c").arg(cmd).status()?;
+        let (prog, flag) = crate::sandbox::shell_program();
+        let st = std::process::Command::new(prog).arg(flag).arg(cmd).status()?;
         if st.success() { done.push(s.name.to_string()); } else { eprintln!("  failed: {cmd}"); }
     }
     Ok(done)
@@ -107,15 +116,16 @@ pub fn print_report(statuses: &[Status]) {
     }
 }
 
-pub fn path_with_bin_dir(_cwd: &Path) -> String {
+pub fn path_with_bin_dir(_cwd: &Path) -> std::ffi::OsString {
     let dir = bin_dir();
-    let cur = std::env::var("PATH").unwrap_or_default();
-    if cur.split(':').any(|p| Path::new(p) == dir) { cur } else { format!("{}:{cur}", dir.display()) }
+    let mut paths: Vec<PathBuf> = std::env::var_os("PATH").map(|p| std::env::split_paths(&p).collect()).unwrap_or_default();
+    if !paths.iter().any(|p| *p == dir) { paths.insert(0, dir); }
+    std::env::join_paths(paths).unwrap_or_else(|_| std::env::var_os("PATH").unwrap_or_default())
 }
 
 /// Write recommended MCP servers into ~/.config/harness/mcp.json (merging; never overwrites existing names).
 pub fn write_default_mcp() -> Result<Vec<String>> {
-    let path = PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".config/harness/mcp.json");
+    let path = config_dir().join("mcp.json");
     let mut doc: serde_json::Value = std::fs::read_to_string(&path).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or(serde_json::json!({"mcpServers": {}}));
     if !doc["mcpServers"].is_object() { doc["mcpServers"] = serde_json::json!({}); }
     let defaults = [

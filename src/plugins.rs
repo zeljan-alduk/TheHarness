@@ -37,7 +37,7 @@ pub struct Plugins { pub dir: PathBuf, pub state: State }
 impl Plugins {
     pub fn open() -> Result<Self> {
         let dir = std::env::var_os("HARNESS_PLUGINS_DIR").map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".config/harness/plugins"));
+            .unwrap_or_else(|| crate::setup::config_dir().join("plugins"));
         std::fs::create_dir_all(&dir)?;
         let state = std::fs::read_to_string(dir.join("state.json")).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
         Ok(Self { dir, state })
@@ -136,7 +136,9 @@ impl Plugins {
         } else if Path::new(spec).is_dir() {
             let p = Path::new(spec).canonicalize()?; let name = p.file_name().unwrap().to_string_lossy().to_string();
             let dst = self.dir.join(&name); if dst.exists() { bail!("'{name}' already installed"); }
-            std::os::unix::fs::symlink(&p, &dst)?; return Ok(name);
+            #[cfg(unix)] { std::os::unix::fs::symlink(&p, &dst)?; }
+            #[cfg(windows)] { copy_dir(&p, &dst)?; }
+            return Ok(name);
         } else if spec.matches('/').count() == 1 {
             (format!("https://github.com/{spec}.git"), spec.split('/').nth(1).unwrap().to_string())
         } else { bail!("install spec must be owner/repo, a git URL, or a local directory") };
@@ -222,6 +224,9 @@ fn collect_dsh_mcp(v: &serde_yaml::Value, out: &mut serde_json::Map<String, serd
         _ => {}
     }
 }
+
+#[allow(dead_code)]
+fn copy_dir(src: &Path, dst: &Path) -> Result<()> { std::fs::create_dir_all(dst)?; for e in std::fs::read_dir(src)? { let e = e?; let to = dst.join(e.file_name()); if e.file_type()?.is_dir() { copy_dir(&e.path(), &to)?; } else { std::fs::copy(e.path(), &to)?; } } Ok(()) }
 
 fn find_files(d: &Path, name: &str, depth: usize, out: &mut Vec<PathBuf>) {
     let Ok(rd) = std::fs::read_dir(d) else { return };

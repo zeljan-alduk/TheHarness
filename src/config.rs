@@ -171,7 +171,7 @@ impl Config {
         if let Some(p) = explicit { candidates.push(p.to_path_buf()); }
         if let Some(p) = std::env::var_os("HARNESS_CONFIG") { candidates.push(PathBuf::from(p)); }
         candidates.push(PathBuf::from("harness.toml"));
-        if let Some(home) = std::env::var_os("HOME") { candidates.push(PathBuf::from(home).join(".config/harness/harness.toml")); }
+        candidates.push(crate::setup::config_dir().join("harness.toml"));
         let exe = std::env::var_os("HARNESS_ORIG_EXE").map(PathBuf::from).or_else(|| std::env::current_exe().ok());
         if let Some(exe) = exe {
             if let Some(dir) = exe.parent() { candidates.push(dir.join("harness.toml")); }

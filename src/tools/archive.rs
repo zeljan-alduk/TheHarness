@@ -153,7 +153,7 @@ impl Tool for ExtractArchive {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::path::PathBuf;

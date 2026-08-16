@@ -50,6 +50,7 @@ const RISKY: &[&str] = &[
     "| sh", "| bash", "|sh", "|bash", "curl ", "wget ", "brew uninstall", "brew remove", "npm install -g", "npm i -g", "pip install", "pip3 install", "cargo install",
     "> ~/", "> /etc", "> /usr", "> /System", "launchctl", "defaults write", "osascript", "crontab", "ssh ", "scp ", "rsync ", "docker ", "kubectl ", "terraform ", "aws ", "gcloud ",
     "git commit --amend", "git rebase", "git branch -D", "git tag -d", "gh pr merge", "gh release",
+    "del /s", "del /q", "rmdir /s", "rd /s", "format ", "remove-item -recurse", "rm -recurse", "diskpart", "reg delete", "schtasks", "net user",
 ];
 const PLAN_OK: &[&str] = &["git status", "git log", "git diff", "git show", "git branch", "git blame", "ls", "cat ", "head ", "tail ", "grep ", "rg ", "find ", "fd ", "wc ", "tree", "pwd", "echo ", "which ", "file ", "stat ", "du ", "df ", "env", "printenv", "cargo check", "cargo metadata", "cargo tree", "python3 -c \"import", "node -e", "jq ", "sed -n", "awk ", "sort", "uniq", "diff "];
 const MUTATING: &[&str] = &["write_file", "edit_file", "apply_patch", "bash", "download_file", "extract_archive", "memory", "spawn_agent"];
@@ -136,7 +137,7 @@ pub fn glob_match(pat: &str, text: &str) -> bool {
     rec(&p, &t)
 }
 
-fn rules_file() -> PathBuf { PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".config/harness/permissions.json") }
+fn rules_file() -> PathBuf { crate::setup::config_dir().join("permissions.json") }
 /// "Always allow" rules persist across sessions.
 pub fn persisted_rules() -> Vec<String> {
     std::fs::read_to_string(rules_file()).ok().and_then(|t| serde_json::from_str::<Vec<String>>(&t).ok()).unwrap_or_default()
