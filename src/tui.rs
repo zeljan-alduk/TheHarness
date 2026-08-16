@@ -358,7 +358,11 @@ pub async fn run(cfg: Config, resume: Option<String>) -> Result<()> {
         loop {
             terminal.draw(|f| draw(f, &mut app))?;
             tokio::select! {
-                _ = ticker.tick() => { app.tick += 1; if app.tick % 30 == 0 { app.word = (app.word + 1) % WORDS.len(); } }
+                _ = ticker.tick() => {
+                    app.tick += 1; if app.tick % 30 == 0 { app.word = (app.word + 1) % WORDS.len(); }
+                    let cap = app.cfg.agent.max_task_secs;
+                    if cap > 0 && app.running.is_some() && app.run_started.elapsed().as_secs() > cap { app.blocks.push(Block::Error(format!("task exceeded max_task_secs ({cap}s) — stopping and moving on"))); app.next_task(); }
+                }
                 Some(msg) = rx.recv() => { app.on_msg(msg); while let Ok(m) = rx.try_recv() { app.on_msg(m); } }
                 Some(ev) = events.next() => { match ev { Ok(ev) => app.on_term(ev), Err(e) => { app.blocks.push(Block::Error(format!("terminal: {e}"))); } } }
             }

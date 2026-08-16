@@ -21,6 +21,8 @@ max_turns = 40
 tool_timeout_secs = 120
 # Max characters of a tool result fed back to the model (head+tail kept)
 max_tool_output_chars = 16000
+# Optional wall-clock cap per task in the interactive UI (0 = unlimited); queued tasks continue afterwards
+max_task_secs = 0
 
 [eval]
 tasks_dir = "evals/tasks"

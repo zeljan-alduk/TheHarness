@@ -82,6 +82,9 @@ pub struct AgentConfig {
     pub tool_timeout_secs: u64,
     #[serde(default = "d_max_out")]
     pub max_tool_output_chars: usize,
+    /// Optional wall-clock cap per task in the TUI (seconds); 0 = unlimited. The queue continues afterwards.
+    #[serde(default)]
+    pub max_task_secs: u64,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
