@@ -78,8 +78,8 @@ theme = "dark"         # dark | light  (/theme toggles at runtime)
 event_log = true       # ~/.config/harness/logs/<date>/tui-<pid>.jsonl
 
 [sandbox]
-# "none" | "seatbelt" (macOS sandbox-exec: shell may only write inside the workdir, temp dirs and
-# ~/.config/harness; deny_network = true also blocks outbound connections except localhost)
+# "none" | "seatbelt" (macOS sandbox-exec) | "bwrap" (Linux bubblewrap): shell may only write inside the
+# workdir, temp dirs and ~/.config/harness (+allow_write); deny_network = true blocks outbound connections
 mode = "none"
 deny_network = false
 allow_write = []

@@ -155,6 +155,8 @@ enum PluginCmd {
     Disable { name: String },
     Remove { name: String },
     Update { name: String },
+    /// Update all installed git plugins
+    UpdateAll,
 }
 
 #[tokio::main]
@@ -162,7 +164,7 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     let mut cfg = config::Config::load(cli.config.as_deref())?;
     if let Some(m) = &cli.permissions { cfg.permissions.mode = harness::permissions::Mode::parse(m).context("--permissions must be bypass|auto|ask|plan")?; }
-    sandbox::configure_seatbelt(cfg.sandbox.mode == "seatbelt", cfg.sandbox.deny_network, cfg.sandbox.allow_write.clone());
+    sandbox::configure_seatbelt(cfg.sandbox.mode == "seatbelt" || cfg.sandbox.mode == "bwrap", cfg.sandbox.deny_network, cfg.sandbox.allow_write.clone());
     let client = llm::Client::new(&cfg.llm)?;
 
     match cli.cmd.unwrap_or(Cmd::Chat) {
@@ -244,6 +246,7 @@ async fn main() -> Result<()> {
                 PluginCmd::Disable { name } => { p.set_enabled(&name, false)?; println!("disabled {name}"); }
                 PluginCmd::Remove { name } => { p.remove(&name)?; println!("removed {name}"); }
                 PluginCmd::Update { name } => { println!("{}", p.update(&name).await?); }
+                PluginCmd::UpdateAll => { for (n, r) in p.update_all().await { println!("{n}: {}", match r { Ok(m) => m, Err(e) => format!("failed: {e:#}") }); } }
             }
         }
         Cmd::Mcp { dir } => {

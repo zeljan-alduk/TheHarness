@@ -4,7 +4,7 @@
 
 use anyhow::Result;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 use tokio::process::Command;
@@ -57,9 +57,21 @@ pub async fn run_shell(cmd: &str, cwd: &Path, timeout: Duration, max_output: usi
     let start = std::time::Instant::now();
     let seatbelt = SEATBELT.get().cloned().flatten().filter(|_| cfg!(target_os = "macos") && Path::new("/usr/bin/sandbox-exec").exists());
     let (prog, flag) = shell_program();
-    let mut c = match &seatbelt {
-        Some((deny_net, extra)) => { let mut c = Command::new("/usr/bin/sandbox-exec"); c.arg("-p").arg(seatbelt_profile(cwd, *deny_net, extra)).arg(&prog); c }
-        None => Command::new(&prog),
+    let bwrap = SEATBELT.get().cloned().flatten().filter(|_| cfg!(target_os = "linux") && crate::setup::which("bwrap").is_some());
+    let mut c = match (&seatbelt, &bwrap) {
+        (Some((deny_net, extra)), _) => { let mut c = Command::new("/usr/bin/sandbox-exec"); c.arg("-p").arg(seatbelt_profile(cwd, *deny_net, extra)).arg(&prog); c }
+        (_, Some((deny_net, extra))) => {
+            // bubblewrap: read-only root, writable workdir/temp/harness config (+extra), private /dev,/proc; optional no network
+            let mut c = Command::new("bwrap");
+            c.args(["--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc", "--tmpfs", "/tmp", "--die-with-parent"]);
+            let home = crate::setup::home_dir();
+            let mut rw: Vec<PathBuf> = vec![cwd.canonicalize().unwrap_or(cwd.to_path_buf()), std::env::temp_dir(), home.join(".config/harness"), home.join(".cargo"), home.join(".cache")];
+            rw.extend(extra.iter().map(PathBuf::from));
+            for p in rw { if p.exists() { let ps = p.display().to_string(); c.args(["--bind", &ps, &ps]); } }
+            if *deny_net { c.arg("--unshare-net"); }
+            c.arg("--").arg(&prog); c
+        }
+        _ => Command::new(&prog),
     };
     c.arg(flag).arg(cmd)
         .current_dir(cwd)
