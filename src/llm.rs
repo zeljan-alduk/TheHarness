@@ -121,8 +121,11 @@ pub struct Client {
 
 impl Client {
     pub fn new(cfg: &crate::config::LlmConfig) -> Result<Self> {
+        // No total timeout: a long reasoning turn can legitimately take many minutes on a local model.
+        // Instead: bounded connect time and a read (stall) timeout between streamed chunks.
         let http = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(600))
+            .connect_timeout(std::time::Duration::from_secs(30))
+            .read_timeout(std::time::Duration::from_secs(300))
             .build()?;
         Ok(Self {
             http,

@@ -95,6 +95,7 @@ impl<'a> Agent<'a> {
         let mut stats = RunStats::default();
         let mut last_usage = Usage::default();
         let mut truncations = 0u32;
+        let mut retries = 0u32;
         self.sink.emit(&Event::RunStarted { model: self.client.model().to_string(), workdir: self.ctx.workdir.display().to_string(), tools: self.registry.names().iter().map(|s| s.to_string()).collect() });
 
         loop {
@@ -125,8 +126,22 @@ impl<'a> Agent<'a> {
             };
             let (msg, usage) = match res {
                 Ok(x) => x,
-                Err(e) => { self.sink.emit(&Event::Error { message: format!("{e:#}") }); return Err(e); }
+                Err(e) => {
+                    // Transient server/network trouble (local servers restart, stall, hiccup): retry with backoff.
+                    let text = format!("{e:#}");
+                    let transient = !text.contains("returned 4") || text.contains("429");
+                    if transient && retries < 3 {
+                        retries += 1;
+                        self.sink.emit(&Event::Error { message: format!("model call failed ({}); retry {retries}/3 in {}s", crate::llm::truncate_for_log(&text, 160), 5 * retries) });
+                        tokio::time::sleep(std::time::Duration::from_secs(5 * retries as u64)).await;
+                        stats.turns -= 1;
+                        continue;
+                    }
+                    self.sink.emit(&Event::Error { message: text });
+                    return Err(e);
+                }
             };
+            retries = 0;
             let secs = call_start.elapsed().as_secs_f64();
             self.sink.emit(&Event::ModelResponse {
                 prompt_tokens: usage.prompt_tokens, completion_tokens: usage.completion_tokens,
