@@ -26,3 +26,7 @@ pub mod setup;
 pub mod tools;
 pub mod workflow;
 pub mod worktree;
+
+/// Harness version string: MAJOR.MINOR.BUILD (build number increments per release build), plus git sha.
+pub fn version() -> String { format!("{} ({})", env!("HARNESS_VERSION"), env!("HARNESS_GIT")) }
+pub const VERSION: &str = env!("HARNESS_VERSION");

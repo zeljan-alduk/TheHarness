@@ -115,7 +115,7 @@ async fn handle(mut sock: TcpStream, sh: Arc<Shared>) -> Result<()> {
 async fn invoke(sh: &Arc<Shared>, cmd: &str, args: Value) -> Result<Value> {
     let cfg = &sh.cfg;
     match cmd {
-        "get_config" => { let mut v = serde_json::to_value(cfg)?; v["cwd"] = json!(std::env::current_dir().map(|p| p.display().to_string()).unwrap_or_default()); v["home"] = json!(std::env::var("HOME").unwrap_or_default()); Ok(v) }
+        "get_config" => { let mut v = serde_json::to_value(cfg)?; v["version"] = json!(crate::version()); v["cwd"] = json!(std::env::current_dir().map(|p| p.display().to_string()).unwrap_or_default()); v["home"] = json!(std::env::var("HOME").unwrap_or_default()); Ok(v) }
         "list_models" => { let c = Client::new(&cfg.llm)?; Ok(json!(c.list_models().await?)) }
         "list_dir" => {
             let path = args["path"].as_str().unwrap_or(".");

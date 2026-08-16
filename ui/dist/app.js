@@ -12,7 +12,7 @@ const state = { running: false, toolNodes: new Map(), selectedFile: null, filesD
     $('workdir').value = cfg.cwd || cfg.home;
     $('maxTurns').value = cfg.agent.max_turns;
     $('net').checked = cfg.net.enabled;
-    $('serverInfo').textContent = cfg.llm.base_url;
+    $('serverInfo').textContent = (cfg.version ? 'v' + cfg.version + ' · ' : '') + cfg.llm.base_url;
     const models = await invoke('list_models').catch(e => { addSystem('models: ' + e); return [cfg.llm.model]; });
     for (const m of models) { const o = el('option', null, m); o.value = m; if (m === cfg.llm.model) o.selected = true; $('model').appendChild(o); }
     if (!models.includes(cfg.llm.model)) { const o = el('option', null, cfg.llm.model + ' (configured)'); o.value = cfg.llm.model; o.selected = true; $('model').prepend(o); }

@@ -476,7 +476,7 @@ impl App {
     fn banner(&mut self) {
         let wd = short_path(&self.workdir);
         self.blocks.push(Block::Banner(vec![
-            format!("✻ TheHarness — local coding agent"),
+            format!("✻ TheHarness {} — local coding agent", harness::version()),
             format!("  model  {}", self.model),
             if self.cfg.llm.provider.as_deref() == Some("claude-code") { "  server claude-code (official CLI, your Anthropic subscription; tools bridged over MCP)".to_string() } else { format!("  server {}", self.cfg.llm.base_url) },
             format!("  cwd    {}", wd),
@@ -1018,6 +1018,7 @@ impl App {
             "/status" => {
                 let cc = self.cfg.llm.provider.as_deref() == Some("claude-code");
                 let mut lines = vec![
+                    format!("version   {}", harness::version()),
                     format!("backend   {}", if cc { format!("Claude Code · {} · effort {}", self.model, self.cfg.llm.effort.clone().unwrap_or("medium".into())) } else if self.cfg.llm.provider.as_deref() == Some("anthropic") { format!("Anthropic API · {}", self.model) } else { format!("{} · {}", self.cfg.llm.base_url, self.model) }),
                     format!("context   {} window · last prompt {} · session {} in / {} out", fmt_k(self.metrics.ctx_len), fmt_k(self.last_prompt_tokens), fmt_k(self.total_prompt), fmt_k(self.total_completion)),
                     format!("session   {} · {} turns · workdir {}", if self.session_meta.id.is_empty() { "(unsaved)".to_string() } else { self.session_meta.id.clone() }, self.history.len(), short_path(&self.workdir)),

@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 #[derive(Parser)]
-#[command(name = "harness", version, about = "Local-first agentic coding harness (Qwen/LM Studio/llama.cpp/Ollama)")]
+#[command(name = "harness", version = env!("HARNESS_VERSION"), about = "Local-first agentic coding harness (Qwen/LM Studio/llama.cpp/Ollama)")]
 struct Cli {
     /// Path to harness.toml (default: ./harness.toml or next to the binary)
     #[arg(long, global = true)]

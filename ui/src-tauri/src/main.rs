@@ -54,6 +54,7 @@ fn load_config() -> Result<Config, String> {
 fn get_config() -> Result<serde_json::Value, String> {
     let cfg = load_config()?;
     let mut v = serde_json::to_value(&cfg).map_err(|e| e.to_string())?;
+    v["version"] = serde_json::json!(harness::version());
     v["cwd"] = serde_json::json!(std::env::current_dir().map(|p| p.display().to_string()).unwrap_or_default());
     v["home"] = serde_json::json!(std::env::var("HOME").unwrap_or_default());
     Ok(v)

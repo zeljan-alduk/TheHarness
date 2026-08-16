@@ -3,6 +3,7 @@ name = "harness"
 version = "0.1.0"
 edition = "2021"
 description = "Local-first agentic coding harness with an eval-gated self-improvement loop"
+build = "build.rs"
 
 [lib]
 name = "harness"
