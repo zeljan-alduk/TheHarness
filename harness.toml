@@ -5,7 +5,8 @@
 base_url = "http://localhost:1234/v1"
 model = "qwen3.8-27b-mlx"
 temperature = 0.2
-max_tokens = 4096
+# Reasoning models spend a lot of this budget on thinking; keep it generous.
+max_tokens = 16384
 # Rough prompt-token budget; when exceeded, old tool outputs are compacted.
 context_budget_tokens = 24000
 

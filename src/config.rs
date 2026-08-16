@@ -67,7 +67,7 @@ pub struct NetConfig {
 }
 
 fn d_temp() -> f32 { 0.2 }
-fn d_max_tokens() -> u32 { 4096 }
+fn d_max_tokens() -> u32 { 16384 }
 fn d_ctx_budget() -> u64 { 24000 }
 fn d_max_turns() -> usize { 40 }
 fn d_tool_timeout() -> u64 { 120 }

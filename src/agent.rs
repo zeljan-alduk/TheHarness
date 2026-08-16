@@ -89,6 +89,7 @@ impl<'a> Agent<'a> {
         let defs = self.registry.defs();
         let mut stats = RunStats::default();
         let mut last_usage = Usage::default();
+        let mut truncations = 0u32;
         self.sink.emit(&Event::RunStarted { model: self.client.model().to_string(), workdir: self.ctx.workdir.display().to_string(), tools: self.registry.names().iter().map(|s| s.to_string()).collect() });
 
         loop {
@@ -126,6 +127,15 @@ impl<'a> Agent<'a> {
             let calls = msg.tool_calls.clone().unwrap_or_default();
             let mut assistant = msg.clone();
             assistant.reasoning_content = None;
+            // A turn cut off by max_tokens with no tool calls is not "done": nudge and continue (bounded).
+            let truncated = assistant.text().contains("[output truncated by max_tokens]");
+            if calls.is_empty() && truncated && truncations < 3 {
+                truncations += 1;
+                self.sink.emit(&Event::Error { message: format!("model output hit max_tokens with no tool call (attempt {truncations}/3) — asking it to continue") });
+                msgs.push(assistant);
+                msgs.push(Message::user("Your previous message was cut off by the output limit before you called any tool. Keep reasoning brief and act: call the next tool now (write_file / edit_file / bash). Do not restate the whole plan."));
+                continue;
+            }
             if calls.is_empty() {
                 let text = assistant.text();
                 msgs.push(assistant);
