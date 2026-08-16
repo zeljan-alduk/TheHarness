@@ -40,7 +40,7 @@ impl SessionStore {
         std::fs::create_dir_all(&d)?;
         if meta.created == 0 { meta.created = now(); }
         meta.updated = now();
-        if meta.title.is_empty() { meta.title = msgs.iter().find(|m| m.role == "user").map(|m| crate::llm::truncate_for_log(&m.text().lines().next().unwrap_or("").to_string(), 80)).unwrap_or_else(|| "(untitled)".into()); }
+        if meta.title.is_empty() { meta.title = msgs.iter().find(|m| m.role == "user").map(|m| crate::llm::truncate_for_log(m.text().lines().next().unwrap_or(""), 80)).unwrap_or_else(|| "(untitled)".into()); }
         meta.turns = msgs.iter().filter(|m| m.role == "user").count();
         let mut out = String::new();
         for m in msgs { out.push_str(&serde_json::to_string(m)?); out.push('\n'); }

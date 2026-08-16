@@ -1,11 +1,9 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use base64::Engine;
-use harness::agent::Agent;
 use harness::config::Config;
 use harness::events::{Event, Sink};
 use harness::llm::Client;
-use harness::tools::{Registry, ToolCtx};
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -81,22 +79,9 @@ async fn start_run(app: AppHandle, state: State<'_, RunState>, task: String, wor
     }
     let app2 = app.clone();
     let handle = tauri::async_runtime::spawn(async move {
-        let result: Result<String, String> = async {
-            let client = Client::new(&cfg.llm).map_err(|e| e.to_string())?;
-            let store = if cfg.memory.enabled { harness::memory::MemoryStore::open(&cfg.memory).ok() } else { None };
-            if let Some(m) = &store { let _ = m.touch_project(&workdir); }
-            let registry = Registry::defaults(cfg.net.enabled);
-            let system = harness::agent::system_prompt_with_memory(&workdir.display().to_string(), &registry.names(), None, store.as_ref());
-            let sink: std::sync::Arc<dyn Sink> = std::sync::Arc::new(TauriSink { app: app2.clone() });
-            let budget = cfg.llm.effective_budget(harness::llm::detect_context_length(&cfg.llm.base_url, &cfg.llm.model).await.map(|d| d.0));
-            let mut pcfg = cfg.permissions.clone(); pcfg.allow.extend(harness::permissions::persisted_rules());
-            let policy = std::sync::Arc::new(harness::permissions::Policy::new(pcfg, &workdir));
-            let approver: std::sync::Arc<dyn harness::permissions::Approver> = std::sync::Arc::new(TauriApprover { app: app2.clone() });
-            let env = std::sync::Arc::new(harness::agent::SubAgentEnv::new(client.clone(), registry.clone(), policy.clone(), approver.clone(), sink.clone(), budget, true));
-            let ctx = ToolCtx { workdir: workdir.clone(), timeout: Duration::from_secs(cfg.agent.tool_timeout_secs), max_output: cfg.agent.max_tool_output_chars, net: cfg.net.clone(), memory: store.clone(), subagent: Some(env), redact_secrets: cfg.security.redact_secrets, hooks: cfg.hooks.clone(), todos: Default::default(), lsp_servers: cfg.lsp.servers.clone(), extra_roots: vec![], approver: Some(approver.clone()), inbox: Default::default(), cancel: None, cwd: None, session_id: None };
-            let agent = Agent { client: &client, registry: &registry, ctx: &ctx, max_turns: cfg.agent.max_turns, context_budget: budget, sink: sink.as_ref(), stream: true, policy: &policy, approver: approver.as_ref() };
-            agent.run(&system, &task).await.map(|(t, _)| t).map_err(|e| format!("{e:#}"))
-        }.await;
+        let sink: std::sync::Arc<dyn Sink> = std::sync::Arc::new(TauriSink { app: app2.clone() });
+        let approver: std::sync::Arc<dyn harness::permissions::Approver> = std::sync::Arc::new(TauriApprover { app: app2.clone() });
+        let result = harness::runner::start_run(harness::runner::RunSetup::new(cfg, workdir, sink, approver), task).await.map_err(|e| format!("{e:#}"));
         let payload = match result {
             Ok(text) => RunFinished { ok: true, text, error: None },
             Err(e) => RunFinished { ok: false, text: String::new(), error: Some(e) },

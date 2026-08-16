@@ -48,18 +48,20 @@ pub async fn start(inbox: Arc<Inbox>, cmd: &str, cwd: &std::path::Path, filter: 
             // read new bytes
             if file.is_none() { file = std::fs::File::open(&log2).ok(); }
             let mut chunk = String::new();
+            let mut more = false; // buffer filled: keep draining before judging exit / sleeping
             if let Some(f) = file.as_mut() {
-                let mut buf = Vec::new();
-                if f.seek(SeekFrom::Start(offset)).is_ok() && f.read_to_end(&mut buf).is_ok() && !buf.is_empty() { offset += buf.len() as u64; chunk = String::from_utf8_lossy(&buf).into_owned(); }
+                // bounded read per tick (a firehose log must not grow our buffer without limit)
+                let mut buf = vec![0u8; 256 * 1024];
+                if f.seek(SeekFrom::Start(offset)).is_ok() { if let Ok(n) = f.read(&mut buf) { if n > 0 { offset += n as u64; chunk = String::from_utf8_lossy(&buf[..n]).into_owned(); more = n == buf.len(); } } }
             }
             let status = proc_status(proc_id);
-            let exited = status.as_deref().map(|s| s != "running").unwrap_or(true);
+            let exited = !more && status.as_deref().map(|s| s != "running").unwrap_or(true);
             let timed_out = !timeout.is_zero() && started.elapsed() > timeout && !exited;
             if !chunk.is_empty() || (exited && !partial.is_empty()) {
                 partial.push_str(&chunk);
                 let mut rest = String::new();
                 let mut it = partial.split_inclusive('\n').peekable();
-                while let Some(l) = it.next() {
+                for l in it {
                     if !l.ends_with('\n') && !exited { rest = l.to_string(); break; }
                     let line = l.trim_end_matches(['\n', '\r']);
                     if filter.as_ref().map(|r| r.is_match(line)).unwrap_or(true) && !truncated {
@@ -84,7 +86,7 @@ pub async fn start(inbox: Arc<Inbox>, cmd: &str, cwd: &std::path::Path, filter: 
                 inbox.push(&source, format!("monitor #{id} {} (log: {})", status.unwrap_or_else(|| "exited".into()), log2.display()));
                 break;
             }
-            tokio::time::sleep(Duration::from_millis(250)).await;
+            if !more { tokio::time::sleep(Duration::from_millis(250)).await; }
         }
         done2.store(true, Ordering::Relaxed);
     });
@@ -120,7 +122,7 @@ impl Tool for Monitor {
                 let cmd = args.get("cmd").and_then(|v| v.as_str()).map(str::trim).unwrap_or("");
                 if cmd.is_empty() { bail!("cmd required"); }
                 let filter = match args.get("filter").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) { Some(f) => Some(regex::Regex::new(f).map_err(|e| anyhow::anyhow!("bad filter regex: {e}"))?), None => None };
-                let cwd = match args.get("cwd").and_then(|v| v.as_str()) { Some(c) => { let p = ctx.workdir.join(c); if !p.is_dir() { bail!("cwd {} is not a directory", p.display()); } p } None => ctx.workdir.clone() };
+                let cwd = match args.get("cwd").and_then(|v| v.as_str()) { Some(c) => { let p = ctx.resolve(c)?; if !p.is_dir() { bail!("cwd {} is not a directory", p.display()); } p } None => ctx.workdir.clone() };
                 let timeout = Duration::from_secs(args.get("timeout_secs").and_then(|v| v.as_u64()).unwrap_or(0));
                 let max_lines = args.get("max_lines").and_then(|v| v.as_u64()).unwrap_or(200).max(1) as usize;
                 let (id, pid, log) = start(ctx.inbox.clone(), cmd, &cwd, filter, timeout, max_lines).await?;

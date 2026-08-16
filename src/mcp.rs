@@ -46,8 +46,12 @@ pub struct McpFile {
 pub fn discover(workdir: &Path, extra_files: &[PathBuf]) -> Vec<(String, ServerConfig, PathBuf)> {
     let mut files: Vec<PathBuf> = Vec::new();
     files.push(crate::setup::config_dir().join("mcp.json"));
-    files.push(workdir.join(".harness/mcp.json"));
-    files.push(workdir.join(".mcp.json"));
+    // project-local files can start arbitrary processes: only honoured in trusted directories
+    for rel in [".harness/mcp.json", ".mcp.json"] {
+        let f = workdir.join(rel);
+        if !f.is_file() { continue; }
+        if crate::permissions::is_trusted(workdir) { files.push(f); } else { eprintln!("mcp: skipping {} (directory not trusted; /trust to enable)", f.display()); }
+    }
     files.extend(extra_files.iter().cloned());
     let mut out: HashMap<String, (ServerConfig, PathBuf)> = HashMap::new();
     for f in files {
@@ -261,12 +265,18 @@ fn expand_env(s: &str) -> String {
 }
 
 /// A live MCP tool exposed through the harness `Tool` trait.
-pub struct McpTool { pub server: Arc<Mutex<McpServer>>, pub server_name: String, pub info: McpToolInfo, pub full_name: String, pub description: String }
+/// `name`/`description` are leaked once at construction (the `Tool` trait hands out `&'static str`).
+pub struct McpTool { pub server: Arc<Mutex<McpServer>>, pub server_name: String, pub info: McpToolInfo, pub name: &'static str, pub description: &'static str }
+impl McpTool {
+    pub fn new(server: Arc<Mutex<McpServer>>, server_name: String, info: McpToolInfo, full_name: String, description: String) -> Self {
+        Self { server, server_name, info, name: Box::leak(full_name.into_boxed_str()), description: Box::leak(description.into_boxed_str()) }
+    }
+}
 
 #[async_trait::async_trait]
 impl crate::tools::Tool for McpTool {
-    fn name(&self) -> &'static str { Box::leak(self.full_name.clone().into_boxed_str()) }
-    fn description(&self) -> &'static str { Box::leak(self.description.clone().into_boxed_str()) }
+    fn name(&self) -> &'static str { self.name }
+    fn description(&self) -> &'static str { self.description }
     fn parameters(&self) -> Value { self.info.input_schema.clone() }
     async fn call(&self, args: Value, ctx: &crate::tools::ToolCtx) -> Result<crate::tools::ToolOutput> {
         let mut s = self.server.lock().await;
@@ -289,7 +299,7 @@ pub async fn start_all(workdir: &Path, extra_files: &[PathBuf]) -> (Vec<Arc<dyn 
                 for info in infos {
                     let full = format!("mcp__{}__{}", sanitize(&name), sanitize(&info.name));
                     let desc = format!("[MCP {name}] {}", info.description);
-                    tools.push(Arc::new(McpTool { server: shared.clone(), server_name: name.clone(), full_name: full, description: desc, info }));
+                    tools.push(Arc::new(McpTool::new(shared.clone(), name.clone(), info, full, desc)));
                 }
                 servers.push(shared);
             }

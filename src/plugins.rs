@@ -123,6 +123,7 @@ impl Plugins {
     pub fn enabled(&self) -> Vec<Plugin> { self.installed().into_iter().filter(|p| p.enabled).collect() }
 
     pub fn set_enabled(&mut self, dirname: &str, on: bool) -> Result<()> {
+        check_name(dirname)?;
         if !self.dir.join(dirname).is_dir() { bail!("no installed plugin named '{dirname}'"); }
         self.state.disabled.retain(|d| d != dirname);
         if !on { self.state.disabled.push(dirname.to_string()); }
@@ -135,21 +136,21 @@ impl Plugins {
             (spec.to_string(), spec.trim_end_matches('/').trim_end_matches(".git").rsplit('/').next().unwrap_or("plugin").to_string())
         } else if Path::new(spec).is_dir() {
             let p = Path::new(spec).canonicalize()?; let name = p.file_name().unwrap().to_string_lossy().to_string();
-            let dst = self.dir.join(&name); if dst.exists() { bail!("'{name}' already installed"); }
+            check_name(&name)?; let dst = self.dir.join(&name); if dst.exists() { bail!("'{name}' already installed"); }
             #[cfg(unix)] { std::os::unix::fs::symlink(&p, &dst)?; }
             #[cfg(windows)] { copy_dir(&p, &dst)?; }
             return Ok(name);
         } else if spec.matches('/').count() == 1 {
             (format!("https://github.com/{spec}.git"), spec.split('/').nth(1).unwrap().to_string())
         } else { bail!("install spec must be owner/repo, a git URL, or a local directory") };
-        let dst = self.dir.join(&name);
+        check_name(&name)?; let dst = self.dir.join(&name);
         if dst.exists() { bail!("'{name}' already installed (use /plugin update {name})"); }
         let o = tokio::process::Command::new("git").args(["clone", "-q", "--depth", "1", &url]).arg(&dst).output().await?;
         if !o.status.success() { bail!("git clone failed: {}", String::from_utf8_lossy(&o.stderr).trim()); }
         Ok(name)
     }
     pub async fn update(&self, name: &str) -> Result<String> {
-        let d = self.dir.join(name); if !d.is_dir() { bail!("no installed plugin named '{name}'"); }
+        check_name(name)?; let d = self.dir.join(name); if !d.is_dir() { bail!("no installed plugin named '{name}'"); }
         let o = tokio::process::Command::new("git").args(["-C", &d.display().to_string(), "pull", "-q", "--ff-only"]).output().await?;
         if !o.status.success() { bail!("git pull failed: {}", String::from_utf8_lossy(&o.stderr).trim()); }
         Ok(format!("updated {name}"))
@@ -166,7 +167,7 @@ impl Plugins {
         self.installed().into_iter().filter(|p| p.path.join(".git").exists()).filter(|p| { let f = p.path.join(".git/FETCH_HEAD"); let h = p.path.join(".git/HEAD"); let m = std::fs::metadata(&f).or_else(|_| std::fs::metadata(&h)).and_then(|m| m.modified()).ok(); m.map(|t| t < cutoff).unwrap_or(false) }).map(|p| p.path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default()).collect()
     }
     pub fn remove(&mut self, name: &str) -> Result<()> {
-        let d = self.dir.join(name); if !d.exists() { bail!("no installed plugin named '{name}'"); }
+        check_name(name)?; let d = self.dir.join(name); if !d.exists() { bail!("no installed plugin named '{name}'"); }
         if d.is_symlink() { std::fs::remove_file(&d)?; } else { std::fs::remove_dir_all(&d)?; }
         self.state.disabled.retain(|x| x != name); self.save_state()
     }
@@ -236,6 +237,11 @@ fn collect_dsh_mcp(v: &serde_yaml::Value, out: &mut serde_json::Map<String, serd
     }
 }
 
+/// Plugin dir names must be a single plain path component (no separators, `..`, or leading dot).
+fn check_name(name: &str) -> Result<()> {
+    if name.is_empty() || name.contains('/') || name.contains('\\') || name == ".." || name.starts_with('.') || name.contains('\0') { bail!("invalid plugin name '{name}'"); }
+    Ok(())
+}
 #[allow(dead_code)]
 fn copy_dir(src: &Path, dst: &Path) -> Result<()> { std::fs::create_dir_all(dst)?; for e in std::fs::read_dir(src)? { let e = e?; let to = dst.join(e.file_name()); if e.file_type()?.is_dir() { copy_dir(&e.path(), &to)?; } else { std::fs::copy(e.path(), &to)?; } } Ok(()) }
 
@@ -282,4 +288,6 @@ mod tests {
         let mut out = serde_json::Map::new(); collect_dsh_mcp(&y, &mut out);
         assert_eq!(out["engram"]["command"], "engram"); assert_eq!(out["engram"]["args"][0], "mcp");
     }
+    #[test]
+    fn plugin_names() { assert!(check_name("my-plugin").is_ok()); for bad in ["", "..", "a/b", "a\\b", ".hidden", "../x"] { assert!(check_name(bad).is_err(), "{bad}"); } }
 }

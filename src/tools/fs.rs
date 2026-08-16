@@ -4,6 +4,8 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 
 pub struct ReadFile;
+/// Whole-file reads above this size are refused (use offset/limit to read a window).
+const MAX_READ_BYTES: u64 = 8 * 1024 * 1024;
 pub struct WriteFile;
 pub struct EditFile;
 pub struct ListDir;
@@ -22,15 +24,22 @@ impl Tool for ReadFile {
     }
     async fn call(&self, args: Value, ctx: &ToolCtx) -> Result<ToolOutput> {
         let path = ctx.resolve(arg_str(&args, "path")?)?;
-        let text = tokio::fs::read_to_string(&path).await.with_context(|| format!("reading {}", path.display()))?;
         let offset = args.get("offset").and_then(|v| v.as_u64()).unwrap_or(1).max(1) as usize;
         let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(400) as usize;
-        let total = text.lines().count();
-        let mut out = String::new();
-        for (i, line) in text.lines().enumerate().skip(offset - 1).take(limit) {
-            out.push_str(&format!("{:>5}\t{}\n", i + 1, line));
+        let windowed = args.get("offset").is_some() || args.get("limit").is_some();
+        let size = tokio::fs::metadata(&path).await.with_context(|| format!("reading {}", path.display()))?.len();
+        if size > MAX_READ_BYTES && !windowed { bail!("{} is {} MiB — too large to read whole; pass offset/limit to read a window, or use grep/bash (head/tail)", path.display(), size >> 20); }
+        // stream lines: only the requested window is kept in memory
+        use tokio::io::AsyncBufReadExt;
+        let f = tokio::fs::File::open(&path).await.with_context(|| format!("reading {}", path.display()))?;
+        let mut lines = tokio::io::BufReader::new(f).lines();
+        let end = offset.saturating_sub(1).saturating_add(limit);
+        let (mut total, mut out) = (0usize, String::new());
+        while let Some(line) = lines.next_line().await.with_context(|| format!("reading {}", path.display()))? {
+            total += 1;
+            if total >= offset && total <= end { out.push_str(&format!("{:>5}\t{}\n", total, line)); }
         }
-        if offset - 1 + limit < total { out.push_str(&format!("…[{} more lines; total {}]\n", total - (offset - 1 + limit), total)); }
+        if end < total { out.push_str(&format!("…[{} more lines; total {}]\n", total - end, total)); }
         if out.is_empty() { out.push_str("(empty)"); }
         Ok((crate::sandbox::truncate_middle(&out, ctx.max_output)).into())
     }
@@ -113,5 +122,54 @@ impl Tool for ListDir {
         names.sort();
         if names.is_empty() { return Ok("(empty)".into()); }
         Ok((crate::sandbox::truncate_middle(&names.join("\n"), ctx.max_output)).into())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static N: AtomicU64 = AtomicU64::new(0);
+    fn ctx() -> (ToolCtx, PathBuf) {
+        let d = std::env::temp_dir().join(format!("harness-fs-test-{}-{}", std::process::id(), N.fetch_add(1, Ordering::Relaxed)));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        (ToolCtx::basic(d.clone()), d)
+    }
+
+    #[tokio::test]
+    async fn read_offset_limit_and_huge_limit() {
+        let (c, d) = ctx();
+        std::fs::write(d.join("f.txt"), "l1\nl2\nl3\nl4\nl5\n").unwrap();
+        let t = ReadFile.call(json!({"path": "f.txt", "offset": 2, "limit": 2}), &c).await.unwrap().text;
+        assert!(t.contains("    2\tl2\n    3\tl3\n"), "{t}"); assert!(!t.contains("l1") && !t.contains("l4"), "{t}");
+        assert!(t.contains("2 more lines; total 5"), "{t}");
+        let t = ReadFile.call(json!({"path": "f.txt", "offset": 4, "limit": u64::MAX}), &c).await.unwrap().text;
+        assert!(t.contains("l5") && !t.contains("more lines"), "{t}");
+        let t = ReadFile.call(json!({"path": "f.txt"}), &c).await.unwrap().text;
+        assert!(t.starts_with("    1\tl1\n") && t.ends_with("    5\tl5\n"), "{t}");
+        assert!(ReadFile.call(json!({"path": "missing.txt"}), &c).await.is_err());
+        assert!(ReadFile.call(json!({"path": "../../etc/passwd"}), &c).await.unwrap_err().to_string().contains("escapes"));
+    }
+
+    #[tokio::test]
+    async fn write_and_edit() {
+        let (c, d) = ctx();
+        let t = WriteFile.call(json!({"path": "sub/dir/new.txt", "content": "a\nb\n"}), &c).await.unwrap().text;
+        assert!(t.starts_with("created"), "{t}");
+        assert_eq!(std::fs::read_to_string(d.join("sub/dir/new.txt")).unwrap(), "a\nb\n");
+        let t = WriteFile.call(json!({"path": "sub/dir/new.txt", "content": "a\nc\n"}), &c).await.unwrap().text;
+        assert!(t.contains("overwrote") && t.contains("+1 -1"), "{t}");
+        // edit: unique / ambiguous / missing / empty
+        let t = EditFile.call(json!({"path": "sub/dir/new.txt", "old": "c", "new": "d"}), &c).await.unwrap().text;
+        assert!(t.contains("@@ line 2") && t.contains("- c") && t.contains("+ d"), "{t}");
+        assert_eq!(std::fs::read_to_string(d.join("sub/dir/new.txt")).unwrap(), "a\nd\n");
+        std::fs::write(d.join("dup.txt"), "x x").unwrap();
+        assert!(EditFile.call(json!({"path": "dup.txt", "old": "x", "new": "y"}), &c).await.unwrap_err().to_string().contains("matches 2 times"));
+        assert!(EditFile.call(json!({"path": "dup.txt", "old": "zzz", "new": "y"}), &c).await.unwrap_err().to_string().contains("not found"));
+        assert!(EditFile.call(json!({"path": "dup.txt", "old": "", "new": "y"}), &c).await.is_err());
+        assert_eq!(std::fs::read_to_string(d.join("dup.txt")).unwrap(), "x x", "failed edits must not touch the file");
+        assert!(WriteFile.call(json!({"path": "/etc/harness-x", "content": ""}), &c).await.is_err());
     }
 }

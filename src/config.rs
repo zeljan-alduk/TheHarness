@@ -176,6 +176,7 @@ impl Config {
         let mut candidates: Vec<PathBuf> = Vec::new();
         if let Some(p) = explicit { candidates.push(p.to_path_buf()); }
         if let Some(p) = std::env::var_os("HARNESS_CONFIG") { candidates.push(PathBuf::from(p)); }
+        let local_idx = candidates.len(); // ./harness.toml (project-local; trust-gated below)
         candidates.push(PathBuf::from("harness.toml"));
         candidates.push(crate::setup::config_dir().join("harness.toml"));
         let exe = std::env::var_os("HARNESS_ORIG_EXE").map(PathBuf::from).or_else(|| std::env::current_exe().ok());
@@ -184,12 +185,30 @@ impl Config {
             // cargo run: target/{debug,release}/harness -> project root
             if let Some(root) = exe.ancestors().nth(3) { candidates.push(root.join("harness.toml")); }
         }
-        let path = candidates.iter().find(|p| p.is_file())
+        let idx = candidates.iter().position(|p| p.is_file())
             .with_context(|| format!("no harness.toml found (looked in {:?})", candidates))?;
+        let path = &candidates[idx];
         let text = std::fs::read_to_string(path)?;
         let mut cfg: Config = toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+        // A project-local ./harness.toml in an untrusted directory may not run hooks or bypass permissions.
+        let same = |a: &Path, b: &Path| a.canonicalize().ok().zip(b.canonicalize().ok()).map(|(x, y)| x == y).unwrap_or(false);
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let project_local = idx == local_idx && !candidates[local_idx + 1..].iter().any(|c| same(c, path));
+        if project_local && !crate::permissions::is_trusted(&cwd) {
+            let dropped = cfg.sanitize_untrusted();
+            if !dropped.is_empty() { eprintln!("config: {} defines {} — ignored because this directory is not trusted (/trust to enable)", path.display(), dropped.join(" and ")); }
+        }
         cfg.apply_env();
         Ok(cfg)
+    }
+
+    /// Drop hooks and downgrade bypass → auto (project-local configs in untrusted dirs). Returns what was dropped.
+    pub fn sanitize_untrusted(&mut self) -> Vec<&'static str> {
+        let mut dropped = Vec::new();
+        let h = &self.hooks;
+        if [&h.pre_tool, &h.post_tool, &h.on_stop, &h.on_prompt, &h.session_start, &h.session_end, &h.subagent_stop, &h.pre_compact, &h.notification].iter().any(|v| !v.is_empty()) { self.hooks = crate::hooks::HooksConfig::default(); dropped.push("hooks"); }
+        if self.permissions.mode == crate::permissions::Mode::Bypass { self.permissions.mode = crate::permissions::Mode::Auto; dropped.push("permissions.mode = bypass"); }
+        dropped
     }
 
     fn apply_env(&mut self) {
@@ -198,5 +217,17 @@ impl Config {
         if let Ok(v) = std::env::var("HARNESS_API_KEY") { self.llm.api_key = Some(v); }
         if let Ok(v) = std::env::var("HARNESS_MAX_TURNS") { if let Ok(n) = v.parse() { self.agent.max_turns = n; } }
         if let Ok(v) = std::env::var("HARNESS_NET") { self.net.enabled = matches!(v.as_str(), "1" | "true" | "yes"); }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn untrusted_sanitize() {
+        let mut cfg: Config = toml::from_str("[llm]\nbase_url='http://x'\nmodel='m'\n[agent]\n[permissions]\nmode='bypass'\n[hooks]\npre_tool=['echo hi']\n").unwrap();
+        assert_eq!(cfg.sanitize_untrusted(), vec!["hooks", "permissions.mode = bypass"]);
+        assert!(cfg.hooks.pre_tool.is_empty()); assert_eq!(cfg.permissions.mode, crate::permissions::Mode::Auto);
+        assert!(cfg.sanitize_untrusted().is_empty());
     }
 }

@@ -114,7 +114,8 @@ pub async fn run_task(cfg: &Config, client: &Client, task_dir: &Path, spec: &Tas
     }
 
     // Always run the check (partial work may still pass), from the task dir so relative scripts resolve.
-    let check_cmd = format!("TASK_DIR='{}' WORKDIR='{}' sh -c '{}'", task_dir.canonicalize().unwrap_or(task_dir.into()).display(), ctx.workdir.display(), spec.check.replace('\'', "'\\''"));
+    let q = crate::security::shell_quote;
+    let check_cmd = format!("TASK_DIR={} WORKDIR={} sh -c {}", q(&task_dir.canonicalize().unwrap_or(task_dir.into()).display().to_string()), q(&ctx.workdir.display().to_string()), q(&spec.check));
     match sandbox::run_shell(&check_cmd, &ctx.workdir, Duration::from_secs(300), 8000).await {
         Ok(o) => { result.passed = o.success(); result.check_output = format!("{}{}", o.stdout, if o.stderr.is_empty() { String::new() } else { format!("\n[stderr]\n{}", o.stderr) }); }
         Err(e) => { result.check_output = format!("check failed to run: {e:#}"); }

@@ -18,6 +18,7 @@ pub mod memory;
 pub mod permissions;
 pub mod plugins;
 pub mod procs;
+pub mod runner;
 pub mod sandbox;
 pub mod serve;
 pub mod security;

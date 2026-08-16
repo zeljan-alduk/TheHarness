@@ -1,6 +1,7 @@
 //! grep (ripgrep-backed, plain-grep fallback) and glob (native walker) — structured, bounded, read-only.
 
 use super::{arg_str, Tool, ToolCtx, ToolOutput};
+use crate::sandbox::shq;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use serde_json::{json, Value};
@@ -35,7 +36,7 @@ impl Tool for Grep {
         let context = args.get("context").and_then(|v| v.as_u64()).unwrap_or(0);
         let files_only = args.get("files_only").and_then(|v| v.as_bool()).unwrap_or(false);
         let glob = args.get("glob").and_then(|v| v.as_str());
-        let has_rg = crate::sandbox::run_shell("command -v rg", &ctx.workdir, std::time::Duration::from_secs(5), 200).await.map(|o| o.success()).unwrap_or(false);
+        let has_rg = super::archive::has_cmd(ctx, "rg").await;
         let mut cmd = if has_rg {
             let mut c = format!("rg --no-heading --line-number --color never --max-count 50 --max-columns 300 --max-columns-preview -e {}", shq(pattern));
             if ci { c.push_str(" -i"); }
@@ -119,7 +120,6 @@ pub fn glob_path(pat: &str, path: &str) -> bool {
     rec(&pat.chars().collect::<Vec<_>>(), &path.chars().collect::<Vec<_>>())
 }
 
-fn shq(s: &str) -> String { format!("'{}'", s.replace('\'', "'\\''")) }
 
 #[cfg(test)]
 mod tests {

@@ -25,10 +25,15 @@ impl Tool for ApplyPatch {
             }
         }
         let mut text = patch.to_string(); if !text.ends_with('\n') { text.push('\n'); }
-        let tmp = ctx.workdir.join(format!(".harness-patch-{}.diff", std::process::id()));
+        // temp diff lives outside the workdir (never pollutes the tree / git status)
+        static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let tmp = std::env::temp_dir().join(format!("harness-patch-{}-{}.diff", std::process::id(), N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
         tokio::fs::write(&tmp, &text).await?;
         let strip = if patch.lines().any(|l| l.starts_with("+++ b/") || l.starts_with("--- a/")) { 1 } else { 0 };
-        let cmd = format!("git apply --whitespace=nowarn --recount -p{strip} '{t}' 2>&1 || {{ echo '--- git apply failed, trying patch ---'; patch -p{strip} -N -s < '{t}' 2>&1; }}", t = tmp.display());
+        // git apply is atomic; the `patch` fallback is not, so dry-run first and only apply when it is
+        // clean (no partial application, no .rej/.orig files left behind).
+        let t = crate::sandbox::shq(&tmp.display().to_string());
+        let cmd = format!("git apply --whitespace=nowarn --recount -p{strip} {t} 2>&1 || {{ echo '--- git apply failed, trying patch ---'; patch --dry-run -p{strip} -N -s -r - < {t} 2>&1 && patch -p{strip} -N -s -r - --no-backup-if-mismatch < {t} 2>&1; }}");
         let out = crate::sandbox::run_shell(&cmd, &ctx.workdir, ctx.timeout, ctx.max_output).await;
         let _ = tokio::fs::remove_file(&tmp).await;
         let out = out?;
