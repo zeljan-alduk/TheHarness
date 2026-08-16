@@ -4,7 +4,7 @@ use crate::events::{Event, Sink};
 use crate::llm::{Client, Content, Delta, Message, Usage};
 use crate::tools::{Registry, ToolCtx};
 use anyhow::{bail, Result};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Default, Clone, serde::Serialize)]
 pub struct RunStats {
@@ -83,12 +83,19 @@ Max ~900 words. Output only the note.";
 
 Focus especially on: {f}")); }
     prog(0.08, &format!("summarizing {} messages (~{} tokens)", old.len(), transcript.chars().count() / 4));
-    // stream the note so progress is real: expected length ≈ 900 words ≈ 5500 chars
-    let mut got = 0usize;
+    // stream the note so progress is real. Thinking phase: 5% → 40% (asymptotic in reasoning length);
+    // writing phase: 40% → 98% (expected note ≈ 900 words ≈ 5500 chars). Label shows elapsed + tokens.
+    let mut got = 0usize; let mut thought = 0usize;
     let expected = 5500.0f64;
+    let t0 = Instant::now();
+    let mut last_emit = Instant::now();
     let (reply, _) = client.chat_stream(&[Message::system(system), Message::user(user)], &[], |d| {
-        if let Delta::Content(t) = d { got += t.chars().count(); let f = 0.08 + 0.9 * (got as f64 / expected).min(1.0); prog(f, "writing handoff note"); }
-        else if let Delta::Reasoning(_) = d { prog(0.08 + 0.02 * ((got as f64) / 400.0).min(1.0), "thinking about what to keep"); }
+        match d { Delta::Content(t) => got += t.chars().count(), Delta::Reasoning(t) => thought += t.chars().count() }
+        if last_emit.elapsed() < Duration::from_millis(150) { return; }
+        last_emit = Instant::now();
+        let secs = t0.elapsed().as_secs();
+        if got == 0 { let f = 0.05 + 0.35 * (1.0 - (-(thought as f64) / 3000.0).exp()); prog(f, &format!("thinking about what to keep · {secs}s · ~{} tok", thought / 4)); }
+        else { let f = 0.40 + 0.58 * (got as f64 / expected).min(1.0); prog(f, &format!("writing handoff note · {secs}s · ~{} tok", got / 4)); }
     }).await?;
     let summary = reply.text().trim().to_string();
     if summary.chars().count() < 80 { bail!("compaction summary too short"); }
