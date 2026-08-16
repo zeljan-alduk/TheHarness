@@ -107,3 +107,20 @@ pub fn path_with_bin_dir(_cwd: &Path) -> String {
     let cur = std::env::var("PATH").unwrap_or_default();
     if cur.split(':').any(|p| Path::new(p) == dir) { cur } else { format!("{}:{cur}", dir.display()) }
 }
+
+/// Write recommended MCP servers into ~/.config/harness/mcp.json (merging; never overwrites existing names).
+pub fn write_default_mcp() -> Result<Vec<String>> {
+    let path = PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".config/harness/mcp.json");
+    let mut doc: serde_json::Value = std::fs::read_to_string(&path).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or(serde_json::json!({"mcpServers": {}}));
+    if !doc["mcpServers"].is_object() { doc["mcpServers"] = serde_json::json!({}); }
+    let defaults = [
+        ("chrome-devtools", serde_json::json!({"command": "npx", "args": ["-y", "chrome-devtools-mcp@latest"], "disabled": false})),
+        ("playwright", serde_json::json!({"command": "npx", "args": ["-y", "@playwright/mcp@latest"], "disabled": true})),
+        ("filesystem-home", serde_json::json!({"command": "npx", "args": ["-y", "@modelcontextprotocol/server-filesystem", "${HOME}"], "disabled": true})),
+    ];
+    let mut added = Vec::new();
+    for (name, cfg) in defaults { if doc["mcpServers"].get(name).is_none() { doc["mcpServers"][name] = cfg; added.push(name.to_string()); } }
+    std::fs::create_dir_all(path.parent().unwrap())?;
+    std::fs::write(&path, serde_json::to_string_pretty(&doc)?)?;
+    Ok(added)
+}

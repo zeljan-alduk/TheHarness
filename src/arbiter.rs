@@ -105,3 +105,13 @@ pub fn judge(repo: &Path, branch: &str, runs: usize, filter: Option<&str>, merge
     }
     Ok(Verdict { branch: branch.into(), base_sha, tests_ok, baseline, proposal, green, reasons })
 }
+
+/// Store an existing eval report as the cached baseline for the current main sha.
+pub fn seed_baseline(repo: &Path, filter: Option<&str>, report: &Path) -> Result<()> {
+    let r = parse_report(report)?;
+    let (_, base_sha) = sh("git rev-parse --short main", repo, 30)?; let base_sha = base_sha.trim().to_string();
+    std::fs::create_dir_all(cache_dir())?;
+    let key = format!("baseline-{base_sha}-{}-{}.json", filter.unwrap_or("all").replace('/', "_"), r.total);
+    std::fs::write(cache_dir().join(key), serde_json::to_string_pretty(&vec![r])?)?;
+    Ok(())
+}

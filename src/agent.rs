@@ -113,22 +113,37 @@ pub fn system_prompt(workdir: &str, tools: &[&str], extra: Option<&str>) -> Stri
     system_prompt_with_memory(workdir, tools, extra, None)
 }
 
-pub fn system_prompt_with_memory(workdir: &str, tools: &[&str], extra: Option<&str>, memory: Option<&crate::memory::MemoryStore>) -> String {
-    let mut s = format!(
-"You are an autonomous software engineering agent running locally with a real toolchain.
+/// The base system prompt template. If `~/.config/harness/prompts/system.md` exists it is used instead
+/// (placeholders: {workdir}, {tools}); it is created from the built-in default on first use so it can be
+/// tuned by the user — or proposed by `harness self` and judged by the arbiter.
+pub fn base_prompt_template() -> String {
+    let default = DEFAULT_PROMPT.to_string();
+    let Some(home) = std::env::var_os("HOME") else { return default };
+    let dir = std::path::PathBuf::from(home).join(".config/harness/prompts");
+    let p = dir.join("system.md");
+    if let Ok(t) = std::fs::read_to_string(&p) { if t.trim().len() > 50 { return t; } }
+    let _ = std::fs::create_dir_all(&dir); let _ = std::fs::write(&p, &default);
+    default
+}
+
+const DEFAULT_PROMPT: &str = "You are an autonomous software engineering agent running locally with a real toolchain.
 Working directory: {workdir}
 Tools: {tools}
 
 Rules:
 - Act, don't ask. The user is not present; finish the task end-to-end, then reply with a short summary.
-- Explore before editing: list_dir / read_file / grep via bash. Never guess file contents.
-- Prefer edit_file for small changes; write_file for new files. Keep edits minimal and idiomatic.
-- Verify your work: run the build, tests, or the program itself with bash. If it fails, fix it and re-run.
+- Explore before editing: list_dir / read_file / grep / glob. Never guess file contents.
+- Prefer edit_file for small changes; apply_patch for multi-hunk changes; write_file for new files. Keep edits minimal and idiomatic.
+- Verify your work: run the build, tests, diagnostics, or the program itself with bash. If it fails, fix it and re-run.
 - The working directory is a git repository. Use `git status`, `git diff`, `git log` freely to understand state, and `git checkout -- <file>` / `git revert` to undo mistakes. Commit when a coherent unit of work is done, with a clear message.
+- For multi-step work keep the `todo` list current; delegate independent sub-tasks with spawn_agent (several in one turn run in parallel).
 - Tool outputs may be truncated in the middle; use offset/limit or grep to see more.
 - When done, your final message (with no tool calls) must state what changed and how you verified it.
-- Finish decisively: once the task is verified, stop calling tools and answer. Do not re-verify, re-read, or polish beyond what was asked; the user may have queued the next task.",
-        tools = tools.join(", "));
+- Finish decisively: once the task is verified, stop calling tools and answer. Do not re-verify, re-read, or polish beyond what was asked; the user may have queued the next task.";
+
+pub fn system_prompt_with_memory(workdir: &str, tools: &[&str], extra: Option<&str>, memory: Option<&crate::memory::MemoryStore>) -> String {
+    let mut s = base_prompt_template().replace("{workdir}", workdir).replace("{tools}", &tools.join(", "));
+
     if let Some(e) = extra { s.push_str("\n\n"); s.push_str(e); }
     s.push_str("\n\n"); s.push_str(&crate::setup::summary_line());
     if let Some(m) = memory { s.push_str(&m.prompt_block(std::path::Path::new(workdir))); }

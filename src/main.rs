@@ -84,6 +84,9 @@ enum Cmd {
     Setup {
         #[arg(long)]
         install: bool,
+        /// Add recommended MCP servers (chrome-devtools enabled; playwright, filesystem disabled) to ~/.config/harness/mcp.json
+        #[arg(long)]
+        mcp_defaults: bool,
     },
     /// Manage plugins: list | install <spec> | enable|disable|remove|update <name>
     Plugin {
@@ -100,6 +103,9 @@ enum Cmd {
         branch: String,
         #[arg(long, default_value_t = 1)]
         runs: usize,
+        /// Reuse an existing eval report as the main baseline (skips baseline runs)
+        #[arg(long)]
+        baseline: Option<PathBuf>,
         #[arg(short, long)]
         filter: Option<String>,
         #[arg(long)]
@@ -143,9 +149,10 @@ async fn main() -> Result<()> {
             let resume = cli.resume.clone().or(if cli.r#continue { Some("last".into()) } else { None });
             tui::run(cfg, resume).await?;
         }
-        Cmd::Arbiter { branch, runs, filter, merge } => {
+        Cmd::Arbiter { branch, runs, filter, merge, baseline } => {
             let repo = repo_root()?;
             let mut log = |s: &str| eprintln!("{s}");
+            if let Some(b) = &baseline { harness::arbiter::seed_baseline(&repo, filter.as_deref(), b)?; }
             let v = harness::arbiter::judge(&repo, &branch, runs.max(1), filter.as_deref(), merge, &mut log)?;
             println!("{}", serde_json::to_string(&serde_json::json!({"branch": v.branch, "green": v.green, "tests_ok": v.tests_ok, "reasons": v.reasons}))?);
             if !v.green { std::process::exit(1); }
@@ -165,7 +172,8 @@ async fn main() -> Result<()> {
             if !out.images.is_empty() { eprintln!("({} image(s) attached)", out.images.len()); }
             if out.text.starts_with("error:") { std::process::exit(1); }
         }
-        Cmd::Setup { install } => {
+        Cmd::Setup { install, mcp_defaults } => {
+            if mcp_defaults { let added = harness::setup::write_default_mcp()?; println!("mcp.json: added {}", if added.is_empty() { "nothing (all present)".into() } else { added.join(", ") }); }
             let mut st = harness::setup::check();
             harness::setup::print_report(&st);
             if install {
