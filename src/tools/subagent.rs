@@ -19,7 +19,8 @@ impl Tool for SpawnAgent {
             "workdir":{"type":"string","description":"optional sub-directory to work in (default: current workdir)"},
             "max_turns":{"type":"integer","description":"default 25"},
             "read_only":{"type":"boolean","description":"true = the sub-agent may not modify files (research/analysis)"},
-            "isolation":{"type":"string","enum":["none","worktree"],"description":"worktree = run in a fresh git worktree (own branch wt/agent-N); the report tells you the path/branch to merge from"}
+            "isolation":{"type":"string","enum":["none","worktree"],"description":"worktree = run in a fresh git worktree (own branch wt/agent-N); the report tells you the path/branch to merge from"},
+            "subagent_type":{"type":"string","description":"name of a custom agent (see 'Custom agents' in your system prompt) whose prompt, tools, model and permission mode this sub-agent should use"}
         },"required":["task"]})
     }
     async fn call(&self, args: Value, ctx: &ToolCtx) -> Result<ToolOutput> {
@@ -33,17 +34,36 @@ impl Tool for SpawnAgent {
             workdir = crate::worktree::create(&workdir, &name, None, None)?;
             wt_note = format!("\n[worktree '{name}' at {} — branch wt/{name}; merge or cherry-pick from it, then `worktree remove {{name:\"{name}\"}}`]", workdir.display());
         }
-        let max_turns = args.get("max_turns").and_then(|v| v.as_u64()).unwrap_or(25) as usize;
+        // named custom agent (.harness/agents/*.md, .claude/agents/*.md, …)
+        let def = match args.get("subagent_type").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+            Some(t) => {
+                let Some(d) = crate::agentdefs::find(&ctx.workdir, t) else {
+                    let names: Vec<String> = crate::agentdefs::discover(&ctx.workdir).into_iter().map(|a| a.name).collect();
+                    bail!("no agent named '{t}'. Available: {}", if names.is_empty() { "(none defined — add .harness/agents/<name>.md)".to_string() } else { names.join(", ") });
+                };
+                Some(d)
+            }
+            None => None,
+        };
+        if let Some(d) = &def { if d.isolation.as_deref() == Some("worktree") && wt_note.is_empty() {
+            let name = format!("agent-{}", env.next_label());
+            workdir = crate::worktree::create(&workdir, &name, None, None)?;
+            wt_note = format!("\n[worktree '{name}' at {} — branch wt/{name}; merge or cherry-pick from it, then `worktree remove {{name:\"{name}\"}}`]", workdir.display());
+        } }
+        let max_turns = args.get("max_turns").and_then(|v| v.as_u64()).map(|n| n as usize).or(def.as_ref().and_then(|d| d.max_turns)).unwrap_or(25);
         let read_only = args.get("read_only").and_then(|v| v.as_bool()).unwrap_or(false);
-        let registry = env.registry.without("spawn_agent");
+        let registry = match &def { Some(d) => env.registry.only(&d.filter_tools(&env.registry.names())).without("spawn_agent"), None => env.registry.without("spawn_agent") };
         let label = env.next_label();
         let info = env.register(format!("↳{label}"), task.clone());
         let sub_ctx = ToolCtx { workdir: workdir.clone(), timeout: ctx.timeout, max_output: ctx.max_output, net: ctx.net.clone(), memory: ctx.memory.clone(), subagent: None, redact_secrets: ctx.redact_secrets, hooks: ctx.hooks.clone(), todos: ctx.todos.clone(), lsp_servers: ctx.lsp_servers.clone(), extra_roots: ctx.extra_roots.clone(), approver: ctx.approver.clone(), inbox: info.inbox.clone(), cancel: Some(info.cancel.clone()), cwd: None, session_id: ctx.session_id.clone() };
         let mut pcfg = env.policy.cfg.clone(); pcfg.mode = env.policy.mode();
+        if let Some(m) = def.as_ref().and_then(|d| d.permission_mode) { pcfg.mode = m; }
         if read_only { pcfg.mode = crate::permissions::Mode::Plan; }
         let policy = crate::permissions::Policy::child_of(env.policy.clone(), pcfg, &workdir);
         let sink = crate::agent::PrefixSink { inner: env.sink.clone(), prefix: format!("↳{label} "), info: Some(info.clone()) };
-        let system = crate::agent::system_prompt_with_memory(&workdir.display().to_string(), &registry.names(), Some("You are a SUB-AGENT working on one delegated task. Do exactly the task, then reply with a concise, complete report of results (facts, file paths, what changed, what failed) — the parent agent only sees this report."), ctx.memory.as_ref());
+        let base_extra = "You are a SUB-AGENT working on one delegated task. Do exactly the task, then reply with a concise, complete report of results (facts, file paths, what changed, what failed) — the parent agent only sees this report.";
+        let extra = match &def { Some(d) => format!("{base_extra}\n\n# Your role: {}\n{}", d.name, d.prompt), None => base_extra.to_string() };
+        let system = crate::agent::system_prompt_with_memory(&workdir.display().to_string(), &registry.names(), Some(&extra), ctx.memory.as_ref());
         let finish = |status: &str| { *info.finished.lock().unwrap() = Some(std::time::Instant::now()); *info.status.lock().unwrap() = status.to_string(); if !ctx.hooks.subagent_stop.is_empty() { let h = ctx.hooks.clone(); let wd = ctx.workdir.clone(); let (l, st) = (info.label.clone(), status.to_string()); tokio::spawn(async move { let _ = crate::hooks::run_event(&h, "subagent_stop", &l, serde_json::json!({"label": l, "status": st}), &wd).await; }); } };
         // Claude Code backend: the sub-agent is another headless claude session with its own tool bridge
         if env.client.provider() == crate::llm::Provider::ClaudeCode {
@@ -58,7 +78,8 @@ impl Tool for SpawnAgent {
                 Err(e) => { finish(if info.cancel.load(std::sync::atomic::Ordering::Relaxed) { "killed" } else { "error" }); if info.cancel.load(std::sync::atomic::Ordering::Relaxed) { Ok("[sub-agent killed by the user]".into()) } else { Err(e) } }
             }
         } else {
-            let agent = crate::agent::Agent { client: &env.client, registry: &registry, ctx: &sub_ctx, max_turns, context_budget: env.context_budget, sink: &sink, stream: env.stream, policy: &policy, approver: env.approver.as_ref() };
+            let client = match def.as_ref().and_then(|d| d.model.clone()) { Some(m) => env.client.with_model(&m), None => env.client.clone() };
+            let agent = crate::agent::Agent { client: &client, registry: &registry, ctx: &sub_ctx, max_turns, context_budget: env.context_budget, sink: &sink, stream: env.stream, policy: &policy, approver: env.approver.as_ref() };
             match agent.run(&system, &task).await {
                 Ok((text, stats)) => { finish(&format!("{} ({} tool calls, {:.0}s)", stats.stop_reason, stats.tool_calls, stats.wall_secs)); Ok(format!("[sub-agent finished: {} turns, {} tool calls, {:.0}s, stop={}]{wt_note}\n{}", stats.turns, stats.tool_calls, stats.wall_secs, stats.stop_reason, text).into()) }
                 Err(e) => { finish("error"); Err(e) }

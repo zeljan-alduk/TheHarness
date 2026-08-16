@@ -192,6 +192,10 @@ pub fn system_prompt_with_memory(workdir: &str, tools: &[&str], extra: Option<&s
     if let Some(e) = extra { s.push_str("\n\n"); s.push_str(e); }
     s.push_str("\n\n"); s.push_str(&crate::setup::summary_line());
     if let Some(m) = memory { s.push_str(&m.prompt_block(std::path::Path::new(workdir))); }
+    let dir = std::path::Path::new(workdir);
+    s.push_str(&crate::instructions::cached(dir).prompt_block());
+    s.push_str(&crate::skills::prompt_block(dir));
+    s.push_str(&crate::agentdefs::prompt_block(dir));
     s
 }
 

@@ -2,6 +2,7 @@
 //! The CLI (`src/main.rs`) and the Tauri UI (`ui/src-tauri`) are thin frontends over this.
 
 pub mod agent;
+pub mod agentdefs;
 pub mod arbiter;
 pub mod claude_code;
 pub mod config;
@@ -9,6 +10,7 @@ pub mod eval;
 pub mod events;
 pub mod hooks;
 pub mod inbox;
+pub mod instructions;
 pub mod llm;
 pub mod lsp;
 pub mod mailbox;
@@ -25,6 +27,7 @@ pub mod serve;
 pub mod security;
 pub mod sessions;
 pub mod setup;
+pub mod skills;
 pub mod tools;
 pub mod workflow;
 pub mod worktree;

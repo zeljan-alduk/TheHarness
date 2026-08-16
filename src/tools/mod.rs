@@ -175,6 +175,11 @@ impl Registry {
         }
         Self { tools }
     }
+    /// A copy keeping only the named tools (custom agents' `tools:` allow-list). Empty list = unchanged.
+    pub fn only(&self, names: &[String]) -> Registry {
+        if names.is_empty() { return self.clone(); }
+        Registry { tools: self.tools.iter().filter(|t| names.iter().any(|n| n == t.name())).cloned().collect() }
+    }
     /// A copy without the named tool (used for sub-agents).
     pub fn without(&self, name: &str) -> Registry { Registry { tools: self.tools.iter().filter(|t| t.name() != name).cloned().collect() } }
     pub fn is_parallel_safe(&self, name: &str) -> bool { self.tools.iter().find(|t| t.name() == name).map(|t| t.parallel_safe()).unwrap_or(false) }
@@ -205,6 +210,7 @@ impl Registry {
                 Err(e) => return format!("error: tool arguments are not valid JSON ({e}): {args_json}").into(),
             }
         };
+        let args_for_rules = args.clone();
         // a panicking tool must not take the session down: it becomes an error result the model can see
         let mut out = match futures_util::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(tool.call(args, ctx))).await {
             Ok(Ok(s)) => s,
@@ -212,6 +218,11 @@ impl Registry {
             Err(p) => { let msg = p.downcast_ref::<String>().cloned().or_else(|| p.downcast_ref::<&str>().map(|s| s.to_string())).unwrap_or_else(|| "unknown panic".into()); format!("error: tool panicked: {msg}").into() }
         };
         if ctx.redact_secrets { out.text = crate::security::redact(&out.text); }
+        // path-scoped rules / sub-directory instruction files, injected the first time a call touches a match
+        if let Some(p) = crate::instructions::touched_path(name, &args_for_rules) {
+            let base = ctx.effective();
+            if let Ok(abs) = base.resolve(&p) { if let Some(extra) = crate::instructions::cached(&base.workdir).on_path(&abs) { out.text.push_str(&extra); } }
+        }
         // todo hygiene reminder (like Claude Code's system reminders): appended to a tool result, at most every 6 calls
         if name != "todo" && name != "load_skill" {
             if let Some(r) = todo_reminder(ctx) { out.text.push_str(&format!("\n\n[harness reminder] {r}")); }
@@ -232,7 +243,6 @@ pub async fn build_toolset(net_enabled: bool, workdir: &Path, with_mcp: bool) ->
     let mut servers = Vec::new();
     let mut prompt_extra = String::new();
     let plugins = crate::plugins::Plugins::open().ok();
-    if let Some(p) = &plugins { prompt_extra.push_str(&p.prompt_block()); }
     if with_mcp {
         let extra = plugins.as_ref().map(|p| p.mcp_files()).unwrap_or_default();
         let (tools, errs, srv) = crate::mcp::start_all(workdir, &extra).await;

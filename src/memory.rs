@@ -181,7 +181,7 @@ impl MemoryStore {
     }
 
     /// The block injected into the system prompt.
-    pub fn prompt_block(&self, workdir: &Path) -> String {
+    pub fn prompt_block(&self, _workdir: &Path) -> String {
         let cap = self.cfg.max_inject_chars;
         let mut s = String::from("\n\n# Persistent memory\nYou have three markdown memory files (below), loaded every session. Use the `memory` tool to record DURABLE, NON-OBVIOUS facts: user preferences and settings → MEMORY.md; reusable multi-step recipes → WORKFLOWS.md; what you learned about the user, this project, how things work here, and lessons from mistakes → BRAIN.md. Never store secrets, trivia, or anything derivable from the code. Prefer editing an existing bullet over adding a near-duplicate.\n");
         for f in FILES {
@@ -195,15 +195,7 @@ impl MemoryStore {
         let recent = self.recent_pastes(5);
         if !recent.is_empty() { s.push_str("\nMost recent pastes: "); s.push_str(&recent.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(", ")); }
         s.push('\n');
-        // Project instructions file, if any (like CLAUDE.md)
-        for name in ["HARNESS.md", ".harness/HARNESS.md"] {
-            let p = workdir.join(name);
-            if let Ok(t) = std::fs::read_to_string(&p) {
-                let t = if t.chars().count() > cap { t.chars().take(cap).collect::<String>() + "\n…[truncated]" } else { t };
-                s.push_str(&format!("\n--- project instructions ({}) ---\n{}\n", p.display(), t.trim_end()));
-                break;
-            }
-        }
+        // (project instruction files — AGENTS.md/CLAUDE.md/HARNESS.md — are loaded by crate::instructions)
         s
     }
 
