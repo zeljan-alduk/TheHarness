@@ -38,7 +38,7 @@ impl Tool for SpawnAgent {
         let registry = env.registry.without("spawn_agent");
         let label = env.next_label();
         let info = env.register(format!("↳{label}"), task.clone());
-        let sub_ctx = ToolCtx { workdir: workdir.clone(), timeout: ctx.timeout, max_output: ctx.max_output, net: ctx.net.clone(), memory: ctx.memory.clone(), subagent: None, redact_secrets: ctx.redact_secrets, hooks: ctx.hooks.clone(), todos: ctx.todos.clone(), lsp_servers: ctx.lsp_servers.clone(), extra_roots: ctx.extra_roots.clone(), approver: ctx.approver.clone(), inbox: info.inbox.clone(), cancel: Some(info.cancel.clone()), cwd: None };
+        let sub_ctx = ToolCtx { workdir: workdir.clone(), timeout: ctx.timeout, max_output: ctx.max_output, net: ctx.net.clone(), memory: ctx.memory.clone(), subagent: None, redact_secrets: ctx.redact_secrets, hooks: ctx.hooks.clone(), todos: ctx.todos.clone(), lsp_servers: ctx.lsp_servers.clone(), extra_roots: ctx.extra_roots.clone(), approver: ctx.approver.clone(), inbox: info.inbox.clone(), cancel: Some(info.cancel.clone()), cwd: None, session_id: ctx.session_id.clone() };
         let mut pcfg = env.policy.cfg.clone(); pcfg.mode = env.policy.mode();
         if read_only { pcfg.mode = crate::permissions::Mode::Plan; }
         let policy = crate::permissions::Policy::new(pcfg, &workdir);

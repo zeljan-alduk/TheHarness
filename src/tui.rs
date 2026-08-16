@@ -447,6 +447,9 @@ pub async fn run(cfg: Config, resume: Option<String>) -> Result<()> {
             tokio::select! {
                 _ = ticker.tick() => {
                     app.tick += 1; if app.tick % 30 == 0 { app.word = (app.word + 1) % WORDS.len(); }
+                    // cross-session: heartbeat every ~5s, poll our mailbox every ~2s
+                    if app.tick % 60 == 0 { if app.session_meta.id.is_empty() { app.session_meta.id = harness::sessions::SessionStore::new_id(); } harness::mailbox::heartbeat(&harness::mailbox::Live { id: app.session_meta.id.clone(), title: if app.session_meta.title.is_empty() { "(new session)".into() } else { app.session_meta.title.clone() }, workdir: app.workdir.display().to_string(), pid: std::process::id(), backend: app.cfg.llm.provider.clone().unwrap_or("local".into()), updated: 0, busy: app.running.is_some() }); }
+                    if app.tick % 25 == 0 && !app.session_meta.id.is_empty() { for m in harness::mailbox::take(&app.session_meta.id) { app.blocks.push(Block::System(format!("✉ message from session {}: {}", m.from, truncate(&m.text, 200)))); app.inbox.push(format!("message from session {}", m.from), m.text); } }
                     // wakeups: inbox events (monitor lines, scheduled prompts, messages) start a turn when idle
                     if app.running.is_none() && app.pending_ask.is_none() && app.pending_q.is_none() && !app.inbox.is_empty() && app.tick % 12 == 0 { if let Some(m) = app.inbox.take_message() { app.set_status("inbox event → waking the agent"); app.start_run(m); } }
                     let cap = app.cfg.agent.max_task_secs;
@@ -461,6 +464,7 @@ pub async fn run(cfg: Config, resume: Option<String>) -> Result<()> {
     }.await;
     let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableMouseCapture, crossterm::event::DisableBracketedPaste);
     ratatui::restore();
+    if !app.session_meta.id.is_empty() { harness::mailbox::unregister(&app.session_meta.id); }
     if !app.cfg.hooks.session_end.is_empty() { let _ = harness::hooks::run_event(&app.cfg.hooks, "session_end", "", serde_json::json!({"session": app.session_meta.id}), &app.workdir).await; }
     if let Some(h) = app.running.take() { h.abort(); }
     res
@@ -761,6 +765,17 @@ impl App {
                 lines.push("Mouse: wheel/trackpad scrolls the transcript and the thinking panel; click a tool call, answer or thought to fold/unfold it. Hold shift (or fn/option in Terminal) to select text.".into());
                 lines.push("Video: paste/drag a video (mp4/mov/webm/mkv/gif) or /video <path> → frame scrubber; select frames, enter attaches them as images with timestamps.".into());
                 lines.push("Images: ctrl+v pastes from the clipboard; typing or dragging an image path attaches it. Previews render as a color mosaic; the model sees the full image.".into());
+                self.blocks.push(Block::Banner(lines));
+            }
+            "/msg" | "/send" => {
+                let mut it = arg.splitn(2, ' '); let to = it.next().unwrap_or("").to_string(); let text = it.next().unwrap_or("").trim().to_string();
+                if to.is_empty() || text.is_empty() { self.blocks.push(Block::Error("usage: /msg <session id|prefix|title|all> <text>   (see /sessions live)".into())); }
+                else { match harness::mailbox::send(&to, &self.session_meta.id, &text) { Ok(n) => self.blocks.push(Block::System(format!("✉ delivered to {n} session(s)"))), Err(e) => self.blocks.push(Block::Error(format!("send failed: {e}"))) } }
+            }
+            "/sessions" if arg == "live" => {
+                let l = harness::mailbox::live();
+                let mut lines = vec![format!("Live sessions ({}) — /msg <id|prefix|title|all> <text>", l.len())];
+                for s in l { lines.push(format!("  {}{}  {:<40} {}  [{}]{}", if s.id == self.session_meta.id { "● " } else { "  " }, s.id, truncate(&s.title, 40), short_path(std::path::Path::new(&s.workdir)), s.backend, if s.busy { " busy" } else { "" })); }
                 self.blocks.push(Block::Banner(lines));
             }
             "/sessions" => {
@@ -1251,6 +1266,8 @@ impl App {
         let toolset = self.toolset.clone();
         let todos = self.todos.clone();
         let extra_roots = self.extra_roots.clone();
+        if self.session_meta.id.is_empty() { self.session_meta.id = harness::sessions::SessionStore::new_id(); }
+        let session_id = self.session_meta.id.clone();
         let inbox = self.inbox.clone();
         let cwd = self.wt_cwd.clone();
         let perm_mode = self.perm_mode;
@@ -1272,7 +1289,7 @@ impl App {
                 let _ = tx.send(Msg::Policy(policy.clone()));
                 let approver: Arc<dyn harness::permissions::Approver> = Arc::new(TuiApprover(tx.clone()));
                 let mut env_ = harness::agent::SubAgentEnv::new(client.clone(), registry.clone(), policy.clone(), approver.clone(), sink.clone(), budget, true); env_.cc_effort = cfg.llm.effort.clone(); let env = Arc::new(env_); let _ = tx.send(Msg::SubEnv(env.clone()));
-                let ctx = ToolCtx { workdir: workdir.clone(), timeout: Duration::from_secs(cfg.agent.tool_timeout_secs), max_output: cfg.agent.max_tool_output_chars, net: cfg.net.clone(), memory: store.clone(), subagent: Some(env), redact_secrets: cfg.security.redact_secrets, hooks: cfg.hooks.clone(), todos: todos.clone(), lsp_servers: cfg.lsp.servers.clone(), extra_roots: extra_roots.clone(), approver: Some(approver.clone()), inbox: inbox.clone(), cancel: None, cwd: Some(cwd.clone()) };
+                let ctx = ToolCtx { workdir: workdir.clone(), timeout: Duration::from_secs(cfg.agent.tool_timeout_secs), max_output: cfg.agent.max_tool_output_chars, net: cfg.net.clone(), memory: store.clone(), subagent: Some(env), redact_secrets: cfg.security.redact_secrets, hooks: cfg.hooks.clone(), todos: todos.clone(), lsp_servers: cfg.lsp.servers.clone(), extra_roots: extra_roots.clone(), approver: Some(approver.clone()), inbox: inbox.clone(), cancel: None, cwd: Some(cwd.clone()), session_id: Some(session_id.clone()) };
                 let agent = Agent { client: &client, registry, ctx: &ctx, max_turns: cfg.agent.max_turns, context_budget: budget, sink: sink.as_ref(), stream: true, policy: &policy, approver: approver.as_ref() };
                 let extra = format!("You are in an interactive session: the user can see everything and will reply; keep final answers concise.{extra_prompt}");
                 let system = harness::agent::system_prompt_with_memory(&workdir.display().to_string(), &registry.names(), Some(&extra), store.as_ref());
@@ -1574,7 +1591,8 @@ impl App {
 const COMMANDS: &[(&str, &str)] = &[
     ("/help", "show commands and keys"),
     ("/clear", "start a new session (forget the transcript)"),
-    ("/sessions", "list saved sessions"),
+    ("/sessions", "list saved sessions · /sessions live = other running sessions"),
+    ("/msg", "message another live session: /msg <id|prefix|title|all> <text>"),
     ("/resume", "resume a saved session: /resume <n|id|last>"),
     ("/model", "show or switch the model: /model <name>"),
     ("/backend", "switch backend: local (LM Studio etc.) | claude [model] [effort] (Claude Code CLI, subscription) | anthropic <model>"),

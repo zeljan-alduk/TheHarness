@@ -16,6 +16,7 @@ pub mod patch;
 pub mod pdf;
 pub mod process;
 pub mod search;
+pub mod sessions;
 pub mod skill;
 pub mod subagent;
 pub mod todo;
@@ -55,12 +56,14 @@ pub struct ToolCtx {
     pub cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     /// Worktree switch (`worktree enter/exit`); None = fixed working directory (enter unavailable).
     pub cwd: Option<crate::worktree::CwdCell>,
+    /// This session's id (for cross-session messaging).
+    pub session_id: Option<String>,
 }
 
 impl ToolCtx {
     /// A context with defaults (no memory/sub-agents/hooks) — tests, `harness tool`, sub-processes.
     pub fn basic(workdir: PathBuf) -> Self {
-        Self { workdir, timeout: Duration::from_secs(120), max_output: 16000, net: crate::config::NetConfig::default(), memory: None, subagent: None, redact_secrets: true, hooks: Default::default(), todos: Default::default(), lsp_servers: Default::default(), extra_roots: vec![], approver: None, inbox: Default::default(), cancel: None, cwd: None }
+        Self { workdir, timeout: Duration::from_secs(120), max_output: 16000, net: crate::config::NetConfig::default(), memory: None, subagent: None, redact_secrets: true, hooks: Default::default(), todos: Default::default(), lsp_servers: Default::default(), extra_roots: vec![], approver: None, inbox: Default::default(), cancel: None, cwd: None, session_id: None }
     }
     /// The context tools actually run in: if the session entered a worktree, workdir is the worktree and
     /// the original tree stays reachable as an extra root.
@@ -149,6 +152,8 @@ impl Registry {
             Arc::new(process::Process),
             Arc::new(todo::Todo),
             Arc::new(ask_user::AskUser),
+            Arc::new(sessions::ListSessions),
+            Arc::new(sessions::SendMessage),
             Arc::new(worktree::Worktree),
             Arc::new(monitor::Monitor),
             Arc::new(notify::Notify),
