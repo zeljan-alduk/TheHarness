@@ -343,6 +343,8 @@ struct App {
     perm_mode: harness::permissions::Mode,
     live_policy: Option<Arc<harness::permissions::Policy>>,
     extra_roots: Vec<PathBuf>,
+    /// worktree enter/exit state (shared with the running agent; persists across turns)
+    wt_cwd: harness::worktree::CwdCell,
     cc: Option<Arc<harness::claude_code::ClaudeCodeSession>>,
     cc_last_session: Option<String>,
     compact_progress: Option<(f64, String, Instant)>,
@@ -376,7 +378,7 @@ pub async fn run(cfg: Config, resume: Option<String>) -> Result<()> {
         quit: false, tick: 0, word: 0, models: vec![],
         metrics: Metrics::new(0), panel: None, attachments: vec![], tool_previews: Default::default(),
         picker, images: Default::default(), img_seq: 0,
-        think_scroll: 0, toolset: None, perm_mode: harness::permissions::Mode::Auto, live_policy: None, extra_roots: vec![], cc: None, cc_last_session: None, compact_progress: None, session_meta: harness::sessions::Meta::default(), todos: Default::default(), inbox: Default::default(), event_log: None, pending_ask: None, pending_q: None, subenv: None, attached: None, video: None, strip_rects: vec![], tr_rect: Rect::default(), panel_rect: Rect::default(), tr_start: 0, line_map: vec![],
+        think_scroll: 0, toolset: None, perm_mode: harness::permissions::Mode::Auto, live_policy: None, extra_roots: vec![], wt_cwd: harness::worktree::new_cell(), cc: None, cc_last_session: None, compact_progress: None, session_meta: harness::sessions::Meta::default(), todos: Default::default(), inbox: Default::default(), event_log: None, pending_ask: None, pending_q: None, subenv: None, attached: None, video: None, strip_rects: vec![], tr_rect: Rect::default(), panel_rect: Rect::default(), tr_start: 0, line_map: vec![],
     };
     app.metrics.ctx_len = app.cfg.llm.context_budget_tokens.unwrap_or(0);
     app.perm_mode = app.cfg.permissions.mode;
@@ -715,7 +717,7 @@ impl App {
                 let p = if arg.is_empty() { harness::setup::home_dir().display().to_string() } else { arg.clone() };
                 let p = if p.starts_with('~') { p.replacen('~', &harness::setup::home_dir().display().to_string(), 1) } else { p };
                 let p = if PathBuf::from(&p).is_absolute() { PathBuf::from(&p) } else { self.workdir.join(&p) };
-                match p.canonicalize() { Ok(p) if p.is_dir() => { self.workdir = p.clone(); let _ = std::env::set_current_dir(&p); self.blocks.push(Block::System(format!("cwd → {}", short_path(&p)))); }
+                match p.canonicalize() { Ok(p) if p.is_dir() => { self.workdir = p.clone(); *self.wt_cwd.lock().unwrap() = None; let _ = std::env::set_current_dir(&p); self.blocks.push(Block::System(format!("cwd → {}", short_path(&p)))); }
                     _ => self.blocks.push(Block::Error(format!("no such directory: {}", p.display()))) }
             }
             "/pwd" => self.blocks.push(Block::System(self.workdir.display().to_string())),
@@ -1167,6 +1169,7 @@ impl App {
         let todos = self.todos.clone();
         let extra_roots = self.extra_roots.clone();
         let inbox = self.inbox.clone();
+        let cwd = self.wt_cwd.clone();
         let perm_mode = self.perm_mode;
         let cc_existing = self.cc.clone(); let cc_resume = self.cc_last_session.clone();
         let cc_images: Vec<(String, String)> = atts.iter().map(|a| (a.mime.clone(), a.b64.clone())).collect();
@@ -1186,7 +1189,7 @@ impl App {
                 let _ = tx.send(Msg::Policy(policy.clone()));
                 let approver: Arc<dyn harness::permissions::Approver> = Arc::new(TuiApprover(tx.clone()));
                 let mut env_ = harness::agent::SubAgentEnv::new(client.clone(), registry.clone(), policy.clone(), approver.clone(), sink.clone(), budget, true); env_.cc_effort = cfg.llm.effort.clone(); let env = Arc::new(env_); let _ = tx.send(Msg::SubEnv(env.clone()));
-                let ctx = ToolCtx { workdir: workdir.clone(), timeout: Duration::from_secs(cfg.agent.tool_timeout_secs), max_output: cfg.agent.max_tool_output_chars, net: cfg.net.clone(), memory: store.clone(), subagent: Some(env), redact_secrets: cfg.security.redact_secrets, hooks: cfg.hooks.clone(), todos: todos.clone(), lsp_servers: cfg.lsp.servers.clone(), extra_roots: extra_roots.clone(), approver: Some(approver.clone()), inbox: inbox.clone(), cancel: None };
+                let ctx = ToolCtx { workdir: workdir.clone(), timeout: Duration::from_secs(cfg.agent.tool_timeout_secs), max_output: cfg.agent.max_tool_output_chars, net: cfg.net.clone(), memory: store.clone(), subagent: Some(env), redact_secrets: cfg.security.redact_secrets, hooks: cfg.hooks.clone(), todos: todos.clone(), lsp_servers: cfg.lsp.servers.clone(), extra_roots: extra_roots.clone(), approver: Some(approver.clone()), inbox: inbox.clone(), cancel: None, cwd: Some(cwd.clone()) };
                 let agent = Agent { client: &client, registry, ctx: &ctx, max_turns: cfg.agent.max_turns, context_budget: budget, sink: sink.as_ref(), stream: true, policy: &policy, approver: approver.as_ref() };
                 let extra = format!("You are in an interactive session: the user can see everything and will reply; keep final answers concise.{extra_prompt}");
                 let system = harness::agent::system_prompt_with_memory(&workdir.display().to_string(), &registry.names(), Some(&extra), store.as_ref());
@@ -1629,6 +1632,7 @@ fn draw(f: &mut Frame, app: &mut App) {
     if !app.net { st.push(dot()); st.push(Span::styled("offline", Style::default().fg(pal().pink))); }
     if !app.queued.is_empty() { st.push(dot()); st.push(Span::styled(format!("{} queued", app.queued.len()), Style::default().fg(pal().cyan))); }
     if let Some(id) = app.attached { st.push(dot()); st.push(Span::styled(format!("attached #{id}"), Style::default().fg(pal().orange))); }
+    if let Some(wt) = app.wt_cwd.lock().unwrap().as_ref() { st.push(dot()); st.push(Span::styled(format!("worktree {}", wt.name), Style::default().fg(pal().orange))); }
     let lw: usize = st.iter().map(|s| s.content.chars().count()).sum();
     let right = if app.running.is_none() { "? for shortcuts · /help" } else { "esc to interrupt" };
     let pad = width.saturating_sub(lw + right.chars().count() + 1);

@@ -6,12 +6,13 @@ Status: ☐ open · ◐ partial · ☑ done.
 
 ## P0 — most useful
 
-- ☐ **`ask_user`** (Claude Code `AskUserQuestion`) — multiple-choice / free-text clarification prompt shown in the
+- ☑ **`ask_user`** (Claude Code `AskUserQuestion`) — multiple-choice / free-text clarification prompt shown in the
   TUI (and desktop/web UIs) with an optional auto-continue timeout; headless runs answer "no user present".
 - ☐ **`monitor`** (`Monitor`) — run a command in the background and stream each output line (or matching lines)
   back into the conversation so the model can react to logs / polled status. Today `process tail` is polling only.
-- ☐ **`worktree`** (`EnterWorktree` / `ExitWorktree`) — create/switch into an isolated git worktree for a task and
-  return; `spawn_agent {isolation:"worktree"}` gets a fresh worktree automatically.
+- ☑ **`worktree`** (`EnterWorktree` / `ExitWorktree`) — `worktree {create|enter|exit|list|remove}` under
+  `.harness/worktrees/<name>` (excluded via `.git/info/exclude`); `enter` switches every tool's working directory until
+  `exit` (`ToolCtx::effective`, TUI mode line shows it); `spawn_agent {isolation:"worktree"}` gets a fresh worktree.
 - ☐ **MCP resources** (`ListMcpResourcesTool` / `ReadMcpResourceTool`) — the harness bridges MCP *tools* only;
   expose `mcp_resources {list|read, server, uri}`.
 

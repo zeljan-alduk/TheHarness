@@ -410,11 +410,13 @@ impl<'a> Agent<'a> {
                 self.sink.emit(&Event::ToolCall { id: id.clone(), name: call.function.name.clone(), args: call.function.arguments.clone() });
                 prepared.push((id, call.function.name.clone(), call.function.arguments.clone()));
             }
-            // permissions + pre-tool hooks
+            // permissions + pre-tool hooks; tools run in the effective context (worktree enter/exit)
+            let ectx = self.ctx.effective();
+            let ectx = &ectx;
             let mut blocked: Vec<Option<String>> = Vec::new();
             for (_, name, args) in &prepared {
                 if !self.ctx.hooks.pre_tool.is_empty() {
-                    if let Some(reason) = crate::hooks::run_pre_tool(&self.ctx.hooks, name, args, &self.ctx.workdir).await { self.sink.emit(&Event::Permission { tool: name.clone(), summary: crate::llm::truncate_for_log(args, 80), decision: format!("blocked by hook: {reason}") }); blocked.push(Some(format!("error: blocked by a pre-tool hook: {reason}"))); continue; }
+                    if let Some(reason) = crate::hooks::run_pre_tool(&self.ctx.hooks, name, args, &ectx.workdir).await { self.sink.emit(&Event::Permission { tool: name.clone(), summary: crate::llm::truncate_for_log(args, 80), decision: format!("blocked by hook: {reason}") }); blocked.push(Some(format!("error: blocked by a pre-tool hook: {reason}"))); continue; }
                 }
                 let av: serde_json::Value = serde_json::from_str(args).unwrap_or(serde_json::Value::Null);
                 let ro = self.registry.is_read_only(name);
@@ -437,11 +439,11 @@ impl<'a> Agent<'a> {
             }
             let outputs: Vec<(crate::tools::ToolOutput, f64)> = if all_read_only && prepared.len() > 1 {
                 // independent reads: run concurrently
-                let futs = prepared.iter().zip(blocked.iter()).map(|((_, name, args), b)| async move { if b.is_some() { return (crate::tools::ToolOutput::default(), 0.0); } let t0 = Instant::now(); let o = self.registry.call(name, args, self.ctx).await; (o, t0.elapsed().as_secs_f64()) });
+                let futs = prepared.iter().zip(blocked.iter()).map(|((_, name, args), b)| async move { if b.is_some() { return (crate::tools::ToolOutput::default(), 0.0); } let t0 = Instant::now(); let o = self.registry.call(name, args, ectx).await; (o, t0.elapsed().as_secs_f64()) });
                 futures_util::future::join_all(futs).await
             } else {
                 let mut v = Vec::new();
-                for ((_, name, args), b) in prepared.iter().zip(blocked.iter()) { if b.is_some() { v.push((crate::tools::ToolOutput::default(), 0.0)); continue; } let t0 = Instant::now(); let o = self.registry.call(name, args, self.ctx).await; v.push((o, t0.elapsed().as_secs_f64())); }
+                for ((_, name, args), b) in prepared.iter().zip(blocked.iter()) { if b.is_some() { v.push((crate::tools::ToolOutput::default(), 0.0)); continue; } let t0 = Instant::now(); let o = self.registry.call(name, args, ectx).await; v.push((o, t0.elapsed().as_secs_f64())); }
                 v
             };
             for (((id, name, _), (out, secs)), block) in prepared.into_iter().zip(outputs).zip(blocked) {

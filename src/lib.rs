@@ -24,3 +24,4 @@ pub mod sessions;
 pub mod setup;
 pub mod tools;
 pub mod workflow;
+pub mod worktree;
