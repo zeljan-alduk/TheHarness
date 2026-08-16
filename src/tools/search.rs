@@ -124,10 +124,72 @@ fn shq(s: &str) -> String { format!("'{}'", s.replace('\'', "'\\''")) }
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static N: AtomicU64 = AtomicU64::new(0);
+    fn ctx() -> (ToolCtx, PathBuf) {
+        let d = std::env::temp_dir().join(format!("harness-search-test-{}-{}", std::process::id(), N.fetch_add(1, Ordering::Relaxed)));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        (ToolCtx { workdir: d.clone(), timeout: std::time::Duration::from_secs(30), max_output: 16000, net: crate::config::NetConfig::default(), memory: None, subagent: None, redact_secrets: true, hooks: Default::default(), todos: Default::default() }, d)
+    }
+
     #[test]
     fn globs() {
         assert!(glob_path("**/*.rs", "src/tools/mod.rs")); assert!(glob_path("*.rs", "main.rs")); assert!(!glob_path("*.rs", "src/main.rs"));
         assert!(glob_path("src/**/test_*.py", "src/a/b/test_x.py")); assert!(glob_path("**/*.{ts,tsx}", "ui/app.tsx")); assert!(!glob_path("**/*.{ts,tsx}", "ui/app.js"));
         assert!(glob_path("**/*.rs", "lib.rs"));
+    }
+
+    #[tokio::test]
+    async fn grep_finds_match_with_line_number() {
+        let (c, d) = ctx();
+        std::fs::write(d.join("alpha.rs"), "fn one() {}\nlet needle = 1;\nfn three() {}\n").unwrap();
+        std::fs::write(d.join("beta.txt"), "nothing to see here\n").unwrap();
+
+        let out = Grep.call(json!({"pattern": "needle"}), &c).await.unwrap();
+        assert!(out.text.contains("alpha.rs"), "{}", out.text);
+        assert!(out.text.contains(":2:"), "expected line number 2 in: {}", out.text);
+        assert!(!out.text.contains("beta.txt"), "{}", out.text);
+
+        let none = Grep.call(json!({"pattern": "zz_no_such_token_zz"}), &c).await.unwrap();
+        assert!(none.text.contains("no matches"), "{}", none.text);
+    }
+
+    #[tokio::test]
+    async fn grep_glob_restricts_file_types() {
+        let (c, d) = ctx();
+        std::fs::write(d.join("alpha.rs"), "let needle = 1;\n").unwrap();
+        std::fs::write(d.join("beta.txt"), "let needle = 2;\n").unwrap();
+
+        let out = Grep.call(json!({"pattern": "needle", "glob": "*.rs"}), &c).await.unwrap();
+        assert!(out.text.contains("alpha.rs"), "{}", out.text);
+        assert!(!out.text.contains("beta.txt"), "glob *.rs should exclude beta.txt: {}", out.text);
+    }
+
+    #[tokio::test]
+    async fn glob_finds_nested_files() {
+        let (c, d) = ctx();
+        std::fs::create_dir_all(d.join("a/b")).unwrap();
+        std::fs::write(d.join("top.txt"), "t\n").unwrap();
+        std::fs::write(d.join("a/b/deep.txt"), "d\n").unwrap();
+        std::fs::write(d.join("a/notes.md"), "n\n").unwrap();
+
+        let out = Glob.call(json!({"pattern": "**/*.txt"}), &c).await.unwrap();
+        assert!(out.text.contains("top.txt"), "{}", out.text);
+        assert!(out.text.contains("a/b/deep.txt"), "nested file should match **/*.txt: {}", out.text);
+
+        let md = Glob.call(json!({"pattern": "*.md"}), &c).await.unwrap();
+        assert!(md.text.contains("a/notes.md"), "{}", md.text);
+        assert!(!md.text.contains("deep.txt"), "single-segment *.md must not match nested files: {}", md.text);
+    }
+
+    #[tokio::test]
+    async fn glob_no_match_reports() {
+        let (c, d) = ctx();
+        std::fs::write(d.join("x.txt"), "t\n").unwrap();
+        let out = Glob.call(json!({"pattern": "**/*.nope"}), &c).await.unwrap();
+        assert!(out.text.contains("no files match"), "{}", out.text);
     }
 }
