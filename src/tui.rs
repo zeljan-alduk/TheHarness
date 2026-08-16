@@ -284,7 +284,7 @@ enum Block {
     Banner(Vec<String>),
     User(String, Vec<String>),
     Assistant { text: String, streaming: bool, folded: bool },
-    Reasoning { text: String, streaming: bool, show: Option<bool> },
+    Reasoning { text: String, streaming: bool, show: Option<bool>, started: Instant, ended: Option<Instant> },
     Tool { id: String, name: String, args: String, result: Option<String>, secs: f64, images: usize, interrupted: bool, fold: Option<bool> },
     System(String),
     Error(String),
@@ -1089,7 +1089,8 @@ impl App {
             for b in self.blocks.iter_mut().rev() {
                 match b {
                     Block::Tool { result: None, interrupted, .. } => { *interrupted = true; }
-                    Block::Assistant { streaming, .. } | Block::Reasoning { streaming, .. } => { *streaming = false; }
+                    Block::Assistant { streaming, .. } => { *streaming = false; }
+                    Block::Reasoning { streaming, ended, .. } => { if ended.is_none() { *ended = Some(Instant::now()); } *streaming = false; }
                     _ => {}
                 }
             }
@@ -1158,11 +1159,11 @@ impl App {
             Event::ReasoningDelta { text } => {
                 self.metrics.on_delta(text.chars().count());
                 if let Some(Block::Reasoning { text: t, streaming: true, .. }) = self.blocks.last_mut() { t.push_str(&text); }
-                else { self.blocks.push(Block::Reasoning { text, streaming: true, show: None }); }
+                else { self.blocks.push(Block::Reasoning { text, streaming: true, show: None, started: Instant::now(), ended: None }); }
             }
             Event::Reasoning { text } => {
-                if let Some(Block::Reasoning { text: t, streaming, .. }) = self.blocks.last_mut() { *t = text; *streaming = false; }
-                else if !text.trim().is_empty() { self.blocks.push(Block::Reasoning { text, streaming: false, show: None }); }
+                if let Some(Block::Reasoning { text: t, streaming, ended, .. }) = self.blocks.last_mut() { *t = text; *streaming = false; *ended = Some(Instant::now()); }
+                else if !text.trim().is_empty() { let now = Instant::now(); self.blocks.push(Block::Reasoning { text, streaming: false, show: None, started: now, ended: Some(now) }); }
             }
             Event::AssistantDelta { text } => {
                 self.metrics.on_delta(text.chars().count());
@@ -1228,7 +1229,7 @@ impl App {
 
     fn finish_streaming(&mut self) {
         for b in self.blocks.iter_mut().rev().take(3) {
-            match b { Block::Assistant { streaming, .. } | Block::Reasoning { streaming, .. } => *streaming = false, _ => {} }
+            match b { Block::Assistant { streaming, .. } => *streaming = false, Block::Reasoning { streaming, ended, .. } => { if *streaming && ended.is_none() { *ended = Some(Instant::now()); } *streaming = false; } _ => {} }
         }
     }
 }
@@ -1593,16 +1594,17 @@ fn render_block(b: &Block, app: &App, width: usize, out: &mut Vec<Line<'static>>
             if text.is_empty() && *streaming { out.push(Line::from(vec![Span::styled("⏺ ", Style::default().fg(pal().fg)), Span::styled("▍", Style::default().fg(pal().orange))])); }
             out.push(Line::raw(""));
         }
-        Block::Reasoning { text, streaming, show } => {
+        Block::Reasoning { text, streaming, show, started, ended } => {
             let st = Style::default().fg(pal().think).italic();
+            let dur = ended.map(|e| e.duration_since(*started)).unwrap_or_else(|| started.elapsed());
+            let dur_s = { let s = dur.as_secs(); if s >= 60 { format!("{}m {:02}s", s / 60, s % 60) } else { format!("{s}s") } };
             if show.unwrap_or(app.show_thinking) {
                 let mut first = true;
                 for l in text.lines().filter(|l| !l.trim().is_empty()) { push_wrapped(out, vec![Span::styled(if first { "✻ " } else { "  " }, st), Span::styled(l.to_string(), st)], w, 2); first = false; }
                 if *streaming { if let Some(last) = out.last_mut() { last.spans.push(Span::styled("▍", st)); } }
             } else {
                 let firstline = text.lines().find(|l| !l.trim().is_empty()).unwrap_or("").trim().to_string();
-                let n = text.chars().count();
-                let lbl = if *streaming { format!("✻ Thinking… {}", truncate(&firstline, w.saturating_sub(40))) } else { format!("✻ Thought for {} chars: {}", n, truncate(&firstline, w.saturating_sub(40))) };
+                let lbl = if *streaming { format!("✻ Thinking… ({dur_s}) {}", truncate(&firstline, w.saturating_sub(44))) } else { format!("✻ Thought for {dur_s}: {}", truncate(&firstline, w.saturating_sub(44))) };
                 push_wrapped(out, vec![Span::styled(lbl, st), Span::styled("  (click · ctrl+t)", Style::default().fg(pal().dim))], w, 2);
             }
             out.push(Line::raw(""));
@@ -1646,13 +1648,17 @@ fn render_block(b: &Block, app: &App, width: usize, out: &mut Vec<Line<'static>>
             let colors = |label: &str| match label { "system prompt" => pal().blue, "tool schemas" => pal().cyan, "memory files" => pal().pink, "skills/plugins" => pal().think, "handoff notes" => pal().orange, "user messages" => pal().fg, "assistant" => pal().ok, "tool results" => pal().dim, "images" => pal().think, _ => pal().dim };
             let total: u64 = segments.iter().map(|x| x.1).sum();
             let win = (*window).max(total).max(1);
-            let barw = w.saturating_sub(6).clamp(20, 100) as u64;
             out.push(Line::from(vec![Span::styled("Context map ", Style::default().fg(pal().orange).bold()), Span::styled(format!("≈{} of {} tokens ({}%){}", fmt_k(total), fmt_k(*window), total * 100 / win, if *measured > 0 { format!(" · last measured prompt {}", fmt_k(*measured)) } else { String::new() }), Style::default().fg(pal().dim))]));
-            // stacked bar
-            let mut spans = vec![Span::raw("  ")]; let mut used = 0u64;
-            for (label, n) in segments { let cells = (n * barw / win).max(if *n > 0 { 1 } else { 0 }); used += cells; spans.push(Span::styled("█".repeat(cells as usize), Style::default().fg(colors(label)))); }
-            if used < barw { spans.push(Span::styled("░".repeat((barw - used) as usize), Style::default().fg(pal().panel_bg))); }
-            out.push(Line::from(spans));
+            // block grid: 10 rows × 20 cells, each cell = 0.5% of the window
+            let cells_total = 200u64;
+            let mut cells: Vec<Color> = Vec::new();
+            for (label, n) in segments { let k = ((*n * cells_total + win / 2) / win).max(if *n > 0 { 1 } else { 0 }); for _ in 0..k { cells.push(colors(label)); } }
+            cells.truncate(cells_total as usize);
+            for row in 0..10 {
+                let mut spans = vec![Span::raw("  ")];
+                for col in 0..20 { let i = row * 20 + col; match cells.get(i) { Some(c) => spans.push(Span::styled("⛁ ", Style::default().fg(*c))), None => spans.push(Span::styled("⛶ ", Style::default().fg(pal().panel_bg))) } }
+                out.push(Line::from(spans));
+            }
             // rows
             for (label, n) in segments {
                 if *n == 0 { continue; }
