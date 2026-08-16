@@ -407,6 +407,8 @@ pub async fn run(cfg: Config, resume: Option<String>) -> Result<()> {
             tokio::select! {
                 _ = ticker.tick() => {
                     app.tick += 1; if app.tick % 30 == 0 { app.word = (app.word + 1) % WORDS.len(); }
+                    // wakeups: inbox events (monitor lines, scheduled prompts, messages) start a turn when idle
+                    if app.running.is_none() && app.pending_ask.is_none() && app.pending_q.is_none() && !app.inbox.is_empty() && app.tick % 12 == 0 { if let Some(m) = app.inbox.take_message() { app.set_status("inbox event → waking the agent"); app.start_run(m); } }
                     let cap = app.cfg.agent.max_task_secs;
                     if cap > 0 && app.running.is_some() && app.run_started.elapsed().as_secs() > cap { app.blocks.push(Block::Error(format!("task exceeded max_task_secs ({cap}s) — stopping and moving on"))); app.next_task(); }
                 }
@@ -1361,7 +1363,7 @@ impl App {
                     let next = self.queued.remove(0);
                     self.set_status(format!("→ next task ({} left in queue)", self.queued.len()));
                     self.start_run(next);
-                }
+                } else if let Some(m) = self.inbox.take_message() { self.set_status("inbox event → waking the agent"); self.start_run(m); }
             }
         }
     }

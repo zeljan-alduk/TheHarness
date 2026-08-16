@@ -3,10 +3,15 @@ pub mod ask_user;
 pub mod bash;
 pub mod diagnostics;
 pub mod download;
+pub mod findings;
 pub mod fs;
 pub mod image;
 pub mod lsp;
+pub mod mcp_resources;
 pub mod memory;
+pub mod monitor;
+pub mod notify;
+pub mod monitor;
 pub mod notebook;
 pub mod patch;
 pub mod pdf;
@@ -16,6 +21,7 @@ pub mod skill;
 pub mod subagent;
 pub mod todo;
 pub mod web;
+pub mod worktree;
 pub mod worktree;
 
 use crate::llm::ToolDef;
@@ -146,6 +152,17 @@ impl Registry {
             Arc::new(todo::Todo),
             Arc::new(ask_user::AskUser),
             Arc::new(worktree::Worktree),
+            Arc::new(monitor::Monitor),
+            Arc::new(notify::Notify),
+            Arc::new(findings::ReportFindings),
+            Arc::new(mcp_resources::McpResources),
+            Arc::new(monitor::Monitor),
+            Arc::new(monitor::Schedule),
+            Arc::new(worktree::Worktree),
+            Arc::new(monitor::Monitor),
+            Arc::new(notify::Notify),
+            Arc::new(findings::ReportFindings),
+            Arc::new(mcp_resources::McpResources),
         ];
         if net_enabled {
             tools.push(Arc::new(web::WebFetch));

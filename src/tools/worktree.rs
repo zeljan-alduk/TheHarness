@@ -1,8 +1,8 @@
-//! worktree: isolated git worktrees for a task (Claude Code EnterWorktree/ExitWorktree parity).
-//! `enter` switches the session's working directory for all tools until `exit`; the original repo stays
-//! readable/writable (added as an extra root).
+//! worktree: isolated git worktrees for risky or parallel work. enter creates <repo>/.harness-worktrees/<name>
+//! on a new branch (from HEAD); exit removes it (optionally keeping the branch). Sub-agents can be
+//! pointed at the returned path with spawn_agent {workdir}.
 
-use super::{Tool, ToolCtx, ToolOutput};
+use super::{arg_str, Tool, ToolCtx, ToolOutput};
 use anyhow::{bail, Result};
 use async_trait::async_trait;
 use serde_json::{json, Value};
@@ -12,58 +12,37 @@ pub struct Worktree;
 #[async_trait]
 impl Tool for Worktree {
     fn name(&self) -> &'static str { "worktree" }
-    fn description(&self) -> &'static str { "Isolated git worktrees under <repo>/.harness/worktrees/<name> (each on its own branch, default wt/<name>). Actions: create {name, branch?, base?} makes one and returns its path; enter {name} creates it if needed and switches the working directory of ALL tools (bash, file tools, sub-agents) to it until exit; exit returns to the original directory (the worktree and branch stay; add remove=true to delete it, which refuses if there are uncommitted changes unless force=true); list; remove {name, delete_branch?, force?}. Commit inside the worktree, then merge/cherry-pick from the main tree." }
-    fn parameters(&self) -> Value {
-        json!({"type":"object","properties":{
-            "action":{"type":"string","enum":["create","enter","exit","list","remove"]},
-            "name":{"type":"string","description":"worktree name (letters, digits, - _ .)"},
-            "branch":{"type":"string","description":"branch to check out (default wt/<name>; created from base if missing)"},
-            "base":{"type":"string","description":"start point for a new branch (default HEAD)"},
-            "delete_branch":{"type":"boolean","description":"remove: also delete the branch"},
-            "remove":{"type":"boolean","description":"exit: also remove the worktree"},
-            "force":{"type":"boolean","description":"remove/exit: discard uncommitted changes"}
-        },"required":["action"]})
-    }
+    fn description(&self) -> &'static str { "Git worktrees for isolated experiments or parallel sub-agents. enter {name?, branch?} creates .harness-worktrees/<name> on a new branch from HEAD and returns its path (use it as workdir for spawn_agent or cd in bash); list; exit {name, keep_branch?} removes the worktree (branch kept by default so work can be merged/reviewed)." }
+    fn parameters(&self) -> Value { json!({"type":"object","properties":{"action":{"type":"string","enum":["enter","list","exit"]},"name":{"type":"string"},"branch":{"type":"string","description":"branch to create (default harness/<name>)"},"keep_branch":{"type":"boolean","description":"default true"}},"required":["action"]}) }
     async fn call(&self, args: Value, ctx: &ToolCtx) -> Result<ToolOutput> {
-        let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("list");
-        let name = args.get("name").and_then(|v| v.as_str()).map(|s| s.trim().to_string());
-        let flag = |k: &str| args.get(k).and_then(|v| v.as_bool()).unwrap_or(false);
-        let cwd = ctx.workdir.clone();
+        let action = arg_str(&args, "action")?;
+        let sh = |cmd: String| async move { crate::sandbox::run_shell(&cmd, &ctx.workdir, std::time::Duration::from_secs(120), 8000).await };
+        let root = sh("git rev-parse --show-toplevel 2>/dev/null".into()).await?;
+        if !root.success() { bail!("not inside a git repository"); }
+        let root = root.stdout.trim().to_string();
         match action {
-            "create" | "enter" => {
-                let Some(name) = name.filter(|n| !n.is_empty()) else { bail!("name required") };
-                let branch = args.get("branch").and_then(|v| v.as_str()); let base = args.get("base").and_then(|v| v.as_str());
-                let root = crate::worktree::main_root(&cwd)?;
-                let existing = crate::worktree::path_of(&root, &name);
-                let (path, created) = if action == "enter" && existing.is_dir() { (existing, false) } else { (crate::worktree::create(&cwd, &name, branch, base)?, true) };
-                let st = crate::worktree::status(&path);
-                if action == "create" { return Ok(format!("created worktree '{name}' at {} ({st}). Use worktree enter {{name}} to work inside it, or bash with cd.", path.display()).into()); }
-                let Some(cell) = &ctx.cwd else { bail!("enter is not available in this context (fixed working directory); use bash with cd {} instead", path.display()) };
-                let mut cur = cell.lock().unwrap();
-                if cur.is_none() { *cur = Some(crate::worktree::Cwd { original: root.clone(), current: path.clone(), name: name.clone() }); }
-                else if let Some(c) = cur.as_mut() { c.current = path.clone(); c.name = name.clone(); }
-                Ok(format!("{} worktree '{name}' at {} ({st}). All tools now run there; the main tree {} remains accessible. Call worktree exit when done.", if created { "created and entered" } else { "entered" }, path.display(), root.display()).into())
+            "list" => { let o = sh("git worktree list".into()).await?; Ok(o.stdout.trim().to_string().into()) }
+            "enter" => {
+                let name = args.get("name").and_then(|v| v.as_str()).map(|s| s.to_string()).unwrap_or_else(|| format!("wt-{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() % 100000).unwrap_or(0)));
+                let name = name.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '-' }).collect::<String>();
+                let branch = args.get("branch").and_then(|v| v.as_str()).map(String::from).unwrap_or(format!("harness/{name}"));
+                let path = format!("{root}/.harness-worktrees/{name}");
+                let o = sh(format!("mkdir -p '{root}/.harness-worktrees' && (grep -qx '.harness-worktrees/' '{root}/.git/info/exclude' 2>/dev/null || echo '.harness-worktrees/' >> '{root}/.git/info/exclude'); git worktree add -b '{branch}' '{path}' HEAD 2>&1 || git worktree add '{path}' '{branch}' 2>&1")).await?;
+                if !o.success() { bail!("worktree add failed: {}{}", o.stdout, o.stderr); }
+                Ok(format!("worktree ready: {path} (branch {branch}, from HEAD). Work there via spawn_agent {{workdir: \"{path}\"}} or `cd {path} && …`; when done: worktree exit {{name: \"{name}\"}} then merge the branch if wanted.").into())
             }
             "exit" => {
-                let Some(cell) = &ctx.cwd else { bail!("not inside a worktree") };
-                let prev = cell.lock().unwrap().take();
-                let Some(prev) = prev else { bail!("not inside a worktree") };
-                let mut msg = format!("left worktree '{}' — back in {}. Worktree state: {}.", prev.name, prev.original.display(), crate::worktree::status(&prev.current));
-                if flag("remove") { match crate::worktree::remove(&prev.original, &prev.name, flag("delete_branch"), flag("force")) { Ok(m) => msg.push_str(&format!(" {m}.")), Err(e) => msg.push_str(&format!(" (not removed: {e})")) } }
+                let name = arg_str(&args, "name")?;
+                let keep = args.get("keep_branch").and_then(|v| v.as_bool()).unwrap_or(true);
+                let path = format!("{root}/.harness-worktrees/{name}");
+                let br = sh(format!("git -C '{path}' rev-parse --abbrev-ref HEAD 2>/dev/null")).await.map(|o| o.stdout.trim().to_string()).unwrap_or_default();
+                let o = sh(format!("git worktree remove --force '{path}' 2>&1 && git worktree prune")).await?;
+                if !o.success() { bail!("worktree remove failed: {}{}", o.stdout, o.stderr); }
+                let mut msg = format!("removed worktree {path}");
+                if !keep && !br.is_empty() { let d = sh(format!("git branch -D '{br}' 2>&1")).await?; msg.push_str(&format!("; branch {br} {}", if d.success() { "deleted" } else { "NOT deleted" })); } else if !br.is_empty() { msg.push_str(&format!("; branch {br} kept (merge or delete it yourself)")); }
                 Ok(msg.into())
             }
-            "list" => {
-                let l = crate::worktree::list(&cwd)?;
-                if l.is_empty() { return Ok("no harness worktrees".into()); }
-                let inside = ctx.cwd.as_ref().and_then(|c| c.lock().unwrap().as_ref().map(|c| c.name.clone()));
-                Ok(l.into_iter().map(|(n, p, b)| format!("{}{n}  branch {b}  {}  ({})", if inside.as_deref() == Some(&n) { "* " } else { "  " }, p.display(), crate::worktree::status(&p))).collect::<Vec<_>>().join("\n").into())
-            }
-            "remove" => {
-                let Some(name) = name.filter(|n| !n.is_empty()) else { bail!("name required") };
-                if let Some(c) = &ctx.cwd { if c.lock().unwrap().as_ref().map(|c| c.name == name).unwrap_or(false) { bail!("you are inside worktree '{name}'; call worktree exit first (exit {{remove:true}} does both)"); } }
-                Ok(crate::worktree::remove(&cwd, &name, flag("delete_branch"), flag("force"))?.into())
-            }
-            _ => bail!("unknown action {action}"),
+            _ => bail!("unknown action"),
         }
     }
 }
