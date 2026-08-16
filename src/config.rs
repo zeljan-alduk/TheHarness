@@ -243,7 +243,66 @@ impl LlmConfig {
     }
 }
 
+/// Where a setting came from, lowest precedence first. `--setting-sources` selects which are read.
+pub const SOURCES: [&str; 5] = ["managed", "user", "project", "local", "cli"];
+
 impl Config {
+    /// `Config::load` plus the layered overlays: managed → user → project → local → CLI `--set`.
+    /// `sources` is a comma-separated subset of `SOURCES` (None = all of them).
+    pub fn load_layered(explicit: Option<&Path>, sources: Option<&str>, sets: &[String]) -> Result<Config> {
+        let mut cfg = Config::load(explicit)?;
+        let wanted: Vec<String> = match sources {
+            Some(s) => s.split(',').map(|x| x.trim().to_lowercase()).filter(|x| !x.is_empty()).collect(),
+            None => SOURCES.iter().map(|s| s.to_string()).collect(),
+        };
+        for w in &wanted { if !SOURCES.contains(&w.as_str()) { anyhow::bail!("unknown setting source '{w}' (use {})", SOURCES.join(",")); } }
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let trusted = crate::permissions::is_trusted(&cwd);
+        for (source, path) in Self::overlay_files(&cwd) {
+            if !wanted.iter().any(|w| w == source) { continue; }
+            let project_scoped = source == "project" || source == "local";
+            cfg.apply_overlay_file(&path, !(project_scoped && !trusted));
+        }
+        if wanted.iter().any(|w| w == "cli") {
+            for kv in sets {
+                let (k, v) = kv.split_once('=').with_context(|| format!("--set needs key=value (got {kv})"))?;
+                cfg.set_setting(k.trim(), v.trim()).with_context(|| format!("--set {kv}"))?;
+            }
+        }
+        Ok(cfg)
+    }
+
+    /// The overlay files in precedence order (later wins). Managed settings come from
+    /// $HARNESS_MANAGED_CONFIG or /etc/harness/managed.toml and are applied first so a policy file
+    /// cannot be silently dropped, then user, project and personal-local settings.
+    pub fn overlay_files(cwd: &Path) -> Vec<(&'static str, PathBuf)> {
+        let mut v: Vec<(&'static str, PathBuf)> = Vec::new();
+        let managed = std::env::var_os("HARNESS_MANAGED_CONFIG").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/etc/harness/managed.toml"));
+        v.push(("managed", managed));
+        v.push(("user", Self::settings_overlay_path()));
+        v.push(("project", cwd.join(".harness").join("settings.toml")));
+        v.push(("local", cwd.join(".harness").join("settings.local.toml")));
+        v
+    }
+
+    /// Apply one overlay file: flat dotted keys (`"ui.theme" = "light"`) or nested tables
+    /// (`[ui] theme = "light"`). Untrusted project files may not raise privileges.
+    pub fn apply_overlay_file(&mut self, path: &Path, trusted: bool) -> usize {
+        let Ok(text) = std::fs::read_to_string(path) else { return 0 };
+        let Ok(v) = text.parse::<toml::Value>() else { eprintln!("config: {} is not valid TOML — ignored", path.display()); return 0 };
+        let mut pairs = Vec::new();
+        flatten("", &v, &mut pairs);
+        let mut n = 0;
+        for (k, val) in pairs {
+            if !trusted && k == "permissions.mode" && val == "bypass" {
+                eprintln!("config: {} sets permissions.mode = bypass — ignored because this directory is not trusted (/trust to enable)", path.display());
+                continue;
+            }
+            match self.set_setting(&k, &val) { Ok(()) => n += 1, Err(e) => eprintln!("config: {} — {e:#}", path.display()) }
+        }
+        n
+    }
+
     /// Lookup order: --config / $HARNESS_CONFIG, ./harness.toml, ~/.config/harness/harness.toml,
     /// next to the executable, and the repo root when running via cargo.
     pub fn load(explicit: Option<&Path>) -> Result<Config> {
@@ -356,9 +415,56 @@ impl Config {
     }
 }
 
+/// Nested TOML tables → flat dotted keys, so `[ui] theme = "x"` and `"ui.theme" = "x"` are the same.
+fn flatten(prefix: &str, v: &toml::Value, out: &mut Vec<(String, String)>) {
+    match v {
+        toml::Value::Table(t) => {
+            for (k, val) in t {
+                let key = if prefix.is_empty() { k.clone() } else { format!("{prefix}.{k}") };
+                flatten(&key, val, out);
+            }
+        }
+        toml::Value::String(s) => out.push((prefix.to_string(), s.clone())),
+        other => out.push((prefix.to_string(), other.to_string())),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn layered_overlays() {
+        let base = "[llm]\nbase_url='http://x'\nmodel='m'\n[agent]\n";
+        let mut cfg: Config = toml::from_str(base).unwrap();
+        let d = std::env::temp_dir().join(format!("harness-cfg-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        // nested tables and flat dotted keys are equivalent
+        let nested = d.join("nested.toml");
+        std::fs::write(&nested, "[ui]\ntheme = \"light\"\ntool_view = \"full\"\n").unwrap();
+        assert_eq!(cfg.apply_overlay_file(&nested, true), 2);
+        assert_eq!(cfg.ui.theme, "light");
+        assert_eq!(cfg.ui.tool_view, "full");
+        let flat = d.join("flat.toml");
+        std::fs::write(&flat, "\"ui.theme\" = \"dark\"\n\"agent.max_turns\" = 7\n").unwrap();
+        assert_eq!(cfg.apply_overlay_file(&flat, true), 2);
+        assert_eq!(cfg.ui.theme, "dark");
+        assert_eq!(cfg.agent.max_turns, 7);
+        // an untrusted project overlay may not turn permissions off
+        let danger = d.join("danger.toml");
+        std::fs::write(&danger, "\"permissions.mode\" = \"bypass\"\n\"ui.theme\" = \"light\"\n").unwrap();
+        assert_eq!(cfg.apply_overlay_file(&danger, false), 1);
+        assert_eq!(cfg.permissions.mode, crate::permissions::Mode::Auto);
+        assert_eq!(cfg.ui.theme, "light");
+        assert_eq!(cfg.apply_overlay_file(&danger, true), 2);
+        assert_eq!(cfg.permissions.mode, crate::permissions::Mode::Bypass);
+        // unknown files are simply absent
+        assert_eq!(cfg.apply_overlay_file(&d.join("nope.toml"), true), 0);
+        let names: Vec<&str> = Config::overlay_files(std::path::Path::new("/proj")).iter().map(|(s, _)| *s).collect();
+        assert_eq!(names, vec!["managed", "user", "project", "local"]);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
     #[test]
     fn untrusted_sanitize() {
         let mut cfg: Config = toml::from_str("[llm]\nbase_url='http://x'\nmodel='m'\n[agent]\n[permissions]\nmode='bypass'\n[hooks]\npre_tool=['echo hi']\n").unwrap();

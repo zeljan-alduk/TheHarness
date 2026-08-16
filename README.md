@@ -40,6 +40,12 @@ mkdir -p ~/.config/harness && cp harness.toml ~/.config/harness/   # user config
 cd ~/some/project && harness                 # interactive TUI: streaming, tools, /commands, esc to interrupt
 ```
 Config lookup: `--config`, `$HARNESS_CONFIG`, `./harness.toml`, `~/.config/harness/harness.toml`, next to the binary.
+Settings then layer on top of it, later winning: **managed** (`/etc/harness/managed.toml` or
+`$HARNESS_MANAGED_CONFIG`) → **user** (`~/.config/harness/settings.toml`, written by `/settings`) →
+**project** (`.harness/settings.toml`) → **local** (`.harness/settings.local.toml`, personal, gitignore it)
+→ **CLI** (`--set ui.theme=light`, repeatable). Each file takes flat dotted keys (`"ui.theme" = "light"`)
+or nested tables; `--setting-sources user,project` restricts which layers are read, and a project file in
+an untrusted directory may not set `permissions.mode = bypass`.
 
 ## Quick start
 

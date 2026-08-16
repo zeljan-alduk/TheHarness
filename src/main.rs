@@ -27,6 +27,12 @@ struct Cli {
     /// Permission mode override: bypass | auto | ask | plan
     #[arg(long, global = true)]
     permissions: Option<String>,
+    /// Override one setting for this run: --set ui.theme=light (repeatable)
+    #[arg(long = "set", global = true, value_name = "KEY=VALUE")]
+    sets: Vec<String>,
+    /// Which layers of settings to read (default: all): managed,user,project,local,cli
+    #[arg(long, global = true, value_name = "LIST")]
+    setting_sources: Option<String>,
     /// Resume a saved session in the TUI (id, number from /sessions, or "last")
     #[arg(short = 'r', long)]
     resume: Option<String>,
@@ -294,7 +300,7 @@ enum PluginCmd {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    let mut cfg = config::Config::load(cli.config.as_deref())?;
+    let mut cfg = config::Config::load_layered(cli.config.as_deref(), cli.setting_sources.as_deref(), &cli.sets)?;
     if let Some(m) = &cli.permissions { cfg.permissions.mode = harness::permissions::Mode::parse(m).context("--permissions must be bypass|auto|ask|plan")?; }
     harness::checkpoints::configure(&cfg.checkpoints);
     sandbox::configure_seatbelt(cfg.sandbox.mode == "seatbelt" || cfg.sandbox.mode == "bwrap", cfg.sandbox.deny_network, cfg.sandbox.allow_write.clone());
