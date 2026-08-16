@@ -29,6 +29,14 @@ Status: ☐ open · ◐ partial · ☑ done.
 - ☑ **Model-driven plan mode** (`EnterPlanMode` / `ExitPlanMode`) — `plan_mode {enter|exit {plan}}`: sets the shared
   policy to Plan, presents the plan via ask_user-style question (approve / approve+ask / revise), restores the mode.
 
+## P0 pass from docs/GAPS.md — DONE 2026-08-16
+
+Instruction files (AGENTS.md/CLAUDE.md chain, @imports, path-scoped rules), skills + custom agents from
+the standard directories, file checkpoints with /undo · /redo · /rewind · /fork, `harness acp` (Agent
+Client Protocol server), the tool-call shim for models without function calling, permission rules with
+argument matchers + built-in guards + the auto-mode classifier, and headless stream-json in/out with
+`--json-schema`. See docs/GAPS.md §2b. Remaining work is the P1/P2 lists there.
+
 ## P2
 
 - ◐ **Agent messaging** (`SendMessage` / `ListAgents`) — `agents {list|send {id,message}|kill|wait}` (steer via the

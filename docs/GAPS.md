@@ -132,6 +132,21 @@ Next five: **OpenHands** (84k★, research reference harness), **Kilo Code** (27
 | Arena/best-of-n as data source for the arbiter | Cursor/Qwen/Windsurf arenas | ❌ | see F | P1 |
 | Prompt-as-data (system prompt, tool descriptions, compaction prompt overridable files) | Goose `prompts/*.md`, Gemini `GEMINI_SYSTEM_MD` | ✅ `prompts/system.md` | tool descriptions + compaction/plan/subagent prompts as files | P2 |
 
+## 2b. Status — P0 pass merged 2026-08-16 (build 1.0.018)
+
+All six P0 items are implemented, tested and on `main`:
+
+| # | Item | Where | Notes |
+|---|---|---|---|
+| 1 | Instruction files, skills, agents, rules | `src/instructions.rs`, `src/skills.rs`, `src/agentdefs.rs` | AGENTS.md→CLAUDE.md→HARNESS.md→GEMINI.md→.cursorrules→copilot-instructions chain with walk-up, globals, `*.local/override`, `@imports`; rules with `paths:` injected on first touch; skills from `.harness/.agents/.claude/skills` + plugins with `allowed-tools`/`model`/`effort`/`paths:`; custom agents with tools/model/permission-mode/isolation via `spawn_agent {subagent_type}` |
+| 2 | File checkpoints + fork | `src/checkpoints.rs`, TUI, `harness checkpoint` | shadow git per session, snapshot before every mutating tool and at each turn; `/undo` `/redo` `/checkpoints` `/rewind [code\|conv] <n>` `/fork` |
+| 3 | ACP server | `src/acp.rs`, `harness acp` | initialize/session · new/load/prompt/cancel/set_mode, `session/update` for messages, thoughts, tool calls + results, `session/request_permission`; smoke test `scripts/acp_smoke.py` |
+| 4 | Tool shim | `src/llm.rs` | `<tool_call>` protocol in the prompt, parsing of `<tool_call>`/`<function_call>`/fenced/bare JSON, `[llm] tool_shim = auto\|on\|off`, auto-latch on server error or text calls |
+| 5 | Classifier auto mode + rules | `src/permissions.rs` | `Tool(arg:glob)` / `domain:` matchers with Claude-Code tool aliases, catastrophic-command deny, credential-file deny, `[permissions.auto]` LLM classifier (fail-closed) |
+| 6 | Headless stream-json + `--json-schema` | `src/headless.rs` | Claude-Code-compatible output *and* input, `--output-format text\|json\|stream-json`, schema-checked final answers with one corrective turn |
+
+Next up: the P1 list below.
+
 ## 3. Roadmap distilled from the matrix
 
 **P0 — do next (parity items every top-10 harness has, cheap relative to value):**

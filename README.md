@@ -21,6 +21,11 @@ never by the agent's own opinion.
   Anthropic subscription is used through the official client. Requires Claude Code installed and logged in.
 - **Anthropic API**: `provider = "anthropic"` + `ANTHROPIC_API_KEY`.
 
+Models without a function-calling API are handled by a **tool shim**: the tool catalogue goes into the
+prompt and `<tool_call>{…}</tool_call>` blocks in the reply are parsed back into tool calls
+(`[llm] tool_shim = "auto" | "on" | "off"`; auto switches over by itself when a server rejects tools or a
+model writes calls as text).
+
 ## Platforms
 macOS (primary; Kitty for inline images, seatbelt sandbox, temps via macmon), Linux (notify-send,
 wl-paste/xclip for clipboard), Windows (`harness.exe`; install **Git for Windows** so the `bash` tool has a
@@ -47,6 +52,9 @@ cargo build --release
 ./target/release/harness self "Make the bash tool return the cwd in its result"   # agent edits itself on a proposal/* branch
 ./target/release/harness --json run "..."              # JSONL event stream on stdout (for UIs)
 ./target/release/harness tool bash '{"cmd":"ls"}'      # call one tool directly, no model (debug tools)
+./target/release/harness acp                           # run as an ACP agent on stdio (Zed, JetBrains, nvim, Emacs)
+./target/release/harness run --output-format stream-json "..."   # Claude-Code-compatible event stream
+./target/release/harness checkpoint list               # file checkpoints of this directory's last session
 ```
 
 ## Desktop UI (Tauri)
@@ -70,11 +78,16 @@ scrubber (ffmpeg): ←/→, space to select, enter attaches frames with timestam
 /model /cd /tools /mcp /plugin /memory /brain /workflows /remember /reflect /compact /net /panel …`.
 
 ## Permissions, sub-agents, sessions
-- **Permissions**: `[permissions] mode = bypass|auto|ask|plan` + allow/deny/ask glob rules; risky shell
-  commands and writes outside the workdir prompt (y / a=always / n) in the TUI, desktop and web UIs;
-  `/permissions`, `/plan`, shift+tab cycles; `harness run -y` approves non-interactively.
-- **Sub-agents**: `spawn_agent {task, workdir?, read_only?}` — fresh context, same tools/policy; several in
-  one turn run in parallel. Read-only tool calls in one turn also run in parallel.
+- **Permissions**: `[permissions] mode = bypass|auto|ask|plan` + allow/deny/ask rules — `bash:git *`,
+  `Bash(git * main)`, `WebFetch(domain:example.com)`, `Agent(subagent_type:review*)`. Risky shell commands
+  and writes outside the workdir prompt (y / a=always / n) in the TUI, desktop and web UIs; catastrophic
+  commands are refused outright and credential files (`.env`, ssh keys, `*.pem`, …) are never read into the
+  context. `[permissions.auto]` puts borderline calls to an LLM classifier (the aux model) instead of
+  interrupting you — it fails closed. `/permissions`, `/plan`, shift+tab cycles; `harness run -y` approves
+  non-interactively.
+- **Sub-agents**: `spawn_agent {task, workdir?, read_only?, isolation?, subagent_type?}` — fresh context, same
+  tools/policy (or a custom agent's), several in one turn run in parallel. Read-only tool calls in one turn
+  also run in parallel.
 - **Task hand-off**: messages typed while a task runs are queued; `/next` (⌃N) stops the current task and
   starts the next; loop detection nudges then stops repeated identical calls; reflection never blocks the
   next task.
@@ -92,6 +105,38 @@ preferences, ideas), **WORKFLOWS.md** (named recipes), **BRAIN.md** (what the ag
 projects ledger, how-tos, lessons). The agent edits them with the `memory` tool; after substantive
 runs a *reflection* call appends durable lessons; long files are *consolidated*. Evals use an isolated
 store. A project can add `HARNESS.md` (like CLAUDE.md) with instructions.
+
+## Project instructions, skills and custom agents
+- **Instructions**: per directory the first of `AGENTS.md` → `CLAUDE.md` → `HARNESS.md` → `GEMINI.md` →
+  `.cursorrules` → `.github/copilot-instructions.md` is loaded, walking from the repo root down to the
+  working directory (most specific last), plus `~/.agents/AGENTS.md`, `~/.claude/CLAUDE.md`,
+  `~/.config/harness/HARNESS.md` and any `*.local.md` / `*.override.md`. A file may pull in others with
+  `@path/to/file` lines. Instruction files in sub-directories arrive when a tool first touches a file there.
+- **Rules**: `.harness/rules/*.md` (also `.claude/rules`, `.cursor/rules/*.mdc`) with frontmatter
+  `paths:`/`globs:` — always-on rules go into the system prompt, path-scoped ones are appended to the tool
+  result the first time a matching file is touched.
+- **Skills**: `.harness/skills/<name>/SKILL.md` (also `.agents/skills`, `.claude/skills`, the same under `~`,
+  and plugin skills). Frontmatter: `description`, `allowed-tools`, `model`, `effort`, `paths:` (only offered
+  when the project has a matching file). The model calls `load_skill {name}`; `/skills` lists them.
+- **Custom agents**: `.harness/agents/<name>.md` (also `.claude/agents`, `.cursor/agents`, `~`): frontmatter
+  `tools`, `model`, `effort`, `permission-mode`, `isolation`, `max-turns`; the body is the agent's system
+  prompt. Delegate with `spawn_agent {task, subagent_type: "<name>"}`.
+
+## Undo: file checkpoints
+Before every file-changing tool call — and at each turn boundary — the working tree is snapshotted into a
+shadow git repo under `~/.config/harness/snapshots/<session>` (never your project's `.git`; ignored and
+oversized files are skipped). `/undo` and `/redo` move through them, `/checkpoints` lists them, `/rewind <n>`
+restores files *and* the conversation, `/rewind code <n>` only the files, `/rewind conv` only the conversation,
+`/fork` continues as a separate session. Outside the TUI: `harness checkpoint list|undo|redo|restore|diff|prune`.
+Turn it off with `[checkpoints] enabled = false`.
+
+## Editors (ACP) and headless use
+- `harness acp` speaks the Agent Client Protocol on stdio, so Zed, JetBrains, Neovim, Emacs and other ACP
+  clients can run the whole harness — tools, permissions, checkpoints, MCP, sub-agents — as their agent.
+  Tool calls, thinking and diffs stream as `session/update`; approvals become `session/request_permission`.
+- `harness run --output-format text|json|stream-json` and `--input-format stream-json` (one user message per
+  line on stdin, multi-turn) use the same JSON shapes as the Claude Code CLI. `--json-schema <json|file>`
+  forces the final answer to match a schema (one corrective turn, then a non-zero exit).
 
 ## Plugins & MCP
 - `harness plugin list|install|enable|disable|remove|update` or `/plugin …` in the TUI. Catalog from the
@@ -118,7 +163,7 @@ PATH) and `--install` adds missing ones with Homebrew.
 
 ```
 src/
-  main.rs      CLI: run | eval | self | models | config
+  main.rs      CLI: run | acp | eval | self | checkpoint | models | config
   config.rs    harness.toml + HARNESS_* env overrides
   llm.rs       OpenAI-compatible chat client (tools, reasoning channel, <think> stripping)
   agent.rs     the loop: model → tool calls → results → model; budgets; context compaction
@@ -126,6 +171,10 @@ src/
   sandbox.rs   local process supervision: timeout, process-group kill, env scrub, output caps
   tools/       bash, read_file, write_file, edit_file, list_dir, view_image, memory, load_skill, read_pdf, pdf_edit, extract_archive, web_fetch, web_search, download_file (+ MCP tools)
   memory.rs    MEMORY/WORKFLOWS/BRAIN store, reflection, consolidation, pastes dir
+  instructions.rs AGENTS.md/CLAUDE.md/HARNESS.md chain, @imports, path-scoped rules
+  skills.rs / agentdefs.rs  skills and named custom agents from the standard directories
+  checkpoints.rs shadow-git snapshots of the working tree (/undo, /redo, /rewind)
+  acp.rs       Agent Client Protocol server (editors) · headless.rs  stream-json + --json-schema runs
   mcp.rs       MCP stdio client · plugins.rs plugin manager · setup.rs external tools · tui.rs terminal UI
   eval.rs      the fitness function: runs evals/tasks/* in fresh git-initialised workdirs
   arbiter.rs   proposal-vs-main verdict · selfimprove.rs  smart self-improvement loop (propose → gates → implement → arbiter → install)
