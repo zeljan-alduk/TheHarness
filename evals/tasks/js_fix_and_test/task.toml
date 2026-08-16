@@ -1,0 +1,5 @@
+name = "js_fix_and_test"
+tags = ["javascript", "edit", "test", "medium"]
+prompt = "mathx.js has a bug in `clamp` (it ignores the upper bound). Fix it and add tests in mathx.test.js using only Node's built-in `node:test` and `node:assert` modules (no npm installs), covering add, mul and clamp (including values below, inside and above the range). Run `node --test` and make sure it passes."
+check = "node --test --test-reporter=tap 2>&1 | grep -q '^# fail 0' && node -e \"const m=require('./mathx.js'); if(m.clamp(15,0,10)!==10||m.clamp(-5,0,10)!==0||m.clamp(5,0,10)!==5) process.exit(1)\" && test -f mathx.test.js"
+max_turns = 20

@@ -1,0 +1,5 @@
+name = "py_refactor_shared"
+tags = ["python", "refactor", "multi-file", "medium"]
+prompt = "app/report.py and app/export.py both define an identical helper `format_money`. Refactor: move it into a new module app/money.py, import it from there in both files, delete the duplicates, and keep `python3 -m unittest -q` passing. Do not change behavior."
+check = "python3 -m unittest -q 2>&1 | grep -q '^OK' && test -f app/money.py && grep -q 'def format_money' app/money.py && ! grep -q 'def format_money' app/report.py && ! grep -q 'def format_money' app/export.py && grep -Eq 'from app.money import|from .money import|import app.money|from app import money' app/report.py"
+max_turns = 20

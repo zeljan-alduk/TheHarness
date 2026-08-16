@@ -1,0 +1,6 @@
+name = "sqlite_query"
+tags = ["sql", "data", "easy"]
+prompt = "shop.db is a SQLite database (tables customers(id,name) and orders(id,customer_id,total)). Write top_customer.sql that returns exactly one row: the name of the customer with the highest sum of order totals, and the sum. Verify with `sqlite3 shop.db < top_customer.sql`."
+setup = "sqlite3 shop.db 'CREATE TABLE customers(id INTEGER PRIMARY KEY, name TEXT); CREATE TABLE orders(id INTEGER PRIMARY KEY, customer_id INTEGER, total REAL); INSERT INTO customers VALUES (1,\"ann\"),(2,\"bob\"),(3,\"cid\"); INSERT INTO orders VALUES (1,1,10),(2,2,50),(3,1,15),(4,3,30),(5,2,5);'"
+check = "test \"$(sqlite3 -separator '|' shop.db < top_customer.sql | head -1 | sed 's/\\.0$//')\" = 'bob|55'"
+max_turns = 12

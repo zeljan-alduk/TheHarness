@@ -1,0 +1,5 @@
+name = "py_debug_crash"
+tags = ["python", "debug", "easy"]
+prompt = "`python3 stats.py data.json` crashes. Fix stats.py so it prints the average age of all users (2 decimals) even when a record has no age or a non-numeric age (skip those). Expected output for data.json is exactly `average age: 31.50`."
+check = "test \"$(python3 stats.py data.json)\" = 'average age: 31.50'"
+max_turns = 15

@@ -95,6 +95,16 @@ enum Cmd {
         #[arg(short = 'C', long)]
         dir: Option<PathBuf>,
     },
+    /// Judge a proposal branch against main with the eval suite (build, test, N eval runs, regression gate); --merge merges on green
+    Arbiter {
+        branch: String,
+        #[arg(long, default_value_t = 1)]
+        runs: usize,
+        #[arg(short, long)]
+        filter: Option<String>,
+        #[arg(long)]
+        merge: bool,
+    },
     /// List saved sessions
     Sessions,
     /// List models on the configured server
@@ -125,6 +135,13 @@ async fn main() -> Result<()> {
         Cmd::Chat => {
             let resume = cli.resume.clone().or(if cli.r#continue { Some("last".into()) } else { None });
             tui::run(cfg, resume).await?;
+        }
+        Cmd::Arbiter { branch, runs, filter, merge } => {
+            let repo = repo_root()?;
+            let mut log = |s: &str| eprintln!("{s}");
+            let v = harness::arbiter::judge(&repo, &branch, runs.max(1), filter.as_deref(), merge, &mut log)?;
+            println!("{}", serde_json::to_string(&serde_json::json!({"branch": v.branch, "green": v.green, "tests_ok": v.tests_ok, "reasons": v.reasons}))?);
+            if !v.green { std::process::exit(1); }
         }
         Cmd::Sessions => {
             let store = harness::sessions::SessionStore::open()?;

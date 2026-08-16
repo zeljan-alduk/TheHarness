@@ -106,6 +106,12 @@ ui/src-tauri   Tauri 2 desktop app (Rust) · ui/dist  vanilla web frontend
 | **Surface** | `tools/*`, system prompt in `agent.rs::system_prompt`, `harness.toml` | agent via `harness self` |
 | **Fitness** | `evals/tasks/*` | humans add; agent may add (never weaken) |
 
+### Arbiter
+`harness arbiter proposal/x [--runs N] [--merge]` builds and tests the branch in its worktree, runs the
+eval suite N times with the branch's binary, compares against a cached baseline for `main`, prints a
+per-task table and a verdict (tests pass ∧ mean score not lower ∧ no always-pass→always-fail task);
+`--merge` merges on green.
+
 ### Self-improvement protocol (`harness self`)
 1. Requires a clean tree; creates `proposal/<slug>` from the current branch.
 2. Agent reads README + relevant source, edits, must pass `cargo build --release` + `cargo test`.

@@ -1,0 +1,5 @@
+name = "csv_report"
+tags = ["python", "data", "easy"]
+prompt = "Write summarize.py that reads sales.csv (columns: category,amount) and prints one line per category as `category: total` with totals as integers, sorted by total descending (ties by name). Run it to verify."
+check = "test \"$(python3 summarize.py | tr '\\n' '|')\" = 'books: 60|toys: 45|food: 12|'"
+max_turns = 12

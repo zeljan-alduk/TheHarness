@@ -1,0 +1,5 @@
+name = "rename_symbol"
+tags = ["python", "refactor", "search", "medium"]
+prompt = "Rename the function `calc_total` to `compute_total` everywhere in this project (definitions, imports, calls, docs and tests) so that no reference to `calc_total` remains and `python3 -m unittest -q` still passes."
+check = "python3 -m unittest -q 2>&1 | grep -q '^OK' && ! grep -rq 'calc_total' --include='*.py' --include='*.md' . && grep -rq 'compute_total' pkg/"
+max_turns = 15

@@ -1,0 +1,5 @@
+name = "sh_wordfreq"
+tags = ["shell", "greenfield", "easy"]
+prompt = "Write an executable POSIX shell script wordfreq.sh that takes a text file path as its only argument and prints the 3 most frequent words (case-insensitive, letters only, punctuation stripped) as lines `count word`, most frequent first (ties broken alphabetically). Test it on sample.txt."
+check = "sh wordfreq.sh sample.txt | head -3 | tr -s ' ' | sed 's/^ *//' | tr '\\n' '|' | grep -qx '5 the|3 fox|2 dog|'"
+max_turns = 15

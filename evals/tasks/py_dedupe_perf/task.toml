@@ -1,0 +1,5 @@
+name = "py_dedupe_perf"
+tags = ["python", "performance", "medium"]
+prompt = "dedupe.py has an O(n^2) `dedupe` function that is too slow for large inputs. Rewrite it to run in linear time while preserving the first-occurrence order and the exact same results (values may be any hashable). `python3 bench.py` must print `ok` in under 2 seconds."
+check = "out=$(timeout_cmd() { perl -e 'alarm shift; exec @ARGV' \"$@\"; }; timeout_cmd 20 python3 bench.py 2>&1); test \"$out\" = 'ok'"
+max_turns = 15

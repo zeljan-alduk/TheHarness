@@ -1,0 +1,5 @@
+name = "rs_add_flag"
+tags = ["rust", "feature", "medium"]
+prompt = "This Rust CLI reverses its arguments joined by spaces. Add an optional `--upper` flag (may appear anywhere) that also upper-cases the output. `cargo run -q -- --upper hello world` must print `DLROW OLLEH`, and `cargo run -q -- hello world` must still print `dlrow olleh`. Keep it dependency-free."
+check = "test \"$(cargo run -q -- --upper hello world 2>/dev/null)\" = 'DLROW OLLEH' && test \"$(cargo run -q -- hello world 2>/dev/null)\" = 'dlrow olleh'"
+max_turns = 20

@@ -1,0 +1,5 @@
+name = "git_branch_commit"
+tags = ["git", "workflow", "easy"]
+prompt = "In this git repository create a branch named `feature/notes` from the current branch, add a file NOTES.md containing the line `# Notes`, commit it on that branch with the message `Add notes`, and switch back to the original branch. The original branch must not contain NOTES.md."
+check = "git rev-parse --verify feature/notes >/dev/null && git show feature/notes:NOTES.md | grep -q '^# Notes' && git log feature/notes -1 --format=%s | grep -q 'Add notes' && ! git ls-tree -r --name-only $(git rev-parse --abbrev-ref HEAD 2>/dev/null | grep -v HEAD || echo main) | grep -q NOTES.md && [ \"$(git rev-parse --abbrev-ref HEAD)\" != 'feature/notes' ]"
+max_turns = 15

@@ -1,0 +1,5 @@
+name = "web_fetch_title"
+tags = ["web", "tools", "easy"]
+prompt = "Using your web tools (not the shell), fetch https://example.com/ and write the page's <title> text, and nothing else, into title.txt (single line, no trailing spaces)."
+check = "test \"$(cat title.txt | tr -d '\\r' | head -1 | sed 's/[[:space:]]*$//')\" = 'Example Domain'"
+max_turns = 10
