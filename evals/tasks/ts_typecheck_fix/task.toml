@@ -1,0 +1,5 @@
+name = "ts_typecheck_fix"
+tags = ["typescript", "debug", "medium"]
+prompt = "math.ts and run.ts have type mistakes papered over with `as any` (avg returns a string but callers expect a number). Fix the types properly (avg returns number, no `as any` left in run.ts) so that `node --experimental-strip-types run.ts` prints `avg=2.5`."
+check = "test \"$(node --experimental-strip-types run.ts 2>/dev/null | tail -1)\" = 'avg=2.5' && ! grep -q 'as any' run.ts"
+max_turns = 12

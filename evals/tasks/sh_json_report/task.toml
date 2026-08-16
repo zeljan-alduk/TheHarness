@@ -1,0 +1,5 @@
+name = "sh_json_report"
+tags = ["shell", "jq", "data", "easy"]
+prompt = "events.json is an array of {user, action}. Write report.sh (POSIX sh using jq) that prints one line per user as `user count` for users with 2 or more events, sorted by count descending then user ascending. Run it."
+check = "test \"$(sh report.sh | tr '\\n' '|')\" = 'ann 3|bob 2|'"
+max_turns = 12

@@ -1,0 +1,5 @@
+name = "rs_error_handling"
+tags = ["rust", "refactor", "medium"]
+prompt = "src/main.rs uses unwrap() everywhere and panics on bad input. Refactor it to return errors: `cargo run -q -- 4 2` prints `2`, `cargo run -q -- 4 0` prints `error: division by zero` to stderr and exits with code 2, `cargo run -q -- x 1` prints `error: invalid number: x` to stderr and exits with code 2. No panics, no external crates."
+check = "test \"$(cargo run -q -- 4 2 2>/dev/null)\" = '2' && cargo run -q -- 4 0 2>err.txt; test $? -eq 2 && grep -q 'division by zero' err.txt && cargo run -q -- x 1 2>err2.txt; test $? -eq 2 && grep -q 'invalid number: x' err2.txt && ! grep -q 'unwrap()' src/main.rs"
+max_turns = 15

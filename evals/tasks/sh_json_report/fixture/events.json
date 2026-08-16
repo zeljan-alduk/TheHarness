@@ -1,0 +1,1 @@
+[{"user":"ann","action":"login"},{"user":"bob","action":"login"},{"user":"ann","action":"view"},{"user":"cid","action":"login"},{"user":"ann","action":"logout"},{"user":"bob","action":"view"}]

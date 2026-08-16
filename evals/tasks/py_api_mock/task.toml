@@ -1,0 +1,5 @@
+name = "py_api_mock"
+tags = ["python", "http", "test", "medium"]
+prompt = "Write server.py: a tiny HTTP server (standard library only) on port 8765 with GET /health returning JSON {\"ok\": true} and GET /sum?a=1&b=2 returning {\"sum\": 3}. Then write client_test.py that starts the server in a background thread, calls both endpoints with urllib, asserts the responses, and prints `PASS`. Run it."
+check = "out=$(python3 client_test.py 2>&1 | tail -1); test \"$out\" = 'PASS'"
+max_turns = 15
