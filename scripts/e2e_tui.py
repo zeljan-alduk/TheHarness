@@ -21,9 +21,11 @@ def png(path, w=160, h=100):
     open(path, "wb").write(b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0)) + chunk(b"IDAT", zlib.compress(rows)) + chunk(b"IEND", b""))
 IMG = os.path.join(WORK, "gradient.png"); png(IMG)
 
+# isolate: memory, sessions, plugins go to a scratch config dir so the test never touches the user's data
+ISO = os.path.join(WORK, "config"); os.makedirs(ISO, exist_ok=True)
 pid, fd = pty.fork()
 if pid == 0:
-    os.environ.update(TERM="xterm-256color", COLUMNS=str(COLS), LINES=str(ROWS))
+    os.environ.update(TERM="xterm-256color", COLUMNS=str(COLS), LINES=str(ROWS), HARNESS_SESSIONS_DIR=os.path.join(ISO, "sessions"), HARNESS_PLUGINS_DIR=os.path.join(ISO, "plugins"), HARNESS_MEMORY_DIR=os.path.join(ISO, "memory"))
     os.chdir(WORK); os.execv(HARNESS, ["harness"])
 fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", ROWS, COLS, 0, 0))
 buf = b""
@@ -60,7 +62,11 @@ step("banner shows model", "qwen3.8" in screen() or "model" in screen())
 for cmd, marker in [("/help", "Commands"), ("/tools", "download_file"), ("/config", "server"), ("/pwd", WORK.split("/")[-1]),
                     ("/cost", "session tokens"), ("/net off", "internet tools: off"), ("/net on", "internet tools: on"),
                     ("/thinking", "thinking shown"), ("/thinking", "thinking hidden"), ("/expand", None), ("/panel", None),
-                    ("/model", "available:"), ("/cd /tmp", "cwd"), (f"/cd {WORK}", "cwd"), ("/bogus", "unknown command")]:
+                    ("/model", "available:"), ("/cd /tmp", "cwd"), (f"/cd {WORK}", "cwd"), ("/bogus", "unknown command"),
+                    ("/permissions", "permission mode"), ("/permissions plan", "plan mode"), ("/permissions auto", "auto permissions"), ("/plan", "plan mode"), ("/plan", "auto permissions"),
+                    ("/queue", "queue is empty"), ("/sessions", "Sessions"), ("/theme light", "theme → light"), ("/theme dark", "theme → dark"),
+                    ("/mcp", "MCP servers configured"), ("/memory", "MEMORY"), ("/brain", "BRAIN"), ("/workflows", "WORKFLOWS"),
+                    ("/remember e2e marker preference", "MEMORY › Preferences"), ("/plugin bogus", "usage: /plugin"), ("/reload", "reloading tools")]:
     send(cmd + "\r"); pump(0.8)
     step(f"{cmd}", marker is None or marker in screen())
 send("/mod\t"); pump(0.3); step("tab-completes /model", "/model " in screen()); send("\x15")  # ctrl+u clears line

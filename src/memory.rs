@@ -46,9 +46,12 @@ pub struct MemoryStore { pub dir: PathBuf, pub cfg: MemoryConfig }
 
 impl MemoryStore {
     pub fn open(cfg: &MemoryConfig) -> Result<Self> {
-        let dir = match &cfg.dir {
-            Some(d) => PathBuf::from(shellexpand(d)),
-            None => PathBuf::from(std::env::var("HOME").context("HOME not set")?).join(".config/harness"),
+        let dir = match std::env::var_os("HARNESS_MEMORY_DIR") {
+            Some(d) => PathBuf::from(d),
+            None => match &cfg.dir {
+                Some(d) => PathBuf::from(shellexpand(d)),
+                None => PathBuf::from(std::env::var("HOME").context("HOME not set")?).join(".config/harness"),
+            },
         };
         std::fs::create_dir_all(&dir)?;
         let s = Self { dir, cfg: cfg.clone() };
