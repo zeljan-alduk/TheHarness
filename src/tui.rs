@@ -385,6 +385,7 @@ pub async fn run(cfg: Config, resume: Option<String>) -> Result<()> {
     if app.cfg.ui.event_log { { let d = config_dir().join("logs").join(harness::memory::today_iso()); let _ = std::fs::create_dir_all(&d); app.event_log = std::fs::OpenOptions::new().create(true).append(true).open(d.join(format!("tui-{}.jsonl", std::process::id()))).ok(); } }
     if app.cfg.ui.theme == "light" { LIGHT.store(true, std::sync::atomic::Ordering::Relaxed); }
     app.banner();
+    if !harness::permissions::is_trusted(&app.workdir) && app.perm_mode != harness::permissions::Mode::Plan { app.blocks.push(Block::System(format!("first time in {} — tools run here in '{}' mode. /trust remembers this directory; /plan for read-only.", short_path(&app.workdir), app.perm_mode.label()))); }
     if let Some(r) = resume { app.resume_session(&r); }
     { let h = app.cfg.hooks.clone(); let wd = app.workdir.clone(); if !h.session_start.is_empty() { let tx = app.tx.clone(); tokio::spawn(async move { for o in harness::hooks::run_event(&h, "session_start", "", serde_json::json!({}), &wd).await { let _ = tx.send(Msg::Notice(format!("session_start hook: {}", o.trim()))); } }); } }
     app.reload_toolset();
@@ -513,11 +514,12 @@ impl App {
                 let ans = match k.code {
                     KeyCode::Char('y') | KeyCode::Enter => Some(harness::permissions::Approval::Once),
                     KeyCode::Char('a') => Some(harness::permissions::Approval::Always),
+                    KeyCode::Char('p') => Some(harness::permissions::Approval::AlwaysProject),
                     KeyCode::Char('n') | KeyCode::Esc => Some(harness::permissions::Approval::Deny),
                     KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => Some(harness::permissions::Approval::Deny),
                     _ => None,
                 };
-                if let Some(a) = ans { if let Some((req, tx)) = self.pending_ask.take() { let label = match &a { harness::permissions::Approval::Once => "allowed once".to_string(), harness::permissions::Approval::Always => format!("always allow {}", req.suggested_rule), harness::permissions::Approval::Deny => "denied".into() }; self.blocks.push(Block::System(format!("🔒 {label}"))); let _ = tx.send(a); } }
+                if let Some(a) = ans { if let Some((req, tx)) = self.pending_ask.take() { let label = match &a { harness::permissions::Approval::Once => "allowed once".to_string(), harness::permissions::Approval::Always => format!("always allow {}", req.suggested_rule), harness::permissions::Approval::AlwaysProject => format!("always allow {} (this project)", req.suggested_rule), harness::permissions::Approval::Deny => "denied".into() }; self.blocks.push(Block::System(format!("🔒 {label}"))); let _ = tx.send(a); } }
             }
             CEvent::Key(k) if k.kind == KeyEventKind::Press && self.video.is_some() => {
                 let n = self.video.as_ref().map(|v| v.frames.len()).unwrap_or(0);
@@ -815,14 +817,23 @@ impl App {
             }
             "/video" => { if arg.is_empty() { self.blocks.push(Block::Error("usage: /video <path>".into())); } else { let p = if arg.starts_with('~') { PathBuf::from(arg.replacen('~', &harness::setup::home_dir().display().to_string(), 1)) } else { PathBuf::from(&arg) }; if p.is_file() { self.open_video(&p); } else { self.blocks.push(Block::Error(format!("no such file: {arg}"))); } } }
             "/permissions" | "/perm" | "/mode" => {
+                let mut it = arg.splitn(2, ' '); let sub = it.next().unwrap_or("").to_string(); let rest = it.next().unwrap_or("").trim().to_string();
                 if arg.is_empty() {
-                    let rules = harness::permissions::persisted_rules();
-                    let mut lines = vec![format!("permission mode: {} ({})", format!("{:?}", self.perm_mode).to_lowercase(), self.perm_mode.label()), "switch: /permissions bypass|auto|ask|plan   (shift+tab cycles)".into(), format!("config allow: {:?}", self.cfg.permissions.allow), format!("config deny:  {:?}", self.cfg.permissions.deny), format!("always-allowed (this machine): {:?}", rules)];
+                    let rules = harness::permissions::persisted_rules(); let proj = harness::permissions::project_rules(&self.workdir);
+                    let mut lines = vec![format!("permission mode: {} ({})", format!("{:?}", self.perm_mode).to_lowercase(), self.perm_mode.label()), "switch: /permissions bypass|auto|ask|plan   (shift+tab cycles) · rules: /permissions add <rule> [project] · remove <rule>".into(), format!("config allow: {:?}", self.cfg.permissions.allow), format!("config deny:  {:?}", self.cfg.permissions.deny), format!("always-allowed (this machine): {:?}", rules), format!("always-allowed (this project, .harness/permissions.json): {:?}", proj), format!("directory trusted: {}  (/trust to remember this directory)", harness::permissions::is_trusted(&self.workdir))];
                     lines.push("Rules are '<tool>' or '<tool>:<glob>' matched on the primary argument (bash cmd, file path, url).".into());
                     self.blocks.push(Block::Banner(lines));
+                } else if sub == "add" && !rest.is_empty() {
+                    let (rule, project) = match rest.strip_suffix(" project") { Some(r) => (r.trim().to_string(), true), None => (rest.clone(), false) };
+                    match &self.live_policy { Some(p) => { if project { p.allow_always_project(&rule) } else { p.allow_always(&rule) } } None => { let p = harness::permissions::Policy::new(self.cfg.permissions.clone(), &self.workdir); if project { p.allow_always_project(&rule) } else { p.allow_always(&rule) } } }
+                    self.blocks.push(Block::System(format!("rule added{}: {rule}", if project { " (project)" } else { "" })));
+                } else if sub == "remove" && !rest.is_empty() {
+                    let p = self.live_policy.clone().unwrap_or_else(|| Arc::new(harness::permissions::Policy::new(self.cfg.permissions.clone(), &self.workdir)));
+                    let n = p.remove_rule(&rest); self.blocks.push(Block::System(format!("removed {n} rule(s) matching {rest}")));
                 } else if let Some(m) = harness::permissions::Mode::parse(&arg) { self.set_perm_mode(m); self.blocks.push(Block::System(format!("permissions → {}", m.label()))); }
-                else { self.blocks.push(Block::Error("usage: /permissions [bypass|auto|ask|plan]".into())); }
+                else { self.blocks.push(Block::Error("usage: /permissions [bypass|auto|ask|plan] · add <rule> [project] · remove <rule>".into())); }
             }
+            "/trust" => { harness::permissions::trust(&self.workdir); self.blocks.push(Block::System(format!("{} is now a trusted directory", short_path(&self.workdir)))); }
             "/theme" => { let light = match arg.as_str() { "light" => true, "dark" => false, _ => !LIGHT.load(std::sync::atomic::Ordering::Relaxed) }; LIGHT.store(light, std::sync::atomic::Ordering::Relaxed); self.blocks.push(Block::System(format!("theme → {}", if light { "light" } else { "dark" }))); }
             "/plan" => { let m = if self.perm_mode == harness::permissions::Mode::Plan { harness::permissions::Mode::Auto } else { harness::permissions::Mode::Plan }; self.set_perm_mode(m); self.blocks.push(Block::System(format!("permissions → {}", self.perm_mode.label()))); }
             "/context" | "/ctx" => {
@@ -1501,6 +1512,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ("/reload", "restart tools, MCP servers and plugins"),
     ("/permissions", "show or set permission mode: bypass|auto|ask|plan"),
     ("/plan", "toggle plan mode (read-only)"),
+    ("/trust", "remember this directory as trusted (no first-time notice)"),
     ("/theme", "switch theme: /theme light|dark"),
     ("/workflow", "run a workflow: /workflow <name> [args]  (list with /workflow)"),
     ("/queue", "show queued tasks (/queue clear)"),
@@ -1552,7 +1564,7 @@ fn draw(f: &mut Frame, app: &mut App) {
     } else if let Some((req, _)) = &app.pending_ask {
         Some(vec![Span::styled(" 🔒 ", Style::default().fg(Color::Black).bg(pal().orange)), Span::styled(format!(" {}({}) ", req.tool, truncate(&req.summary, width.saturating_sub(70))), Style::default().fg(Color::Black).bg(pal().orange).bold()),
                   Span::styled(format!("  {} · ", req.reason), Style::default().fg(pal().orange)),
-                  Span::styled("[y] allow once  ", Style::default().fg(pal().ok).bold()), Span::styled(format!("[a] always ({})  ", req.suggested_rule), Style::default().fg(pal().cyan)), Span::styled("[n] deny", Style::default().fg(pal().err).bold())])
+                  Span::styled("[y] once  ", Style::default().fg(pal().ok).bold()), Span::styled(format!("[a] always ({})  ", req.suggested_rule), Style::default().fg(pal().cyan)), Span::styled("[p] always in this project  ", Style::default().fg(pal().cyan)), Span::styled("[n] deny", Style::default().fg(pal().err).bold())])
     } else if let Some((f, phase, _)) = &app.compact_progress {
         let barw = 30usize; let filled = ((f * barw as f64) as usize).min(barw);
         Some(vec![Span::styled("⟲ compacting context ", Style::default().fg(pal().orange)), Span::styled("█".repeat(filled), Style::default().fg(pal().orange)), Span::styled("░".repeat(barw - filled), Style::default().fg(pal().dim)), Span::styled(format!(" {:>3.0}%  {phase}", f * 100.0), Style::default().fg(pal().dim))])

@@ -33,7 +33,7 @@ pub enum Decision { Allow, Deny(String), Ask(String) }
 #[derive(Debug, Clone)]
 pub struct ApprovalRequest { pub tool: String, pub summary: String, pub suggested_rule: String, pub reason: String }
 #[derive(Debug, Clone)]
-pub enum Approval { Once, Always, Deny }
+pub enum Approval { Once, Always, AlwaysProject, Deny }
 
 /// A question the model asks the user (ask_user tool): multiple choice and/or free text.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -71,11 +71,21 @@ const MUTATING: &[&str] = &["write_file", "edit_file", "apply_patch", "bash", "d
 pub struct Policy { pub cfg: PermissionsConfig, pub workdir: PathBuf, session_allow: std::sync::Mutex<Vec<String>>, mode: std::sync::Mutex<Mode> }
 
 impl Policy {
-    pub fn new(cfg: PermissionsConfig, workdir: &Path) -> Self { let mode = cfg.mode; Self { cfg, workdir: workdir.to_path_buf(), session_allow: std::sync::Mutex::new(vec![]), mode: std::sync::Mutex::new(mode) } }
+    pub fn new(cfg: PermissionsConfig, workdir: &Path) -> Self {
+        let mode = cfg.mode;
+        // project-scoped always-rules are merged in automatically
+        let mut session = project_rules(workdir);
+        session.retain(|r| !cfg.allow.contains(r));
+        Self { cfg, workdir: workdir.to_path_buf(), session_allow: std::sync::Mutex::new(session), mode: std::sync::Mutex::new(mode) }
+    }
+    pub fn session_rules(&self) -> Vec<String> { self.session_allow.lock().unwrap().clone() }
     /// Current mode (live: `set_mode` takes effect for running sessions too).
     pub fn mode(&self) -> Mode { *self.mode.lock().unwrap() }
     pub fn set_mode(&self, m: Mode) { *self.mode.lock().unwrap() = m; }
     pub fn allow_always(&self, rule: &str) { self.session_allow.lock().unwrap().push(rule.to_string()); persist_rule(rule); }
+    /// Persist an allow rule for this project only (<workdir>/.harness/permissions.json).
+    pub fn allow_always_project(&self, rule: &str) { self.session_allow.lock().unwrap().push(rule.to_string()); persist_project_rule(&self.workdir, rule); }
+    pub fn remove_rule(&self, rule: &str) -> usize { let mut n = 0; { let mut v = self.session_allow.lock().unwrap(); let before = v.len(); v.retain(|r| r != rule); n += before - v.len(); } n += remove_persisted(rule, None); n += remove_persisted(rule, Some(&self.workdir)); n }
 
     /// Primary argument used for rule matching and the human-readable summary.
     pub fn primary_arg(tool: &str, args: &Value) -> String {
@@ -160,6 +170,23 @@ fn persist_rule(rule: &str) {
     let mut v = persisted_rules();
     if !v.iter().any(|r| r == rule) { v.push(rule.to_string()); let _ = std::fs::write(rules_file(), serde_json::to_string_pretty(&v).unwrap_or_default()); }
 }
+fn project_rules_file(workdir: &Path) -> PathBuf { workdir.join(".harness").join("permissions.json") }
+pub fn project_rules(workdir: &Path) -> Vec<String> { std::fs::read_to_string(project_rules_file(workdir)).ok().and_then(|t| serde_json::from_str::<Vec<String>>(&t).ok()).unwrap_or_default() }
+fn persist_project_rule(workdir: &Path, rule: &str) {
+    let mut v = project_rules(workdir);
+    if !v.iter().any(|r| r == rule) { v.push(rule.to_string()); let _ = std::fs::create_dir_all(workdir.join(".harness")); let _ = std::fs::write(project_rules_file(workdir), serde_json::to_string_pretty(&v).unwrap_or_default()); }
+}
+fn remove_persisted(rule: &str, workdir: Option<&Path>) -> usize {
+    let (file, mut v) = match workdir { Some(w) => (project_rules_file(w), project_rules(w)), None => (rules_file(), persisted_rules()) };
+    let before = v.len(); v.retain(|r| r != rule);
+    if v.len() != before { let _ = std::fs::write(file, serde_json::to_string_pretty(&v).unwrap_or_default()); }
+    before - v.len()
+}
+
+/// Directory trust: remembered directories the user has accepted working in (non-blocking notice otherwise).
+fn trusted_file() -> PathBuf { crate::setup::config_dir().join("trusted.json") }
+pub fn is_trusted(workdir: &Path) -> bool { let w = workdir.canonicalize().unwrap_or(workdir.to_path_buf()).display().to_string(); std::fs::read_to_string(trusted_file()).ok().and_then(|t| serde_json::from_str::<Vec<String>>(&t).ok()).unwrap_or_default().iter().any(|d| *d == w) }
+pub fn trust(workdir: &Path) { let w = workdir.canonicalize().unwrap_or(workdir.to_path_buf()).display().to_string(); let mut v: Vec<String> = std::fs::read_to_string(trusted_file()).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default(); if !v.contains(&w) { v.push(w); let _ = std::fs::write(trusted_file(), serde_json::to_string_pretty(&v).unwrap_or_default()); } }
 
 #[cfg(test)]
 mod tests {

@@ -432,6 +432,7 @@ impl<'a> Agent<'a> {
                         match self.approver.ask(req.clone()).await {
                             crate::permissions::Approval::Once => { self.sink.emit(&Event::Permission { tool: name.clone(), summary: arg, decision: "allowed once".into() }); None }
                             crate::permissions::Approval::Always => { self.policy.allow_always(&req.suggested_rule); self.sink.emit(&Event::Permission { tool: name.clone(), summary: arg, decision: format!("always allowed ({})", req.suggested_rule) }); None }
+                            crate::permissions::Approval::AlwaysProject => { self.policy.allow_always_project(&req.suggested_rule); self.sink.emit(&Event::Permission { tool: name.clone(), summary: arg, decision: format!("always allowed in this project ({})", req.suggested_rule) }); None }
                             crate::permissions::Approval::Deny => { self.sink.emit(&Event::Permission { tool: name.clone(), summary: arg, decision: "denied by user".into() }); Some("error: the user declined this action. Do not retry it; ask what to do instead or take a different approach.".to_string()) }
                         }
                     }
