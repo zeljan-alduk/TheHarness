@@ -34,4 +34,21 @@ EXPECT="plan|Plan|read-only|mode"  t "plan_mode"       plan_mode '{"action":"sta
 EXPECT="agent|none|no sub-agents|Sub"  t "agents"      agents '{"action":"list"}'
 EXPECT="workflow|Workflows|review|fix-tests|no workflow" t "run_workflow list" run_workflow '{"action":"list"}'
 EXPECT="path escapes|error"        t "path jail"       write_file '{"path":"/etc/harness-itest","content":"x"}'
+
+# file checkpoints (shadow git): a session-scoped tool call snapshots the tree; undo/redo restore it
+c() { name=$1; shift; out=$("$H" checkpoint -C "$D" --session itest-cp "$@" 2>&1); if echo "$out" | grep -qE "$EXPECT"; then echo "PASS $name"; pass=$((pass+1)); else echo "FAIL $name"; echo "$out" | head -5 | sed 's/^/     /'; fail=$((fail+1)); fi; }
+"$H" -y tool -C "$D" --session itest-cp write_file '{"path":"cp.txt","content":"one\n"}' >/dev/null 2>&1
+"$H" -y tool -C "$D" --session itest-cp write_file '{"path":"cp.txt","content":"two\n"}' >/dev/null 2>&1
+EXPECT="checkpoint" c "checkpoint list"  list
+EXPECT="restored"   c "checkpoint undo"  undo
+EXPECT="^one$"; if grep -qE "$EXPECT" "$D/cp.txt"; then echo "PASS checkpoint undo restored the file"; pass=$((pass+1)); else echo "FAIL checkpoint undo restored the file"; fail=$((fail+1)); fi
+EXPECT="restored"   c "checkpoint redo"  redo
+EXPECT="^two$"; if grep -qE "$EXPECT" "$D/cp.txt"; then echo "PASS checkpoint redo re-applied the change"; pass=$((pass+1)); else echo "FAIL checkpoint redo re-applied the change"; fail=$((fail+1)); fi
+
+# project instruction files + path-scoped rules reach the model through tool results
+mkdir -p "$D/.harness/rules"; printf -- '---\npaths: *.txt\ndescription: itest rule\n---\nITEST-RULE-BODY\n' > "$D/.harness/rules/itest.md"
+EXPECT="ITEST-RULE-BODY"           t "path-scoped rule"  read_file '{"path":"cp.txt"}'
+mkdir -p "$D/.harness/skills/itest-skill"; printf -- '---\nname: itest-skill\ndescription: itest\n---\nSKILL-BODY-OK\n' > "$D/.harness/skills/itest-skill/SKILL.md"
+EXPECT="SKILL-BODY-OK"             t "load_skill"        load_skill '{"name":"itest-skill"}'
+
 echo; echo "$pass passed, $fail failed"; [ "$fail" -eq 0 ]

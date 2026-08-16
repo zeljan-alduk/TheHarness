@@ -24,6 +24,8 @@ pub struct Config {
     pub sandbox: SandboxConfig,
     #[serde(default)]
     pub lsp: LspConfig,
+    #[serde(default)]
+    pub checkpoints: crate::checkpoints::CheckpointsConfig,
     /// Smart self-improvement loop (`harness improve`, `/improve`).
     #[serde(default, rename = "self")]
     pub selfimprove: SelfConfig,
@@ -278,6 +280,7 @@ impl Config {
             "agent.max_turns" => self.agent.max_turns = val.parse().context("bad number")?,
             "net.enabled" => self.net.enabled = b(val),
             "sandbox.mode" => self.sandbox.mode = if val == "none" { String::new() } else { val.into() },
+            "checkpoints.enabled" => self.checkpoints.enabled = b(val),
             _ => anyhow::bail!("unknown setting {key}"),
         }
         Ok(())

@@ -39,8 +39,10 @@ impl Status { pub fn ok(&self) -> bool { self.missing.is_empty() } }
 pub fn home_dir() -> PathBuf {
     std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")).map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."))
 }
-/// ~/.config/harness (all harness state lives here on every platform).
-pub fn config_dir() -> PathBuf { home_dir().join(".config/harness") }
+/// ~/.config/harness (all harness state lives here on every platform); HARNESS_CONFIG_DIR overrides it.
+pub fn config_dir() -> PathBuf {
+    std::env::var_os("HARNESS_CONFIG_DIR").map(PathBuf::from).unwrap_or_else(|| home_dir().join(".config/harness"))
+}
 
 pub fn bin_dir() -> PathBuf {
     std::env::var_os("HARNESS_BIN_DIR").map(PathBuf::from).unwrap_or_else(|| config_dir().join("bin"))

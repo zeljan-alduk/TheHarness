@@ -1283,7 +1283,11 @@ impl App {
             }
             "/todos" => { let t = self.todos.lock().map(|t| t.clone()).unwrap_or_default(); if t.is_empty() { self.blocks.push(Block::System("no todos (the agent maintains them with the todo tool)".into())); } else { self.blocks.push(Block::Banner(std::iter::once("Todos".to_string()).chain(t.iter().map(|x| format!("  {}", x.line(&t)))).collect())); } }
             "/hooks" => { let h = &self.cfg.hooks; self.blocks.push(Block::Banner(vec!["Hooks (harness.toml [hooks]) — JSON on stdin; pre_tool exit 2 blocks the call".into(), format!("  pre_tool  {:?}", h.pre_tool), format!("  post_tool {:?}", h.post_tool), format!("  on_stop   {:?}", h.on_stop), format!("  on_prompt {:?}", h.on_prompt), format!("  timeout   {}s", h.timeout_secs)])); }
-            "/skills" => { match harness::plugins::Plugins::open() { Ok(p) => { let sk: Vec<_> = p.enabled().into_iter().flat_map(|x| x.skills).collect(); if sk.is_empty() { self.blocks.push(Block::System("no skills installed — /plugin list".into())); } else { self.blocks.push(Block::Banner(std::iter::once(format!("Skills ({}) — the model loads them with load_skill", sk.len())).chain(sk.iter().map(|s| format!("  {:<28} {}  [{}]", s.name, truncate(&s.description, 80), s.plugin))).collect())); } } Err(e) => self.blocks.push(Block::Error(e.to_string())) } }
+            "/skills" => {
+                let sk = harness::skills::discover(&self.workdir);
+                if sk.is_empty() { self.blocks.push(Block::System("no skills found — add .harness/skills/<name>/SKILL.md, ~/.claude/skills/…, or install a plugin (/plugin list)".into())); }
+                else { self.blocks.push(Block::Banner(std::iter::once(format!("Skills ({}) — the model loads them with load_skill", sk.len())).chain(sk.iter().map(|x| format!("  {:<28} {}  [{}]", x.name, truncate(&x.description, 78), x.source))).collect())); }
+            }
             "/diff" => { let wd = self.workdir.clone(); let tx = self.tx.clone(); tokio::spawn(async move { let o = harness::sandbox::run_shell("git status --short | head -40; echo; git diff --stat HEAD | tail -25", &wd, Duration::from_secs(20), 12000).await; let _ = tx.send(Msg::Block(Block::Banner(std::iter::once("git diff (working tree vs HEAD)".to_string()).chain(o.map(|o| o.stdout).unwrap_or_default().lines().map(String::from)).collect()))); }); }
             "/copy" => {
                 let last = self.blocks.iter().rev().find_map(|b| if let Block::Assistant { text, .. } = b { Some(text.clone()) } else { None }).unwrap_or_default();
@@ -1327,22 +1331,72 @@ impl App {
                     self.blocks.push(Block::Banner(lines));
                 }
             }
-            "/rewind" | "/undo" => {
-                if self.running.is_some() { self.set_status("finish or interrupt first"); }
-                else {
-                    let session = self.session.clone(); let tx = self.tx.clone(); let wd = self.workdir.clone();
-                    // drop the transcript back to before the last user turn
-                    let last_user_idx = self.blocks.iter().rposition(|b| matches!(b, Block::User(..)));
-                    if let Some(i) = last_user_idx { self.blocks.truncate(i); }
+            "/undo" | "/redo" => {
+                if self.running.is_some() { self.set_status("finish or interrupt first"); return; }
+                let steps = arg.trim().parse::<usize>().unwrap_or(1);
+                let (sid, wd, tx, redo) = (self.session_meta.id.clone(), self.workdir.clone(), self.tx.clone(), cmd == "/redo");
+                if sid.is_empty() { self.blocks.push(Block::Error("no checkpoints yet in this session".into())); return; }
+                tokio::spawn(async move {
+                    let msg = tokio::task::spawn_blocking(move || {
+                        let Some(cp) = harness::checkpoints::for_session(&sid, &wd) else { return "file checkpoints are disabled ([checkpoints] enabled = false)".to_string() };
+                        match if redo { cp.redo(steps) } else { cp.undo(steps) } {
+                            Ok((c, n)) => format!("{} to checkpoint #{} — {} ({} file(s) restored). {} to go the other way.", if redo { "redone" } else { "undone" }, cp.cursor() + 1, c.label, n, if redo { "/undo" } else { "/redo" }),
+                            Err(e) => format!("{e:#}"),
+                        }
+                    }).await.unwrap_or_else(|e| format!("{e}"));
+                    let _ = tx.send(Msg::Notice(msg));
+                });
+            }
+            "/checkpoints" | "/rewind" => {
+                if self.running.is_some() { self.set_status("finish or interrupt first"); return; }
+                let a = arg.trim().to_string();
+                // conversation-only rewind (the old /rewind behaviour)
+                if cmd == "/rewind" && (a == "conv" || a == "conversation" || a == "chat") {
+                    let session = self.session.clone(); let tx = self.tx.clone();
+                    if let Some(i) = self.blocks.iter().rposition(|b| matches!(b, Block::User(..))) { self.blocks.truncate(i); }
                     tokio::spawn(async move {
                         let mut msgs = session.lock().await;
                         if let Some(i) = msgs.iter().rposition(|m| m.role == "user" && !m.text().starts_with("[harness]")) { msgs.truncate(i); }
                         let n = msgs.len();
-                        drop(msgs);
-                        let o = harness::sandbox::run_shell("git status --short | head -20", &wd, Duration::from_secs(10), 4000).await.map(|o| o.stdout).unwrap_or_default();
-                        let _ = tx.send(Msg::Notice(format!("rewound the conversation to before the last turn ({n} messages kept). Files changed on disk are NOT reverted — review with /diff, undo with `git checkout -- <file>` or ask the agent.{}", if o.trim().is_empty() { String::new() } else { format!("\n{}", o.trim()) })));
+                        let _ = tx.send(Msg::Notice(format!("rewound the conversation to before the last turn ({n} messages kept); files were not touched (/undo reverts files)")));
                     });
+                    return;
                 }
+                let sid = self.session_meta.id.clone();
+                let Some(cp) = (if sid.is_empty() { None } else { harness::checkpoints::for_session(&sid, &self.workdir) }) else {
+                    self.blocks.push(Block::System("no checkpoints in this session yet (they are taken before every file-changing tool call; disable with [checkpoints] enabled = false)".into())); return;
+                };
+                let list = cp.list();
+                if a.is_empty() {
+                    let mut lines = vec![format!("Checkpoints ({}) — cursor at #{} · /rewind <n> restores files AND conversation · /rewind code <n> files only · /rewind conv = conversation only · /undo · /redo", list.len(), cp.cursor() + 1)];
+                    for (i, c) in list.iter().enumerate().rev().take(25).collect::<Vec<_>>().into_iter().rev() {
+                        lines.push(format!("  {}{:>3}. {:<8} {:>3} file(s)  {}", if i == cp.cursor() { "▸" } else { " " }, i + 1, harness::sessions::fmt_age(c.time), c.changed, truncate(&c.label, 70)));
+                    }
+                    self.blocks.push(Block::Banner(lines)); return;
+                }
+                let (code_only, which) = match a.strip_prefix("code ") { Some(r) => (true, r.trim().to_string()), None => (false, a.clone()) };
+                let (tx, session) = (self.tx.clone(), self.session.clone());
+                let target = list.iter().enumerate().find(|(i, c)| which.parse::<usize>() == Ok(i + 1) || c.id.starts_with(&which)).map(|(_, c)| c.clone());
+                let Some(target) = target else { self.blocks.push(Block::Error(format!("no checkpoint '{which}' — /checkpoints"))); return };
+                if !code_only && target.msgs > 0 { if let Some(i) = self.blocks.iter().rposition(|b| matches!(b, Block::User(..))) { let _ = i; } self.blocks.push(Block::System(format!("rewinding to checkpoint — {}", truncate(&target.label, 70)))); }
+                let keep = target.msgs;
+                tokio::spawn(async move {
+                    let restored = tokio::task::spawn_blocking(move || match cp.restore(&which) { Ok((c, n)) => format!("files restored to '{}' ({n} changed)", truncate(&c.label, 60)), Err(e) => format!("restore failed: {e:#}") }).await.unwrap_or_else(|e| e.to_string());
+                    let mut extra = String::new();
+                    if !code_only && keep > 0 {
+                        let mut msgs = session.lock().await;
+                        if keep < msgs.len() { msgs.truncate(keep); extra = format!(" · conversation truncated to {keep} messages"); }
+                    }
+                    let _ = tx.send(Msg::Notice(format!("{restored}{extra}")));
+                });
+            }
+            "/fork" => {
+                if self.running.is_some() { self.set_status("finish or interrupt first"); return; }
+                let old = self.session_meta.id.clone();
+                self.session_meta.id = harness::sessions::SessionStore::new_id();
+                self.session_meta.title = format!("{} (fork)", truncate(&self.session_meta.title, 60));
+                self.save_session();
+                self.blocks.push(Block::System(format!("forked session {old} → {} — this branch is saved separately; the original is untouched (/resume {old} to go back)", self.session_meta.id)));
             }
             "/effort" => {
                 let lvl = arg.trim().to_lowercase();
@@ -1541,6 +1595,12 @@ impl App {
                 let extra = format!("You are in an interactive session: the user can see everything and will reply; keep final answers concise.{extra_prompt}");
                 let system = harness::agent::system_prompt_with_memory(&workdir.display().to_string(), &registry.names(), Some(&extra), store.as_ref());
                 let mut msgs = session.lock().await;
+                // turn boundary checkpoint: anchors /rewind (code + conversation) to "before this prompt"
+                {
+                    let (n, sid, wd) = (msgs.len(), session_id.clone(), workdir.clone());
+                    let label = format!("before turn: {}", harness::llm::truncate_for_log(&user_text, 60));
+                    let _ = tokio::task::spawn_blocking(move || { if let Some(cp) = harness::checkpoints::for_session(&sid, &wd) { let _ = cp.snapshot(&label, n); } }).await;
+                }
                 if client.provider() == harness::llm::Provider::ClaudeCode {
                     // Claude Code backend: our tools bridged over MCP; the claude CLI drives the loop
                     let cc = match cc_existing { Some(c) => c, None => {
@@ -1988,7 +2048,11 @@ const COMMANDS: &[(&str, &str)] = &[
     ("/copy", "copy the last answer to the clipboard"),
     ("/review", "run the review workflow on the working-tree diff"),
     ("/pr-comments", "show PR comments via gh: /pr-comments [number]"),
-    ("/rewind", "drop the last turn from the conversation (files not reverted)"),
+    ("/rewind", "rewind to a checkpoint: /rewind <n> (files + conversation) · /rewind code <n> · /rewind conv"),
+    ("/checkpoints", "list file checkpoints taken before each change"),
+    ("/undo", "restore the files to the previous checkpoint (/undo <n> steps)"),
+    ("/redo", "re-apply what /undo reverted"),
+    ("/fork", "continue this conversation as a new, separately saved session"),
     ("/release-notes", "recent commits"),
     ("/agents", "sub-agents: list · attach <id> (watch + message it) · detach · kill <id|all>"),
     ("/keybindings", "list keyboard shortcuts"),

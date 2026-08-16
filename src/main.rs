@@ -77,9 +77,22 @@ enum Cmd {
     Tool {
         #[arg(short = 'C', long)]
         dir: Option<PathBuf>,
+        /// Session id the call belongs to (enables file checkpoints and cross-session tools)
+        #[arg(long)]
+        session: Option<String>,
         name: String,
         /// JSON arguments (default: {})
         args: Option<String>,
+    },
+    /// File checkpoints of the working tree: list | undo | redo | restore | diff | prune
+    Checkpoint {
+        #[arg(short = 'C', long)]
+        dir: Option<PathBuf>,
+        /// Session id (default: the most recent session for this directory)
+        #[arg(long)]
+        session: Option<String>,
+        #[command(subcommand)]
+        action: CheckpointCmd,
     },
     /// Audit external tools; gather them in ~/.config/harness/bin; --install adds missing ones via Homebrew
     Setup {
@@ -146,6 +159,24 @@ enum Cmd {
 }
 
 #[derive(Subcommand)]
+enum CheckpointCmd {
+    /// Show the checkpoints of this session
+    List,
+    /// Take one now
+    Save { label: Option<String> },
+    /// Restore the previous checkpoint
+    Undo { #[arg(default_value_t = 1)] steps: usize },
+    /// Re-apply what undo reverted
+    Redo { #[arg(default_value_t = 1)] steps: usize },
+    /// Restore a specific checkpoint (number from `list`, or a sha prefix)
+    Restore { which: String },
+    /// diff --stat between a checkpoint and the working tree
+    Diff { which: String },
+    /// Delete snapshot repos older than N days
+    Prune { #[arg(default_value_t = 14)] days: u64 },
+}
+
+#[derive(Subcommand)]
 enum WorkflowCmd {
     List,
     Run {
@@ -175,6 +206,7 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     let mut cfg = config::Config::load(cli.config.as_deref())?;
     if let Some(m) = &cli.permissions { cfg.permissions.mode = harness::permissions::Mode::parse(m).context("--permissions must be bypass|auto|ask|plan")?; }
+    harness::checkpoints::configure(&cfg.checkpoints);
     sandbox::configure_seatbelt(cfg.sandbox.mode == "seatbelt" || cfg.sandbox.mode == "bwrap", cfg.sandbox.deny_network, cfg.sandbox.allow_write.clone());
     let client = llm::Client::new(&cfg.llm)?;
 
@@ -239,10 +271,32 @@ async fn main() -> Result<()> {
             let store = harness::sessions::SessionStore::open()?;
             for (i, m) in store.list(None).iter().take(40).enumerate() { println!("{:>2}. {}  {:<50} {:<30} {} turns · {}", i + 1, m.id, llm::truncate_for_log(&m.title, 50), m.workdir, m.turns, harness::sessions::fmt_age(m.updated)); }
         }
-        Cmd::Tool { dir, name, args } => {
+        Cmd::Checkpoint { dir, session, action } => {
+            let workdir = dir.unwrap_or(std::env::current_dir()?).canonicalize().context("workdir does not exist")?;
+            if let CheckpointCmd::Prune { days } = action { println!("removed {} snapshot repo(s)", harness::checkpoints::prune(days)); return Ok(()); }
+            let sid = match session { Some(s) => s, None => harness::sessions::SessionStore::open().ok().and_then(|st| st.latest_for(&workdir.display().to_string())).map(|m| m.id).context("no session for this directory — pass --session <id>")? };
+            let cp = harness::checkpoints::Checkpoints::open(&sid, &workdir)?;
+            match action {
+                CheckpointCmd::Prune { .. } => unreachable!(),
+                CheckpointCmd::List => {
+                    let list = cp.list();
+                    println!("session {sid} — {} checkpoint(s), cursor at #{}", list.len(), cp.cursor() + 1);
+                    for (i, c) in list.iter().enumerate() { println!(" {}{:>3}. {}  {:>4} file(s)  {:<12} {}", if i == cp.cursor() { "▸" } else { " " }, i + 1, &c.id[..8.min(c.id.len())], c.changed, harness::sessions::fmt_age(c.time), c.label); }
+                }
+                CheckpointCmd::Save { label } => match cp.snapshot(label.as_deref().unwrap_or("manual"), 0)? {
+                    Some(c) => println!("checkpoint #{} {} ({} file(s))", cp.list().len(), &c.id[..8.min(c.id.len())], c.changed),
+                    None => println!("nothing changed since the last checkpoint"),
+                },
+                CheckpointCmd::Undo { steps } => { let (c, n) = cp.undo(steps)?; println!("restored '{}' ({n} file(s) changed)", c.label); }
+                CheckpointCmd::Redo { steps } => { let (c, n) = cp.redo(steps)?; println!("restored '{}' ({n} file(s) changed)", c.label); }
+                CheckpointCmd::Restore { which } => { let (c, n) = cp.restore(&which)?; println!("restored '{}' ({n} file(s) changed)", c.label); }
+                CheckpointCmd::Diff { which } => println!("{}", cp.diff(&which)?),
+            }
+        }
+        Cmd::Tool { dir, session, name, args } => {
             let workdir = dir.unwrap_or(std::env::current_dir()?).canonicalize().context("workdir does not exist")?;
             let store = if cfg.memory.enabled { harness::memory::MemoryStore::open(&cfg.memory).ok() } else { None };
-            let ctx = tools::ToolCtx { workdir: workdir.clone(), timeout: Duration::from_secs(cfg.agent.tool_timeout_secs), max_output: cfg.agent.max_tool_output_chars, net: cfg.net.clone(), memory: store, subagent: None, redact_secrets: cfg.security.redact_secrets, hooks: cfg.hooks.clone(), todos: Default::default(), lsp_servers: cfg.lsp.servers.clone(), extra_roots: vec![], approver: None, inbox: Default::default(), cancel: None, cwd: None, session_id: None };
+            let ctx = tools::ToolCtx { workdir: workdir.clone(), timeout: Duration::from_secs(cfg.agent.tool_timeout_secs), max_output: cfg.agent.max_tool_output_chars, net: cfg.net.clone(), memory: store, subagent: None, redact_secrets: cfg.security.redact_secrets, hooks: cfg.hooks.clone(), todos: Default::default(), lsp_servers: cfg.lsp.servers.clone(), extra_roots: vec![], approver: None, inbox: Default::default(), cancel: None, cwd: None, session_id: session };
             let ts = tools::build_toolset(cfg.net.enabled, &workdir, name.starts_with("mcp__")).await;
             let out = ts.registry.call(&name, args.as_deref().unwrap_or("{}"), &ctx).await;
             println!("{}", out.text);
@@ -352,6 +406,7 @@ Ground rules:
 }
 
 async fn run_agent(cfg: &config::Config, client: &llm::Client, workdir: &std::path::Path, task: &str, extra: Option<&str>, verbose: bool, json: bool, yes: bool) -> Result<(String, agent::RunStats)> {
+    let session_id = harness::sessions::SessionStore::new_id();
     let sink: std::sync::Arc<dyn events::Sink> = if json { std::sync::Arc::new(events::JsonlSink) } else { std::sync::Arc::new(events::StderrSink { verbose }) };
     let ctx = tools::ToolCtx {
         workdir: workdir.to_path_buf(),
@@ -360,7 +415,7 @@ async fn run_agent(cfg: &config::Config, client: &llm::Client, workdir: &std::pa
         net: cfg.net.clone(),
         memory: None,
         subagent: None,
-        redact_secrets: cfg.security.redact_secrets, hooks: cfg.hooks.clone(), todos: Default::default(), lsp_servers: cfg.lsp.servers.clone(), extra_roots: vec![], approver: None, inbox: Default::default(), cancel: None, cwd: None, session_id: None,
+        redact_secrets: cfg.security.redact_secrets, hooks: cfg.hooks.clone(), todos: Default::default(), lsp_servers: cfg.lsp.servers.clone(), extra_roots: vec![], approver: None, inbox: Default::default(), cancel: None, cwd: None, session_id: Some(session_id.clone()),
     };
     let store = if cfg.memory.enabled { harness::memory::MemoryStore::open(&cfg.memory).ok() } else { None };
     if let Some(m) = &store { let _ = m.touch_project(workdir); }
@@ -395,7 +450,7 @@ async fn run_agent(cfg: &config::Config, client: &llm::Client, workdir: &std::pa
     };
     // always persist the transcript (also on error) — it is the run log
     if let Ok(store_s) = harness::sessions::SessionStore::open() {
-        let mut meta = harness::sessions::Meta { id: harness::sessions::SessionStore::new_id(), workdir: workdir.display().to_string(), model: client.model().to_string(), ..Default::default() };
+        let mut meta = harness::sessions::Meta { id: session_id.clone(), workdir: workdir.display().to_string(), model: client.model().to_string(), ..Default::default() };
         if let Ok((_, st)) = &out { meta.prompt_tokens = st.prompt_tokens; meta.completion_tokens = st.completion_tokens; }
         let _ = store_s.save(&mut meta, &msgs);
         if !json { eprintln!("· session saved: {} (harness --resume {})", meta.id, meta.id); }

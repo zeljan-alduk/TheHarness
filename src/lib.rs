@@ -4,6 +4,7 @@
 pub mod agent;
 pub mod agentdefs;
 pub mod arbiter;
+pub mod checkpoints;
 pub mod claude_code;
 pub mod config;
 pub mod eval;

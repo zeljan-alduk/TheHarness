@@ -211,6 +211,14 @@ impl Registry {
             }
         };
         let args_for_rules = args.clone();
+        // file checkpoint before anything that can change the working tree (/undo, /rewind)
+        if crate::checkpoints::MUTATING_TOOLS.contains(&name) {
+            if let Some(sid) = ctx.session_id.clone() {
+                let wd = ctx.effective().workdir;
+                let label = format!("before {name} {}", crate::llm::truncate_for_log(&crate::permissions::Policy::primary_arg(name, &args), 60));
+                let _ = tokio::task::spawn_blocking(move || { if let Some(cp) = crate::checkpoints::for_session(&sid, &wd) { let _ = cp.snapshot(&label, 0); } }).await;
+            }
+        }
         // a panicking tool must not take the session down: it becomes an error result the model can see
         let mut out = match futures_util::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(tool.call(args, ctx))).await {
             Ok(Ok(s)) => s,
@@ -241,7 +249,7 @@ pub async fn build_toolset(net_enabled: bool, workdir: &Path, with_mcp: bool) ->
     let mut registry = Registry::defaults(net_enabled);
     let mut notes = Vec::new();
     let mut servers = Vec::new();
-    let mut prompt_extra = String::new();
+    let prompt_extra = String::new();
     let plugins = crate::plugins::Plugins::open().ok();
     if with_mcp {
         let extra = plugins.as_ref().map(|p| p.mcp_files()).unwrap_or_default();
