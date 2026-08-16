@@ -58,6 +58,9 @@ impl Default for SecurityConfig { fn default() -> Self { Self { redact_secrets: 
 pub struct LlmConfig {
     pub base_url: String,
     pub model: String,
+    /// "openai" (any OpenAI-compatible server; default) or "anthropic" (Messages API). Auto-detected from base_url.
+    #[serde(default)]
+    pub provider: Option<String>,
     #[serde(default)]
     pub api_key: Option<String>,
     #[serde(default = "d_temp")]

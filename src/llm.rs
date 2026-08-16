@@ -110,6 +110,9 @@ pub struct Usage {
     pub total_tokens: u64,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Provider { OpenAi, Anthropic }
+
 #[derive(Clone)]
 pub struct Client {
     http: reqwest::Client,
@@ -119,6 +122,7 @@ pub struct Client {
     temperature: f32,
     max_tokens: u32,
     aux_model: Option<String>,
+    provider: Provider,
 }
 
 impl Client {
@@ -129,16 +133,20 @@ impl Client {
             .connect_timeout(std::time::Duration::from_secs(30))
             .read_timeout(std::time::Duration::from_secs(300))
             .build()?;
+        let provider = match cfg.provider.as_deref() { Some("anthropic") => Provider::Anthropic, Some(_) => Provider::OpenAi, None => if cfg.base_url.contains("anthropic.com") { Provider::Anthropic } else { Provider::OpenAi } };
+        let api_key = cfg.api_key.clone().or_else(|| match provider { Provider::Anthropic => std::env::var("ANTHROPIC_API_KEY").ok(), Provider::OpenAi => std::env::var("OPENAI_API_KEY").ok() });
         Ok(Self {
             http,
             base_url: cfg.base_url.trim_end_matches('/').to_string(),
             model: cfg.model.clone(),
-            api_key: cfg.api_key.clone(),
+            api_key,
             temperature: cfg.temperature,
             max_tokens: cfg.max_tokens,
             aux_model: cfg.aux_model.clone().filter(|m| !m.trim().is_empty()),
+            provider,
         })
     }
+    pub fn provider(&self) -> Provider { self.provider }
     /// Client for auxiliary calls (reflection, compaction): the configured aux model, or this one.
     pub fn aux(&self) -> Client { match &self.aux_model { Some(m) => self.with_model(m), None => self.clone() } }
 
@@ -147,6 +155,12 @@ impl Client {
     pub fn with_model(&self, model: &str) -> Client { let mut c = self.clone(); c.model = model.to_string(); c }
 
     pub async fn list_models(&self) -> Result<Vec<String>> {
+        if self.provider == Provider::Anthropic {
+            let mut req = self.http.get(format!("{}/v1/models?limit=100", self.base_url.trim_end_matches("/v1"))).header("anthropic-version", "2023-06-01");
+            if let Some(k) = &self.api_key { req = req.header("x-api-key", k); }
+            let v: Value = req.send().await?.error_for_status()?.json().await?;
+            return Ok(v["data"].as_array().map(|a| a.iter().filter_map(|m| m["id"].as_str().map(String::from)).collect()).unwrap_or_default());
+        }
         let mut req = self.http.get(format!("{}/models", self.base_url));
         if let Some(k) = &self.api_key { req = req.bearer_auth(k); }
         let v: Value = req.send().await?.error_for_status()?.json().await?;
@@ -154,6 +168,7 @@ impl Client {
     }
 
     pub async fn chat(&self, messages: &[Message], tools: &[ToolDef]) -> Result<(Message, Usage)> {
+        if self.provider == Provider::Anthropic { return self.chat_stream(messages, tools, |_| {}).await; }
         let mut body = json!({
             "model": self.model,
             "messages": messages,
@@ -198,6 +213,7 @@ impl Client {
     /// Same as `chat` but streams (SSE). `on_delta` is called for each reasoning/content increment;
     /// tool-call fragments are assembled internally and returned in the final message.
     pub async fn chat_stream(&self, messages: &[Message], tools: &[ToolDef], mut on_delta: impl FnMut(Delta)) -> Result<(Message, Usage)> {
+        if self.provider == Provider::Anthropic { return self.anthropic_stream(messages, tools, &mut on_delta).await; }
         let mut body = json!({
             "model": self.model,
             "messages": messages,
@@ -275,6 +291,7 @@ impl Client {
 /// Detect the loaded context length of `model` from the server. Tries LM Studio (`/api/v0/models`),
 /// llama.cpp server (`/props`), Ollama (`/api/show`). Returns (tokens, source).
 pub async fn detect_context_length(base_url: &str, model: &str) -> Option<(u64, &'static str)> {
+    if base_url.contains("anthropic.com") || model.starts_with("claude-") { return Some((200_000, "Anthropic (known)")); }
     let root = base_url.trim_end_matches('/').trim_end_matches("/v1").to_string();
     let http = reqwest::Client::builder().timeout(std::time::Duration::from_secs(4)).build().ok()?;
     // LM Studio
@@ -301,6 +318,99 @@ pub async fn detect_context_length(base_url: &str, model: &str) -> Option<(u64, 
     None
 }
 
+impl Client {
+    /// Anthropic Messages API (streaming). Converts our OpenAI-shaped transcript to Anthropic blocks and back.
+    async fn anthropic_stream(&self, messages: &[Message], tools: &[ToolDef], on_delta: &mut impl FnMut(Delta)) -> Result<(Message, Usage)> {
+        let (system, msgs) = to_anthropic_messages(messages);
+        let a_tools: Vec<Value> = tools.iter().map(|t| json!({"name": t.function.name, "description": t.function.description, "input_schema": t.function.parameters})).collect();
+        let mut body = json!({"model": self.model, "max_tokens": self.max_tokens, "messages": msgs, "stream": true, "temperature": self.temperature});
+        if !system.is_empty() { body["system"] = json!(system); }
+        if !a_tools.is_empty() { body["tools"] = json!(a_tools); }
+        let url = format!("{}/v1/messages", self.base_url.trim_end_matches("/v1"));
+        let mut req = self.http.post(&url).header("anthropic-version", "2023-06-01").header("content-type", "application/json").json(&body);
+        if let Some(k) = &self.api_key { req = req.header("x-api-key", k); } else { bail!("Anthropic provider needs an API key (llm.api_key or ANTHROPIC_API_KEY)"); }
+        let resp = req.send().await.context("Anthropic request failed")?;
+        let status = resp.status();
+        if !status.is_success() { let t = resp.text().await.unwrap_or_default(); bail!("Anthropic returned {status}: {}", truncate_for_log(&t, 600)); }
+        let mut stream = resp.bytes_stream();
+        let mut buf = String::new();
+        let mut content = String::new(); let mut reasoning = String::new();
+        let mut calls: Vec<ToolCall> = Vec::new(); let mut cur_json: Vec<String> = Vec::new(); // per tool_use block index → partial json
+        let mut block_kind: std::collections::HashMap<u64, String> = std::collections::HashMap::new();
+        let mut usage = Usage::default(); let mut stop: Option<String> = None;
+        'outer: while let Some(chunk) = stream.next().await {
+            buf.push_str(&String::from_utf8_lossy(&chunk.context("stream error")?));
+            while let Some(pos) = buf.find('\n') {
+                let line = buf[..pos].trim().to_string(); buf.drain(..=pos);
+                let Some(data) = line.strip_prefix("data:") else { continue };
+                let Ok(v) = serde_json::from_str::<Value>(data.trim()) else { continue };
+                match v["type"].as_str().unwrap_or("") {
+                    "message_start" => { if let Some(u) = v["message"]["usage"].as_object() { usage.prompt_tokens = u.get("input_tokens").and_then(|x| x.as_u64()).unwrap_or(0) + u.get("cache_read_input_tokens").and_then(|x| x.as_u64()).unwrap_or(0) + u.get("cache_creation_input_tokens").and_then(|x| x.as_u64()).unwrap_or(0); } }
+                    "content_block_start" => {
+                        let idx = v["index"].as_u64().unwrap_or(0); let cb = &v["content_block"];
+                        let kind = cb["type"].as_str().unwrap_or("").to_string();
+                        if kind == "tool_use" { calls.push(ToolCall { id: cb["id"].as_str().unwrap_or("").to_string(), kind: "function".into(), function: FunctionCall { name: cb["name"].as_str().unwrap_or("").to_string(), arguments: String::new() } }); cur_json.push(String::new()); }
+                        block_kind.insert(idx, kind);
+                    }
+                    "content_block_delta" => {
+                        let d = &v["delta"];
+                        match d["type"].as_str().unwrap_or("") {
+                            "text_delta" => { let t = d["text"].as_str().unwrap_or(""); content.push_str(t); on_delta(Delta::Content(t.to_string())); }
+                            "thinking_delta" => { let t = d["thinking"].as_str().unwrap_or(""); reasoning.push_str(t); on_delta(Delta::Reasoning(t.to_string())); }
+                            "input_json_delta" => { if let Some(last) = cur_json.last_mut() { last.push_str(d["partial_json"].as_str().unwrap_or("")); } }
+                            _ => {}
+                        }
+                    }
+                    "content_block_stop" => {}
+                    "message_delta" => { if let Some(sr) = v["delta"]["stop_reason"].as_str() { stop = Some(sr.to_string()); } if let Some(o) = v["usage"]["output_tokens"].as_u64() { usage.completion_tokens = o; } }
+                    "message_stop" => break 'outer,
+                    "error" => bail!("Anthropic stream error: {}", v["error"]),
+                    _ => {}
+                }
+            }
+        }
+        for (c, j) in calls.iter_mut().zip(cur_json) { c.function.arguments = if j.trim().is_empty() { "{}".into() } else { j }; }
+        usage.total_tokens = usage.prompt_tokens + usage.completion_tokens;
+        if stop.as_deref() == Some("max_tokens") { content.push_str("\n[output truncated by max_tokens]"); }
+        Ok((Message { role: "assistant".into(), content: if content.is_empty() && !calls.is_empty() { None } else { Some(Content::Text(content)) }, tool_calls: if calls.is_empty() { None } else { Some(calls) }, reasoning_content: if reasoning.is_empty() { None } else { Some(reasoning) }, ..Default::default() }, usage))
+    }
+}
+
+/// OpenAI-shaped transcript → (system, anthropic messages). Consecutive tool results are merged into one user turn.
+fn to_anthropic_messages(messages: &[Message]) -> (String, Vec<Value>) {
+    let mut system = String::new();
+    let mut out: Vec<Value> = Vec::new();
+    for m in messages {
+        match m.role.as_str() {
+            "system" => { if !system.is_empty() { system.push_str("\n\n"); } system.push_str(&m.text()); }
+            "user" => {
+                let blocks: Vec<Value> = match &m.content {
+                    Some(Content::Parts(parts)) => parts.iter().filter_map(|p| match p["type"].as_str() {
+                        Some("text") => Some(json!({"type": "text", "text": p["text"]})),
+                        Some("image_url") => { let url = p["image_url"]["url"].as_str().unwrap_or(""); if let Some(rest) = url.strip_prefix("data:") { let (mime, b64) = rest.split_once(";base64,").unwrap_or(("image/png", "")); Some(json!({"type": "image", "source": {"type": "base64", "media_type": mime, "data": b64}})) } else { Some(json!({"type": "image", "source": {"type": "url", "url": url}})) } }
+                        _ => None }).collect(),
+                    _ => vec![json!({"type": "text", "text": m.text()})],
+                };
+                out.push(json!({"role": "user", "content": blocks}));
+            }
+            "assistant" => {
+                let mut blocks: Vec<Value> = Vec::new();
+                let t = m.text(); if !t.trim().is_empty() { blocks.push(json!({"type": "text", "text": t})); }
+                if let Some(calls) = &m.tool_calls { for c in calls { let input: Value = serde_json::from_str(&c.function.arguments).unwrap_or(json!({})); blocks.push(json!({"type": "tool_use", "id": c.id, "name": c.function.name, "input": input})); } }
+                if blocks.is_empty() { blocks.push(json!({"type": "text", "text": "(empty)"})); }
+                out.push(json!({"role": "assistant", "content": blocks}));
+            }
+            "tool" => {
+                let block = json!({"type": "tool_result", "tool_use_id": m.tool_call_id.clone().unwrap_or_default(), "content": m.text()});
+                if let Some(last) = out.last_mut() { if last["role"] == "user" && last["content"].as_array().map(|a| a.iter().all(|b| b["type"] == "tool_result")).unwrap_or(false) { last["content"].as_array_mut().unwrap().push(block); continue; } }
+                out.push(json!({"role": "user", "content": [block]}));
+            }
+            _ => {}
+        }
+    }
+    (system, out)
+}
+
 fn split_think(s: &str) -> (Option<String>, String) {
     if let (Some(a), Some(b)) = (s.find("<think>"), s.find("</think>")) {
         if a < b {
@@ -314,4 +424,28 @@ fn split_think(s: &str) -> (Option<String>, String) {
 
 pub fn truncate_for_log(s: &str, n: usize) -> String {
     if s.chars().count() <= n { s.to_string() } else { format!("{}…", s.chars().take(n).collect::<String>()) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn anthropic_conversion() {
+        let msgs = vec![
+            Message::system("sys"),
+            Message::user("hi"),
+            Message { role: "assistant".into(), content: None, tool_calls: Some(vec![ToolCall { id: "t1".into(), kind: "function".into(), function: FunctionCall { name: "bash".into(), arguments: "{\"cmd\":\"ls\"}".into() } }]), ..Default::default() },
+            Message::tool("t1", "bash", "out"),
+            Message::tool("t2", "bash", "out2"),
+        ];
+        let (system, out) = to_anthropic_messages(&msgs);
+        assert_eq!(system, "sys");
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[1]["content"][0]["type"], "tool_use");
+        assert_eq!(out[1]["content"][0]["input"]["cmd"], "ls");
+        assert_eq!(out[2]["content"].as_array().unwrap().len(), 2, "consecutive tool results merge into one user turn");
+        assert_eq!(out[2]["content"][1]["tool_use_id"], "t2");
+    }
+    #[test]
+    fn think_split() { let (t, r) = split_think("<think>abc</think>hello"); assert_eq!(t.as_deref(), Some("abc")); assert_eq!(r, "hello"); }
 }
