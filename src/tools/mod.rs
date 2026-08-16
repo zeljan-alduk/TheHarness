@@ -1,4 +1,5 @@
 pub mod archive;
+pub mod ask_user;
 pub mod bash;
 pub mod diagnostics;
 pub mod download;
@@ -45,12 +46,14 @@ pub struct ToolCtx {
     pub approver: Option<std::sync::Arc<dyn crate::permissions::Approver>>,
     /// Asynchronous events for the model (monitor lines, scheduled prompts); drained before each model call.
     pub inbox: std::sync::Arc<crate::inbox::Inbox>,
+    /// Cooperative cancellation flag (sub-agents): checked before each model call.
+    pub cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl ToolCtx {
     /// A context with defaults (no memory/sub-agents/hooks) — tests, `harness tool`, sub-processes.
     pub fn basic(workdir: PathBuf) -> Self {
-        Self { workdir, timeout: Duration::from_secs(120), max_output: 16000, net: crate::config::NetConfig::default(), memory: None, subagent: None, redact_secrets: true, hooks: Default::default(), todos: Default::default(), lsp_servers: Default::default(), extra_roots: vec![], approver: None, inbox: Default::default() }
+        Self { workdir, timeout: Duration::from_secs(120), max_output: 16000, net: crate::config::NetConfig::default(), memory: None, subagent: None, redact_secrets: true, hooks: Default::default(), todos: Default::default(), lsp_servers: Default::default(), extra_roots: vec![], approver: None, inbox: Default::default(), cancel: None }
     }
     /// Resolve a model-supplied path against workdir and refuse escapes.
     /// Symlinks are resolved on the deepest existing ancestor.
@@ -130,6 +133,7 @@ impl Registry {
             Arc::new(subagent::SpawnAgent),
             Arc::new(process::Process),
             Arc::new(todo::Todo),
+            Arc::new(ask_user::AskUser),
         ];
         if net_enabled {
             tools.push(Arc::new(web::WebFetch));

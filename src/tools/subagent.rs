@@ -29,14 +29,33 @@ impl Tool for SpawnAgent {
         let max_turns = args.get("max_turns").and_then(|v| v.as_u64()).unwrap_or(25) as usize;
         let read_only = args.get("read_only").and_then(|v| v.as_bool()).unwrap_or(false);
         let registry = env.registry.without("spawn_agent");
-        let sub_ctx = ToolCtx { workdir: workdir.clone(), timeout: ctx.timeout, max_output: ctx.max_output, net: ctx.net.clone(), memory: ctx.memory.clone(), subagent: None, redact_secrets: ctx.redact_secrets, hooks: ctx.hooks.clone(), todos: ctx.todos.clone(), lsp_servers: ctx.lsp_servers.clone(), extra_roots: ctx.extra_roots.clone() };
-        let mut pcfg = env.policy.cfg.clone();
+        let label = env.next_label();
+        let info = env.register(format!("↳{label}"), task.clone());
+        let sub_ctx = ToolCtx { workdir: workdir.clone(), timeout: ctx.timeout, max_output: ctx.max_output, net: ctx.net.clone(), memory: ctx.memory.clone(), subagent: None, redact_secrets: ctx.redact_secrets, hooks: ctx.hooks.clone(), todos: ctx.todos.clone(), lsp_servers: ctx.lsp_servers.clone(), extra_roots: ctx.extra_roots.clone(), approver: ctx.approver.clone(), inbox: info.inbox.clone(), cancel: Some(info.cancel.clone()) };
+        let mut pcfg = env.policy.cfg.clone(); pcfg.mode = env.policy.mode();
         if read_only { pcfg.mode = crate::permissions::Mode::Plan; }
         let policy = crate::permissions::Policy::new(pcfg, &workdir);
-        let sink = crate::agent::PrefixSink { inner: env.sink.clone(), prefix: format!("↳{} ", env.next_label()) };
-        let agent = crate::agent::Agent { client: &env.client, registry: &registry, ctx: &sub_ctx, max_turns, context_budget: env.context_budget, sink: &sink, stream: env.stream, policy: &policy, approver: env.approver.as_ref() };
+        let sink = crate::agent::PrefixSink { inner: env.sink.clone(), prefix: format!("↳{label} "), info: Some(info.clone()) };
         let system = crate::agent::system_prompt_with_memory(&workdir.display().to_string(), &registry.names(), Some("You are a SUB-AGENT working on one delegated task. Do exactly the task, then reply with a concise, complete report of results (facts, file paths, what changed, what failed) — the parent agent only sees this report."), ctx.memory.as_ref());
-        let (text, stats) = agent.run(&system, &task).await?;
-        Ok(format!("[sub-agent finished: {} turns, {} tool calls, {:.0}s, stop={}]\n{}", stats.turns, stats.tool_calls, stats.wall_secs, stats.stop_reason, text).into())
+        let finish = |status: &str| { *info.finished.lock().unwrap() = Some(std::time::Instant::now()); *info.status.lock().unwrap() = status.to_string(); };
+        // Claude Code backend: the sub-agent is another headless claude session with its own tool bridge
+        if env.client.provider() == crate::llm::Provider::ClaudeCode {
+            let policy = std::sync::Arc::new(policy);
+            let host = std::sync::Arc::new(crate::mcp_bridge::BridgeHost { registry: registry.clone(), ctx: sub_ctx.clone(), policy: policy.clone(), approver: env.approver.clone(), sink: std::sync::Arc::new(crate::agent::PrefixSink { inner: env.sink.clone(), prefix: format!("↳{label} "), info: Some(info.clone()) }) });
+            let session = match crate::claude_code::ClaudeCodeSession::start_with(&workdir, Some(env.client.model()), env.cc_effort.as_deref().or(Some("medium")), &system, host, None).await { Ok(s) => s, Err(e) => { finish("failed to start"); return Err(e); } };
+            *info.cc.lock().unwrap() = Some(session.clone());
+            let r = session.run_turn(&task, &[], &sink).await;
+            session.stop().await;
+            match r {
+                Ok((text, stats)) => { finish(&format!("done ({} tool calls, {:.0}s)", stats.tool_calls, stats.wall_secs)); Ok(format!("[sub-agent (claude) finished: {} model calls, {} tool calls, {:.0}s, stop={}]\n{}", stats.turns, stats.tool_calls, stats.wall_secs, stats.stop_reason, text).into()) }
+                Err(e) => { finish(if info.cancel.load(std::sync::atomic::Ordering::Relaxed) { "killed" } else { "error" }); if info.cancel.load(std::sync::atomic::Ordering::Relaxed) { Ok("[sub-agent killed by the user]".into()) } else { Err(e) } }
+            }
+        } else {
+            let agent = crate::agent::Agent { client: &env.client, registry: &registry, ctx: &sub_ctx, max_turns, context_budget: env.context_budget, sink: &sink, stream: env.stream, policy: &policy, approver: env.approver.as_ref() };
+            match agent.run(&system, &task).await {
+                Ok((text, stats)) => { finish(&format!("{} ({} tool calls, {:.0}s)", stats.stop_reason, stats.tool_calls, stats.wall_secs)); Ok(format!("[sub-agent finished: {} turns, {} tool calls, {:.0}s, stop={}]\n{}", stats.turns, stats.tool_calls, stats.wall_secs, stats.stop_reason, text).into()) }
+                Err(e) => { finish("error"); Err(e) }
+            }
+        }
     }
 }

@@ -35,9 +35,22 @@ pub struct ApprovalRequest { pub tool: String, pub summary: String, pub suggeste
 #[derive(Debug, Clone)]
 pub enum Approval { Once, Always, Deny }
 
+/// A question the model asks the user (ask_user tool): multiple choice and/or free text.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct Question { pub question: String, pub options: Vec<QuestionOption>, pub allow_free_text: bool, pub timeout_secs: Option<u64> }
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct QuestionOption { pub label: String, pub description: String }
+/// How the user answered. `choice` is 0-based into `options`; `text` is free text (or notes).
+#[derive(Debug, Clone, Default)]
+pub struct Answer { pub choice: Option<usize>, pub text: Option<String>, pub declined: bool, pub timed_out: bool }
+
 #[async_trait::async_trait]
 pub trait Approver: Send + Sync {
     async fn ask(&self, req: ApprovalRequest) -> Approval;
+    /// Ask the user a question; `None` = no user is available (headless run) — the model must decide itself.
+    async fn question(&self, _q: Question) -> Option<Answer> { None }
+    /// The user's answers may be prompted for interactively.
+    fn interactive(&self) -> bool { false }
 }
 /// Non-interactive: deny (unless `yes`).
 pub struct AutoApprover { pub yes: bool }

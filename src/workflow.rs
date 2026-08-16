@@ -159,7 +159,7 @@ async fn run_agent_step(wenv: &WorkflowEnv, sid: &str, label: &str, task: &str, 
     let mut pcfg = env.policy.cfg.clone(); if step.read_only { pcfg.mode = crate::permissions::Mode::Plan; }
     let policy = crate::permissions::Policy::new(pcfg, &wenv.ctx.workdir);
     let registry = env.registry.without("spawn_agent");
-    let sink = crate::agent::PrefixSink { inner: wenv.sink.clone(), prefix: format!("wf {} ", crate::llm::truncate_for_log(label, 24)) };
+    let sink = crate::agent::PrefixSink { inner: wenv.sink.clone(), prefix: format!("wf {} ", crate::llm::truncate_for_log(label, 24)), info: None };
     let mut task_now = task.to_string();
     let mut last = String::new();
     for attempt in 1..=step.max_attempts.max(1) {

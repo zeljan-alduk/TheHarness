@@ -94,13 +94,14 @@ pub async fn run_task(cfg: &Config, client: &Client, task_dir: &Path, spec: &Tas
         // evals get a throwaway memory store so the fitness function never depends on (or pollutes) the user's memory
         memory: crate::memory::MemoryStore::scratch(&workdir.join(".harness-memory"), &cfg.memory).ok(),
         subagent: None,
-        redact_secrets: cfg.security.redact_secrets, hooks: cfg.hooks.clone(), todos: Default::default(), lsp_servers: cfg.lsp.servers.clone(), extra_roots: vec![],
+        redact_secrets: cfg.security.redact_secrets, hooks: cfg.hooks.clone(), todos: Default::default(), lsp_servers: cfg.lsp.servers.clone(), extra_roots: vec![], approver: None, inbox: Default::default(), cancel: None,
     };
     let registry = Registry::defaults(cfg.net.enabled);
     let sink: std::sync::Arc<dyn crate::events::Sink> = std::sync::Arc::new(crate::events::StderrSink { verbose });
     let budget = cfg.llm.effective_budget(crate::llm::detect_context_length(&cfg.llm.base_url, &cfg.llm.model).await.map(|d| d.0));
     let policy = std::sync::Arc::new(crate::permissions::Policy::new(crate::permissions::PermissionsConfig { mode: crate::permissions::Mode::Bypass, ..Default::default() }, &ctx.workdir));
     let approver: std::sync::Arc<dyn crate::permissions::Approver> = std::sync::Arc::new(crate::permissions::AutoApprover { yes: true });
+    ctx.approver = Some(approver.clone());
     ctx.subagent = Some(std::sync::Arc::new(crate::agent::SubAgentEnv::new(client.clone(), registry.clone(), policy.clone(), approver.clone(), sink.clone(), budget, true)));
     let agent = Agent { client, registry: &registry, ctx: &ctx, max_turns: spec.max_turns.unwrap_or(cfg.agent.max_turns), context_budget: budget, sink: sink.as_ref(), stream: true, policy: &policy, approver: approver.as_ref() };
     let system = crate::agent::system_prompt(&ctx.workdir.display().to_string(), &registry.names(), None);

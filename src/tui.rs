@@ -58,7 +58,7 @@ fn pal() -> Pal {
 const SPINNER: [&str; 10] = ["✻", "✼", "✽", "✾", "✿", "❀", "✿", "✾", "✽", "✼"];
 const WORDS: [&str; 12] = ["Thinking", "Pondering", "Working", "Reasoning", "Cooking", "Tinkering", "Brewing", "Mulling", "Crunching", "Percolating", "Noodling", "Computing"];
 
-enum Msg { Policy(Arc<harness::permissions::Policy>), CcSession(Arc<harness::claude_code::ClaudeCodeSession>), CcSid(String), Block(Block), Ask(harness::permissions::ApprovalRequest, tokio::sync::oneshot::Sender<harness::permissions::Approval>), Ev(Event), Done(Result<(String, harness::agent::RunStats), String>), Sys(SysSample), CtxLen(u64), Pasted(Result<PathBuf, String>), Frames(Result<(PathBuf, f64, Vec<(f64, PathBuf)>), String>), Toolset(Arc<Toolset>), Catalog(Result<harness::plugins::Catalog, String>), Notice(String) }
+enum Msg { Question(harness::permissions::Question, tokio::sync::oneshot::Sender<harness::permissions::Answer>), SubEnv(Arc<harness::agent::SubAgentEnv>), Policy(Arc<harness::permissions::Policy>), CcSession(Arc<harness::claude_code::ClaudeCodeSession>), CcSid(String), Block(Block), Ask(harness::permissions::ApprovalRequest, tokio::sync::oneshot::Sender<harness::permissions::Approval>), Ev(Event), Done(Result<(String, harness::agent::RunStats), String>), Sys(SysSample), CtxLen(u64), Pasted(Result<PathBuf, String>), Frames(Result<(PathBuf, f64, Vec<(f64, PathBuf)>), String>), Toolset(Arc<Toolset>), Catalog(Result<harness::plugins::Catalog, String>), Notice(String) }
 
 /// Video scrubber state (modal over the transcript).
 struct VideoPicker { path: PathBuf, duration: f64, frames: Vec<(f64, PathBuf, String)>, cur: usize, selected: std::collections::BTreeSet<usize>, loading: bool, error: Option<String> }
@@ -278,6 +278,12 @@ impl harness::permissions::Approver for TuiApprover {
         if self.0.send(Msg::Ask(req, tx)).is_err() { return harness::permissions::Approval::Deny; }
         rx.await.unwrap_or(harness::permissions::Approval::Deny)
     }
+    async fn question(&self, q: harness::permissions::Question) -> Option<harness::permissions::Answer> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        if self.0.send(Msg::Question(q, tx)).is_err() { return None; }
+        rx.await.ok()
+    }
+    fn interactive(&self) -> bool { true }
 }
 
 enum Block {
@@ -342,8 +348,12 @@ struct App {
     compact_progress: Option<(f64, String, Instant)>,
     session_meta: harness::sessions::Meta,
     todos: Arc<std::sync::Mutex<Vec<harness::tools::todo::TodoItem>>>,
+    inbox: Arc<harness::inbox::Inbox>,
     event_log: Option<std::fs::File>,
     pending_ask: Option<(harness::permissions::ApprovalRequest, tokio::sync::oneshot::Sender<harness::permissions::Approval>)>,
+    pending_q: Option<(harness::permissions::Question, tokio::sync::oneshot::Sender<harness::permissions::Answer>, String)>,
+    subenv: Option<Arc<harness::agent::SubAgentEnv>>,
+    attached: Option<usize>,
     video: Option<VideoPicker>,
     strip_rects: Vec<(Rect, usize)>,
     // geometry from the last draw, for mouse hit-testing
@@ -366,7 +376,7 @@ pub async fn run(cfg: Config, resume: Option<String>) -> Result<()> {
         quit: false, tick: 0, word: 0, models: vec![],
         metrics: Metrics::new(0), panel: None, attachments: vec![], tool_previews: Default::default(),
         picker, images: Default::default(), img_seq: 0,
-        think_scroll: 0, toolset: None, perm_mode: harness::permissions::Mode::Auto, live_policy: None, extra_roots: vec![], cc: None, cc_last_session: None, compact_progress: None, session_meta: harness::sessions::Meta::default(), todos: Default::default(), event_log: None, pending_ask: None, video: None, strip_rects: vec![], tr_rect: Rect::default(), panel_rect: Rect::default(), tr_start: 0, line_map: vec![],
+        think_scroll: 0, toolset: None, perm_mode: harness::permissions::Mode::Auto, live_policy: None, extra_roots: vec![], cc: None, cc_last_session: None, compact_progress: None, session_meta: harness::sessions::Meta::default(), todos: Default::default(), inbox: Default::default(), event_log: None, pending_ask: None, pending_q: None, subenv: None, attached: None, video: None, strip_rects: vec![], tr_rect: Rect::default(), panel_rect: Rect::default(), tr_start: 0, line_map: vec![],
     };
     app.metrics.ctx_len = app.cfg.llm.context_budget_tokens.unwrap_or(0);
     app.perm_mode = app.cfg.permissions.mode;
@@ -477,6 +487,21 @@ impl App {
                     }
                     _ => {}
                 }
+            }
+            CEvent::Key(k) if k.kind == KeyEventKind::Press && self.pending_q.is_some() => {
+                let nopts = self.pending_q.as_ref().map(|(q, _, _)| q.options.len()).unwrap_or(0);
+                let buf_empty = self.pending_q.as_ref().map(|(_, _, b)| b.is_empty()).unwrap_or(true);
+                let mut answer: Option<harness::permissions::Answer> = None;
+                match k.code {
+                    KeyCode::Esc => answer = Some(harness::permissions::Answer { declined: true, ..Default::default() }),
+                    KeyCode::Char(c) if c.is_ascii_digit() && buf_empty && (c as usize - '0' as usize) >= 1 && (c as usize - '0' as usize) <= nopts => answer = Some(harness::permissions::Answer { choice: Some(c as usize - '1' as usize), ..Default::default() }),
+                    KeyCode::Enter => { let t = self.pending_q.as_ref().map(|(_, _, b)| b.clone()).unwrap_or_default(); if !t.trim().is_empty() { answer = Some(harness::permissions::Answer { text: Some(t), ..Default::default() }); } }
+                    KeyCode::Backspace => { if let Some((_, _, b)) = &mut self.pending_q { b.pop(); } }
+                    KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => answer = Some(harness::permissions::Answer { declined: true, ..Default::default() }),
+                    KeyCode::Char(c) => { if let Some((q, _, b)) = &mut self.pending_q { if q.allow_free_text { b.push(c); } } }
+                    _ => {}
+                }
+                if let Some(a) = answer { if let Some((q, tx, _)) = self.pending_q.take() { let label = if a.declined { "declined".to_string() } else if let Some(i) = a.choice { format!("→ {}", q.options.get(i).map(|o| o.label.clone()).unwrap_or_default()) } else { format!("→ {}", a.text.clone().unwrap_or_default()) }; self.blocks.push(Block::System(format!("❓ answer {label}"))); let _ = tx.send(a); } }
             }
             CEvent::Key(k) if k.kind == KeyEventKind::Press && self.pending_ask.is_some() => {
                 let ans = match k.code {
@@ -638,6 +663,12 @@ impl App {
         self.input.clear(); self.cursor = 0; self.hist_idx = None;
         if self.history.last() != Some(&text) { self.history.push(text.clone()); }
         if text.starts_with('/') { self.command(&text); return; }
+        if let Some(id) = self.attached {
+            if let Some(a) = self.subenv.as_ref().and_then(|e| e.list().into_iter().find(|a| a.id == id)) {
+                if a.running() { a.inbox.push("message from the user (attached)", text.clone()); self.blocks.push(Block::System(format!("→ {} (delivered before its next model call): {}", a.label, truncate(&text, 120)))); return; }
+                self.set_status(format!("sub-agent #{id} is finished — /agents detach")); return;
+            }
+        }
         if self.running.is_some() { self.queued.push(text); self.set_status(format!("queued ({} waiting) — will run after the current turn", self.queued.len())); return; }
         self.start_run(text);
     }
@@ -947,7 +978,26 @@ impl App {
             "/pr-comments" => { let wd = self.workdir.clone(); let tx = self.tx.clone(); let a = arg.clone(); tokio::spawn(async move { let o = harness::sandbox::run_shell(&format!("gh pr view {a} --comments 2>&1 | head -120", ), &wd, Duration::from_secs(30), 16000).await; let _ = tx.send(Msg::Block(Block::Banner(std::iter::once("PR comments (gh)".to_string()).chain(o.map(|o| o.stdout).unwrap_or_default().lines().map(String::from)).collect()))); }); }
             "/release-notes" | "/changelog" => { let wd = self.workdir.clone(); let tx = self.tx.clone(); tokio::spawn(async move { let o = harness::sandbox::run_shell("git log --oneline -30", &wd, Duration::from_secs(20), 12000).await; let _ = tx.send(Msg::Block(Block::Banner(std::iter::once("Recent commits".to_string()).chain(o.map(|o| o.stdout).unwrap_or_default().lines().map(String::from)).collect()))); }); }
             "/bug" | "/feedback" => { self.blocks.push(Block::Banner(vec!["Report a harness bug: include the session id and the event log".into(), format!("  session   {}", if self.session_meta.id.is_empty() { "(unsaved)".into() } else { self.session_meta.id.clone() }), format!("  log       {}", short_path(&harness::setup::config_dir().join("logs"))), "  repo      docs/GAPS.md · README.md".into()])); }
-            "/agents" => { self.blocks.push(Block::Banner(vec!["Sub-agents".into(), "  the model delegates with spawn_agent {task, workdir?, read_only?} — several in one turn run in parallel".into(), "  events appear as ↳1 …, ↳2 … tool blocks; the parent only sees each sub-agent's final report".into(), "  workflows (/workflow) orchestrate agent steps deterministically".into()])); }
+            "/agents" => {
+                let list = self.subenv.as_ref().map(|e| e.list()).unwrap_or_default();
+                let mut it = arg.split_whitespace(); let sub = it.next().unwrap_or(""); let which = it.next().unwrap_or("");
+                if sub == "attach" || sub == "watch" {
+                    match which.parse::<usize>().ok().and_then(|id| list.iter().find(|a| a.id == id).cloned()) {
+                        Some(a) => { self.attached = Some(a.id); self.blocks.push(Block::System(format!("attached to sub-agent #{} {} — showing only its events; what you type is delivered to it; /agents detach to return", a.id, a.label))); }
+                        None => self.blocks.push(Block::Error("usage: /agents attach <id>".into())),
+                    }
+                } else if sub == "detach" { self.attached = None; self.blocks.push(Block::System("detached".into())); }
+                else if sub == "kill" || sub == "stop" {
+                    let targets: Vec<_> = list.iter().filter(|a| a.running() && (which == "all" || which.parse::<usize>().ok() == Some(a.id))).cloned().collect();
+                    if targets.is_empty() { self.blocks.push(Block::Error("usage: /agents kill <id|all>  (no matching running sub-agent)".into())); }
+                    for a in targets { a.kill(); self.blocks.push(Block::System(format!("killing sub-agent #{} {}", a.id, a.label))); }
+                } else {
+                    let mut lines = vec![format!("Sub-agents ({} total, {} running) — /agents kill <id|all>", list.len(), list.iter().filter(|a| a.running()).count())];
+                    for a in &list { let secs = a.finished.lock().unwrap().map(|f| f.duration_since(a.started)).unwrap_or_else(|| a.started.elapsed()).as_secs(); lines.push(format!("  #{:<2} {:<4} {:<9} {:>4}s  {:>3} tools  {}", a.id, a.label, truncate(&a.status.lock().unwrap(), 9), secs, a.tool_calls.load(std::sync::atomic::Ordering::Relaxed), truncate(&a.task, 70))); }
+                    if list.is_empty() { lines.push("  none yet — the model delegates with spawn_agent {task, workdir?, read_only?}; several in one turn run in parallel (also under the Claude Code backend)".into()); }
+                    self.blocks.push(Block::Banner(lines));
+                }
+            }
             "/rewind" | "/undo" => {
                 if self.running.is_some() { self.set_status("finish or interrupt first"); }
                 else {
@@ -1116,6 +1166,7 @@ impl App {
         let toolset = self.toolset.clone();
         let todos = self.todos.clone();
         let extra_roots = self.extra_roots.clone();
+        let inbox = self.inbox.clone();
         let perm_mode = self.perm_mode;
         let cc_existing = self.cc.clone(); let cc_resume = self.cc_last_session.clone();
         let cc_images: Vec<(String, String)> = atts.iter().map(|a| (a.mime.clone(), a.b64.clone())).collect();
@@ -1134,8 +1185,8 @@ impl App {
                 let policy = Arc::new(harness::permissions::Policy::new(pcfg, &workdir));
                 let _ = tx.send(Msg::Policy(policy.clone()));
                 let approver: Arc<dyn harness::permissions::Approver> = Arc::new(TuiApprover(tx.clone()));
-                let env = Arc::new(harness::agent::SubAgentEnv::new(client.clone(), registry.clone(), policy.clone(), approver.clone(), sink.clone(), budget, true));
-                let ctx = ToolCtx { workdir: workdir.clone(), timeout: Duration::from_secs(cfg.agent.tool_timeout_secs), max_output: cfg.agent.max_tool_output_chars, net: cfg.net.clone(), memory: store.clone(), subagent: Some(env), redact_secrets: cfg.security.redact_secrets, hooks: cfg.hooks.clone(), todos: todos.clone(), lsp_servers: cfg.lsp.servers.clone(), extra_roots: extra_roots.clone() };
+                let mut env_ = harness::agent::SubAgentEnv::new(client.clone(), registry.clone(), policy.clone(), approver.clone(), sink.clone(), budget, true); env_.cc_effort = cfg.llm.effort.clone(); let env = Arc::new(env_); let _ = tx.send(Msg::SubEnv(env.clone()));
+                let ctx = ToolCtx { workdir: workdir.clone(), timeout: Duration::from_secs(cfg.agent.tool_timeout_secs), max_output: cfg.agent.max_tool_output_chars, net: cfg.net.clone(), memory: store.clone(), subagent: Some(env), redact_secrets: cfg.security.redact_secrets, hooks: cfg.hooks.clone(), todos: todos.clone(), lsp_servers: cfg.lsp.servers.clone(), extra_roots: extra_roots.clone(), approver: Some(approver.clone()), inbox: inbox.clone(), cancel: None };
                 let agent = Agent { client: &client, registry, ctx: &ctx, max_turns: cfg.agent.max_turns, context_budget: budget, sink: sink.as_ref(), stream: true, policy: &policy, approver: approver.as_ref() };
                 let extra = format!("You are in an interactive session: the user can see everything and will reply; keep final answers concise.{extra_prompt}");
                 let system = harness::agent::system_prompt_with_memory(&workdir.display().to_string(), &registry.names(), Some(&extra), store.as_ref());
@@ -1260,6 +1311,14 @@ impl App {
             Msg::Block(b) => self.blocks.push(b),
             Msg::CcSession(s) => { self.cc = Some(s); }
             Msg::Policy(p) => { p.set_mode(self.perm_mode); self.live_policy = Some(p); }
+            Msg::SubEnv(e) => { self.subenv = Some(e); }
+            Msg::Question(q, tx) => {
+                let mut lines = vec![format!("❓ {}", q.question)];
+                for (i, o) in q.options.iter().enumerate() { lines.push(format!("   [{}] {}{}", i + 1, o.label, if o.description.is_empty() { String::new() } else { format!(" — {}", o.description) })); }
+                lines.push(if q.allow_free_text { "   type an answer and press enter · number picks an option · esc declines".into() } else { "   press a number to choose · esc declines".into() });
+                self.blocks.push(Block::Banner(lines));
+                self.pending_q = Some((q, tx, String::new()));
+            }
             Msg::CcSid(id) => { self.cc_last_session = Some(id); }
             Msg::Ask(req, tx) => { self.blocks.push(Block::System(format!("🔒 approval needed — {}({}) · {}", req.tool, truncate(&req.summary, 100), req.reason))); self.pending_ask = Some((req, tx)); }
             Msg::Ev(e) => self.on_event(e),
@@ -1453,7 +1512,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ("/pr-comments", "show PR comments via gh: /pr-comments [number]"),
     ("/rewind", "drop the last turn from the conversation (files not reverted)"),
     ("/release-notes", "recent commits"),
-    ("/agents", "how sub-agents work"),
+    ("/agents", "sub-agents: list · attach <id> (watch + message it) · detach · kill <id|all>"),
     ("/keybindings", "list keyboard shortcuts"),
     ("/exit", "quit"),
 ];
@@ -1478,7 +1537,11 @@ fn draw(f: &mut Frame, app: &mut App) {
     let sugg = suggestions(&app.input);
     let input_h = (input_lines.len().clamp(1, 8) + sugg.len() + if app.attachments.is_empty() { 0 } else { 1 }) as u16;
     // notice line above the box: spinner while running, or a transient status message
-    let notice: Option<Vec<Span>> = if let Some((req, _)) = &app.pending_ask {
+    let notice: Option<Vec<Span>> = if let Some((q, _, buf)) = &app.pending_q {
+        Some(vec![Span::styled(" ❓ ", Style::default().fg(Color::Black).bg(pal().cyan)), Span::styled(format!(" {} ", truncate(&q.question, width.saturating_sub(60))), Style::default().fg(Color::Black).bg(pal().cyan).bold()),
+                  Span::styled(format!("  {}", if q.options.is_empty() { String::new() } else { format!("[1-{}] choose · ", q.options.len()) }), Style::default().fg(pal().cyan)),
+                  Span::styled(if q.allow_free_text { format!("type + enter: {buf}▏") } else { String::new() }, Style::default().fg(pal().fg)), Span::styled("  esc declines", Style::default().fg(pal().dim))])
+    } else if let Some((req, _)) = &app.pending_ask {
         Some(vec![Span::styled(" 🔒 ", Style::default().fg(Color::Black).bg(pal().orange)), Span::styled(format!(" {}({}) ", req.tool, truncate(&req.summary, width.saturating_sub(70))), Style::default().fg(Color::Black).bg(pal().orange).bold()),
                   Span::styled(format!("  {} · ", req.reason), Style::default().fg(pal().orange)),
                   Span::styled("[y] allow once  ", Style::default().fg(pal().ok).bold()), Span::styled(format!("[a] always ({})  ", req.suggested_rule), Style::default().fg(pal().cyan)), Span::styled("[n] deny", Style::default().fg(pal().err).bold())])
@@ -1501,7 +1564,12 @@ fn draw(f: &mut Frame, app: &mut App) {
     let mut lines: Vec<Line> = Vec::new();
     let mut ph: Vec<Placeholder> = Vec::new();
     let mut line_map: Vec<(usize, usize, usize)> = Vec::new();
-    for (i, b) in app.blocks.iter().enumerate() { let a = lines.len(); render_block(b, app, width, &mut lines, &mut ph); line_map.push((a, lines.len(), i)); }
+    let attach_prefix: Option<String> = app.attached.and_then(|id| app.subenv.as_ref().and_then(|e| e.list().into_iter().find(|a| a.id == id)).map(|a| format!("{} ", a.label)));
+    if let Some(pfx) = &attach_prefix { lines.push(Line::from(vec![Span::styled(format!(" attached to sub-agent {} ", pfx.trim()), Style::default().fg(Color::Black).bg(pal().orange).bold()), Span::styled("  its tool calls and report below · type to message it · /agents detach", Style::default().fg(pal().dim))])); }
+    for (i, b) in app.blocks.iter().enumerate() {
+        if let Some(pfx) = &attach_prefix { let keep = match b { Block::Tool { name, .. } => name.starts_with(pfx.as_str()), Block::Error(t) | Block::System(t) => t.contains(pfx.trim()), _ => false }; if !keep { continue; } }
+        let a = lines.len(); render_block(b, app, width, &mut lines, &mut ph); line_map.push((a, lines.len(), i));
+    }
     let total = lines.len();
     let h = tr_area.height as usize;
     let max_up = total.saturating_sub(h);
@@ -1560,6 +1628,7 @@ fn draw(f: &mut Frame, app: &mut App) {
         Span::styled(format!("ctx {}", fmt_k(app.last_prompt_tokens)), Style::default().fg(pal().cyan))];
     if !app.net { st.push(dot()); st.push(Span::styled("offline", Style::default().fg(pal().pink))); }
     if !app.queued.is_empty() { st.push(dot()); st.push(Span::styled(format!("{} queued", app.queued.len()), Style::default().fg(pal().cyan))); }
+    if let Some(id) = app.attached { st.push(dot()); st.push(Span::styled(format!("attached #{id}"), Style::default().fg(pal().orange))); }
     let lw: usize = st.iter().map(|s| s.content.chars().count()).sum();
     let right = if app.running.is_none() { "? for shortcuts · /help" } else { "esc to interrupt" };
     let pad = width.saturating_sub(lw + right.chars().count() + 1);
@@ -1623,14 +1692,24 @@ fn draw_panel(f: &mut Frame, app: &App, area: Rect) {
     let running = app.running.is_some();
     let todos: Vec<harness::tools::todo::TodoItem> = app.todos.lock().map(|t| t.clone()).unwrap_or_default();
     let todo_h = if todos.is_empty() { 0 } else { (todos.len() as u16).min(8) + 1 };
+    let agents: Vec<Arc<harness::agent::SubAgentInfo>> = app.subenv.as_ref().map(|e| e.list()).unwrap_or_default();
+    let agents_show: Vec<&Arc<harness::agent::SubAgentInfo>> = agents.iter().filter(|a| a.running() || a.finished.lock().unwrap().map(|f| f.elapsed().as_secs() < 120).unwrap_or(false)).collect();
+    let agents_h = if agents_show.is_empty() { 0 } else { (agents_show.len() as u16).min(6) + 1 };
     let rows = Layout::vertical([
         Constraint::Length(1), Constraint::Min(6),          // thinking
         Constraint::Length(todo_h),                         // tasks
+        Constraint::Length(agents_h),                       // sub-agents
         Constraint::Length(1), Constraint::Length(6),       // tokens
         Constraint::Length(1), Constraint::Length(8),       // speed
         Constraint::Length(1), Constraint::Length(9),       // system
     ]).split(area);
-    let (r_tokens_t, r_tokens, r_speed_t, r_speed, r_sys_t, r_sys) = (rows[3], rows[4], rows[5], rows[6], rows[7], rows[8]);
+    let (r_tokens_t, r_tokens, r_speed_t, r_speed, r_sys_t, r_sys) = (rows[4], rows[5], rows[6], rows[7], rows[8], rows[9]);
+    if agents_h > 0 {
+        let running = agents_show.iter().filter(|a| a.running()).count();
+        let mut al: Vec<Line> = vec![title(&format!("Agents · {} running", running))];
+        for a in agents_show.iter().take(6) { let secs = a.finished.lock().unwrap().map(|f| f.duration_since(a.started)).unwrap_or_else(|| a.started.elapsed()).as_secs(); let st = a.status.lock().unwrap().clone(); let run = a.running(); al.push(Line::from(vec![Span::styled(format!("{} ", if run { "▶" } else { "☑" }), Style::default().fg(if run { pal().orange } else { pal().ok })), Span::styled(format!("{:<3}", a.label), Style::default().bold()), Span::styled(format!(" {:>3}s {:>2}t ", secs, a.tool_calls.load(std::sync::atomic::Ordering::Relaxed)), dim), Span::styled(truncate(&if run { st } else { format!("{st}") }, area.width.saturating_sub(16) as usize), if run { Style::default() } else { dim })])); }
+        f.render_widget(Paragraph::new(al), rows[3]);
+    }
     if todo_h > 0 {
         let done = todos.iter().filter(|t| t.status == "done").count();
         let mut tl: Vec<Line> = vec![title(&format!("Tasks {}/{}", done, todos.len()))];

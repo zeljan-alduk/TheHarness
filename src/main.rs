@@ -206,7 +206,7 @@ async fn main() -> Result<()> {
         Cmd::Tool { dir, name, args } => {
             let workdir = dir.unwrap_or(std::env::current_dir()?).canonicalize().context("workdir does not exist")?;
             let store = if cfg.memory.enabled { harness::memory::MemoryStore::open(&cfg.memory).ok() } else { None };
-            let ctx = tools::ToolCtx { workdir: workdir.clone(), timeout: Duration::from_secs(cfg.agent.tool_timeout_secs), max_output: cfg.agent.max_tool_output_chars, net: cfg.net.clone(), memory: store, subagent: None, redact_secrets: cfg.security.redact_secrets, hooks: cfg.hooks.clone(), todos: Default::default(), lsp_servers: cfg.lsp.servers.clone(), extra_roots: vec![] };
+            let ctx = tools::ToolCtx { workdir: workdir.clone(), timeout: Duration::from_secs(cfg.agent.tool_timeout_secs), max_output: cfg.agent.max_tool_output_chars, net: cfg.net.clone(), memory: store, subagent: None, redact_secrets: cfg.security.redact_secrets, hooks: cfg.hooks.clone(), todos: Default::default(), lsp_servers: cfg.lsp.servers.clone(), extra_roots: vec![], approver: None, inbox: Default::default(), cancel: None };
             let ts = tools::build_toolset(cfg.net.enabled, &workdir, name.starts_with("mcp__")).await;
             let out = ts.registry.call(&name, args.as_deref().unwrap_or("{}"), &ctx).await;
             println!("{}", out.text);
@@ -323,7 +323,7 @@ async fn run_agent(cfg: &config::Config, client: &llm::Client, workdir: &std::pa
         net: cfg.net.clone(),
         memory: None,
         subagent: None,
-        redact_secrets: cfg.security.redact_secrets, hooks: cfg.hooks.clone(), todos: Default::default(), lsp_servers: cfg.lsp.servers.clone(), extra_roots: vec![],
+        redact_secrets: cfg.security.redact_secrets, hooks: cfg.hooks.clone(), todos: Default::default(), lsp_servers: cfg.lsp.servers.clone(), extra_roots: vec![], approver: None, inbox: Default::default(), cancel: None,
     };
     let store = if cfg.memory.enabled { harness::memory::MemoryStore::open(&cfg.memory).ok() } else { None };
     if let Some(m) = &store { let _ = m.touch_project(workdir); }
@@ -341,7 +341,7 @@ async fn run_agent(cfg: &config::Config, client: &llm::Client, workdir: &std::pa
     let policy = std::sync::Arc::new(harness::permissions::Policy::new(pcfg, workdir));
     let approver: std::sync::Arc<dyn harness::permissions::Approver> = std::sync::Arc::new(harness::permissions::AutoApprover { yes });
     if !yes && policy.mode() != harness::permissions::Mode::Bypass { eprintln!("· permissions: {} (non-interactive: prompts are denied; pass -y to approve, or --permissions bypass)", policy.mode().label()); }
-    let ctx = tools::ToolCtx { subagent: Some(std::sync::Arc::new(agent::SubAgentEnv::new(client.clone(), registry.clone(), policy.clone(), approver.clone(), sink.clone(), budget, true))), ..ctx };
+    let ctx = tools::ToolCtx { subagent: Some(std::sync::Arc::new(agent::SubAgentEnv::new(client.clone(), registry.clone(), policy.clone(), approver.clone(), sink.clone(), budget, true))), approver: Some(approver.clone()), ..ctx };
     let mut msgs = Vec::new();
     let out = if client.provider() == llm::Provider::ClaudeCode {
         // Claude Code backend: our tools bridged over MCP; the claude CLI drives the loop

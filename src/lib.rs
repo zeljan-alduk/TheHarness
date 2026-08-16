@@ -8,6 +8,7 @@ pub mod config;
 pub mod eval;
 pub mod events;
 pub mod hooks;
+pub mod inbox;
 pub mod llm;
 pub mod lsp;
 pub mod mcp;

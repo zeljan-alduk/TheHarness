@@ -4,6 +4,7 @@ use crate::events::{Event, Sink};
 use crate::llm::{Client, Content, Delta, Message, Usage};
 use crate::tools::{Registry, ToolCtx};
 use anyhow::{bail, Result};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 #[derive(Debug, Default, Clone, serde::Serialize)]
@@ -194,8 +195,31 @@ pub fn system_prompt_with_memory(workdir: &str, tools: &[&str], extra: Option<&s
     s
 }
 
+/// A running/finished sub-agent, visible to the UI and controllable (kill).
+pub struct SubAgentInfo {
+    pub id: usize,
+    pub label: String,
+    pub task: String,
+    pub started: Instant,
+    pub finished: std::sync::Mutex<Option<Instant>>,
+    pub status: std::sync::Mutex<String>,
+    pub tool_calls: std::sync::atomic::AtomicUsize,
+    pub cancel: Arc<std::sync::atomic::AtomicBool>,
+    pub cc: std::sync::Mutex<Option<Arc<crate::claude_code::ClaudeCodeSession>>>,
+    /// Messages pushed here (attach mode) reach the sub-agent before its next model call.
+    pub inbox: Arc<crate::inbox::Inbox>,
+}
+impl SubAgentInfo {
+    pub fn kill(&self) { self.cancel.store(true, std::sync::atomic::Ordering::Relaxed); *self.status.lock().unwrap() = "cancelling".into(); if let Some(cc) = self.cc.lock().unwrap().clone() { tokio::spawn(async move { cc.stop().await; }); } }
+    pub fn running(&self) -> bool { self.finished.lock().unwrap().is_none() }
+}
+
 /// Shared, owned environment that lets a tool (spawn_agent) start nested agents.
 pub struct SubAgentEnv {
+    /// Live registry of sub-agents (this env's children).
+    pub agents: std::sync::Mutex<Vec<Arc<SubAgentInfo>>>,
+    /// Claude Code backend: effort level for spawned claude sessions.
+    pub cc_effort: Option<String>,
     pub client: Client,
     pub registry: crate::tools::Registry,
     pub policy: std::sync::Arc<crate::permissions::Policy>,
@@ -207,17 +231,24 @@ pub struct SubAgentEnv {
 }
 impl SubAgentEnv {
     pub fn new(client: Client, registry: crate::tools::Registry, policy: std::sync::Arc<crate::permissions::Policy>, approver: std::sync::Arc<dyn crate::permissions::Approver>, sink: std::sync::Arc<dyn Sink>, context_budget: u64, stream: bool) -> Self {
-        Self { client, registry, policy, approver, sink, context_budget, stream, counter: std::sync::atomic::AtomicUsize::new(0) }
+        Self { agents: std::sync::Mutex::new(vec![]), cc_effort: None, client, registry, policy, approver, sink, context_budget, stream, counter: std::sync::atomic::AtomicUsize::new(0) }
     }
     pub fn next_label(&self) -> String { format!("{}", self.counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1) }
+    pub fn register(&self, label: String, task: String) -> Arc<SubAgentInfo> {
+        let id = self.agents.lock().unwrap().len() + 1;
+        let info = Arc::new(SubAgentInfo { id, label, task, started: Instant::now(), finished: std::sync::Mutex::new(None), status: std::sync::Mutex::new("running".into()), tool_calls: std::sync::atomic::AtomicUsize::new(0), cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)), cc: std::sync::Mutex::new(None), inbox: Arc::new(crate::inbox::Inbox::new()) });
+        self.agents.lock().unwrap().push(info.clone());
+        info
+    }
+    pub fn list(&self) -> Vec<Arc<SubAgentInfo>> { self.agents.lock().unwrap().clone() }
 }
 
 /// Forwards a sub-agent's events to the parent sink with tool names prefixed (e.g. "↳1 bash").
-pub struct PrefixSink { pub inner: std::sync::Arc<dyn Sink>, pub prefix: String }
+pub struct PrefixSink { pub inner: std::sync::Arc<dyn Sink>, pub prefix: String, pub info: Option<Arc<SubAgentInfo>> }
 impl Sink for PrefixSink {
     fn emit(&self, e: &Event) {
         match e {
-            Event::ToolCall { id, name, args } => self.inner.emit(&Event::ToolCall { id: format!("{}{id}", self.prefix), name: format!("{}{name}", self.prefix), args: args.clone() }),
+            Event::ToolCall { id, name, args } => { if let Some(i) = &self.info { i.tool_calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed); *i.status.lock().unwrap() = format!("{name}"); } self.inner.emit(&Event::ToolCall { id: format!("{}{id}", self.prefix), name: format!("{}{name}", self.prefix), args: args.clone() }) }
             Event::ToolResult { id, name, result, secs, images } => self.inner.emit(&Event::ToolResult { id: format!("{}{id}", self.prefix), name: format!("{}{name}", self.prefix), result: result.clone(), secs: *secs, images: images.clone() }),
             Event::Assistant { text } => self.inner.emit(&Event::ToolResult { id: format!("{}final", self.prefix), name: format!("{}report", self.prefix), result: text.clone(), secs: 0.0, images: vec![] }),
             Event::Error { message } => self.inner.emit(&Event::Error { message: format!("{}{message}", self.prefix) }),
@@ -295,6 +326,8 @@ impl<'a> Agent<'a> {
                 }
                 last_usage = Usage::default(); // re-measured on the next call
             }
+            if let Some(c) = &self.ctx.cancel { if c.load(std::sync::atomic::Ordering::Relaxed) { stats.stop_reason = "cancelled".into(); stats.wall_secs = start.elapsed().as_secs_f64(); self.finish(&stats); return Ok((last_text(msgs).unwrap_or_else(|| "(cancelled by user)".into()), stats)); } }
+            if let Some(m) = self.ctx.inbox.take_message() { msgs.push(Message::user(m)); }
             stats.turns += 1;
             self.sink.emit(&Event::Turn { n: stats.turns });
             let call_start = Instant::now();
