@@ -44,6 +44,29 @@ fn highlight_line(lang: &str, line: &str, state: &mut Option<syntect::easy::High
     }
 }
 
+// ───────────────────────── /settings ─────────────────────────
+/// (key, label, choices, help). Booleans use ["on","off"]. Read-only rows have no choices.
+const SETTINGS: &[(&str, &str, &[&str], &str)] = &[
+    ("ui.tool_view", "Tool calls", &["summary", "hidden", "full"], "summary = one line per burst (click to expand) · hidden = only thinking + answers · full = every call (ctrl+o cycles)"),
+    ("ui.show_thinking", "Show thinking inline", &["off", "on"], "expand the model's reasoning in the transcript (ctrl+t / click)"),
+    ("ui.panel", "Dashboard panel", &["auto", "on", "off"], "auto shows it when the window is ≥120 columns (ctrl+p)"),
+    ("ui.theme", "Theme", &["dark", "light"], ""),
+    ("ui.notify", "Notifications", &["on", "off"], "desktop notification when a long task finishes"),
+    ("ui.fold_previous", "Auto-fold previous turn", &["on", "off"], "collapse the last turn's outputs when a new task starts"),
+    ("ui.vim", "Vim mode", &["off", "on"], "modal editing in the prompt (/vim)"),
+    ("permissions.mode", "Permission mode", &["auto", "ask", "plan", "bypass"], "default for new sessions (shift+tab cycles live)"),
+    ("llm.effort", "Effort (Claude backend)", &["medium", "low", "high", "xhigh", "max"], "reasoning effort passed to Claude Code"),
+    ("llm.compact_at_fraction", "Auto-compact at", &["0.75", "0.5", "0.6", "0.85", "0.9"], "fraction of the context window that triggers compaction (local/API backends)"),
+    ("memory.auto_reflect", "Memory reflection", &["on", "off"], "learn durable facts into BRAIN.md after substantive runs"),
+    ("security.redact_secrets", "Redact secrets", &["on", "off"], "mask API keys/tokens in tool outputs"),
+    ("net.enabled", "Internet tools", &["on", "off"], "web_fetch / web_search / download_file"),
+    ("agent.max_task_secs", "Max task time", &["0", "300", "900", "1800", "3600"], "0 = unlimited; the queue continues afterwards"),
+    ("ui.event_log", "Event log", &["on", "off"], "~/.config/harness/logs/<date>/"),
+    ("sandbox.mode", "Sandbox", &["none", "seatbelt", "bwrap"], "confine shell writes (macOS seatbelt / Linux bubblewrap)"),
+    ("llm.provider", "Backend", &[], "change with /backend"),
+    ("llm.model", "Model", &[], "change with /model or /backend"),
+];
+
 // ───────────────────────── custom keybindings ─────────────────────────
 /// ~/.config/harness/keybindings.toml — [bindings] action = "ctrl+x" | "alt+enter" | "shift+tab" | "f5" | "esc" …
 /// Actions: interrupt, next_task, toggle_panel, toggle_thinking, expand_tools, paste, cycle_permissions, newline,
@@ -381,6 +404,9 @@ struct App {
     perm_mode: harness::permissions::Mode,
     vim: bool, vim_normal: bool,
     keymap: Keymap,
+    tool_view: String,               // summary | hidden | full
+    tool_groups_open: std::collections::HashSet<usize>, // first block index of an expanded tool burst
+    settings_open: bool, settings_cursor: usize,
     live_policy: Option<Arc<harness::permissions::Policy>>,
     extra_roots: Vec<PathBuf>,
     /// worktree enter/exit state (shared with the running agent; persists across turns)
@@ -419,10 +445,12 @@ pub async fn run(cfg: Config, resume: Option<String>) -> Result<()> {
         quit: false, restart: false, tick: 0, word: 0, models: vec![],
         metrics: Metrics::new(0), panel: None, attachments: vec![], tool_previews: Default::default(),
         picker, images: Default::default(), img_seq: 0,
-        think_scroll: 0, toolset: None, perm_mode: harness::permissions::Mode::Auto, vim: false, vim_normal: false, keymap: Keymap::load(), live_policy: None, cc_rate: None, extra_roots: vec![], wt_cwd: harness::worktree::new_cell(), cc: None, cc_last_session: None, compact_progress: None, session_meta: harness::sessions::Meta::default(), todos: Default::default(), inbox: Default::default(), event_log: None, pending_ask: None, pending_q: None, subenv: None, attached: None, video: None, strip_rects: vec![], tr_rect: Rect::default(), panel_rect: Rect::default(), tr_start: 0, line_map: vec![],
+        think_scroll: 0, toolset: None, perm_mode: harness::permissions::Mode::Auto, vim: false, vim_normal: false, keymap: Keymap::load(), tool_view: "summary".into(), tool_groups_open: Default::default(), settings_open: false, settings_cursor: 0, live_policy: None, cc_rate: None, extra_roots: vec![], wt_cwd: harness::worktree::new_cell(), cc: None, cc_last_session: None, compact_progress: None, session_meta: harness::sessions::Meta::default(), todos: Default::default(), inbox: Default::default(), event_log: None, pending_ask: None, pending_q: None, subenv: None, attached: None, video: None, strip_rects: vec![], tr_rect: Rect::default(), panel_rect: Rect::default(), tr_start: 0, line_map: vec![],
     };
     app.metrics.ctx_len = app.cfg.llm.context_budget_tokens.unwrap_or(0);
     app.perm_mode = app.cfg.permissions.mode;
+    app.tool_view = app.cfg.ui.tool_view.clone(); app.show_thinking = app.cfg.ui.show_thinking; app.vim = app.cfg.ui.vim;
+    app.panel = match app.cfg.ui.panel.as_str() { "on" => Some(true), "off" => Some(false), _ => None };
     if app.cfg.ui.event_log { { let d = config_dir().join("logs").join(harness::memory::today_iso()); let _ = std::fs::create_dir_all(&d); app.event_log = std::fs::OpenOptions::new().create(true).append(true).open(d.join(format!("tui-{}.jsonl", std::process::id()))).ok(); } }
     if app.cfg.ui.theme == "light" { LIGHT.store(true, std::sync::atomic::Ordering::Relaxed); }
     app.banner();
@@ -528,6 +556,42 @@ impl App {
     }
 
     fn set_status(&mut self, s: impl Into<String>) { self.status_msg = Some((s.into(), Instant::now())); }
+
+    fn setting_value(&self, key: &str) -> String {
+        let b = |v: bool| if v { "on" } else { "off" }.to_string();
+        match key {
+            "ui.tool_view" => self.tool_view.clone(), "ui.show_thinking" => b(self.show_thinking), "ui.panel" => match self.panel { Some(true) => "on".into(), Some(false) => "off".into(), None => "auto".into() },
+            "ui.theme" => if LIGHT.load(std::sync::atomic::Ordering::Relaxed) { "light".into() } else { "dark".into() }, "ui.notify" => b(self.cfg.ui.notify), "ui.fold_previous" => b(self.cfg.ui.fold_previous), "ui.vim" => b(self.vim),
+            "permissions.mode" => format!("{:?}", self.perm_mode).to_lowercase(), "llm.effort" => self.cfg.llm.effort.clone().unwrap_or("medium".into()), "llm.compact_at_fraction" => format!("{}", self.cfg.llm.compact_at_fraction),
+            "memory.auto_reflect" => b(self.cfg.memory.auto_reflect), "security.redact_secrets" => b(self.cfg.security.redact_secrets), "net.enabled" => b(self.net), "agent.max_task_secs" => self.cfg.agent.max_task_secs.to_string(), "ui.event_log" => b(self.cfg.ui.event_log), "sandbox.mode" => if self.cfg.sandbox.mode.is_empty() { "none".into() } else { self.cfg.sandbox.mode.clone() },
+            "llm.provider" => self.cfg.llm.provider.clone().unwrap_or("local (OpenAI-compatible server)".into()), "llm.model" => self.model.clone(),
+            _ => String::new(),
+        }
+    }
+    /// Cycle the selected setting; apply live + persist.
+    fn cycle_setting(&mut self, dir: i32) {
+        let (key, _, choices, _) = SETTINGS[self.settings_cursor];
+        if choices.is_empty() { self.set_status("read-only here — use /backend or /model"); return; }
+        let cur = self.setting_value(key);
+        let idx = choices.iter().position(|c| *c == cur).unwrap_or(0) as i32;
+        let next = choices[((idx + dir).rem_euclid(choices.len() as i32)) as usize];
+        self.apply_setting(key, next);
+    }
+    fn apply_setting(&mut self, key: &str, val: &str) {
+        let _ = self.cfg.set_setting(key, val);
+        match key {
+            "ui.tool_view" => self.tool_view = val.into(),
+            "ui.show_thinking" => self.show_thinking = val == "on",
+            "ui.panel" => self.panel = match val { "on" => Some(true), "off" => Some(false), _ => None },
+            "ui.theme" => LIGHT.store(val == "light", std::sync::atomic::Ordering::Relaxed),
+            "ui.vim" => { self.vim = val == "on"; self.vim_normal = false; }
+            "permissions.mode" => { if let Some(m) = harness::permissions::Mode::parse(val) { self.set_perm_mode(m); } }
+            "net.enabled" => { self.net = val == "on"; self.reload_toolset(); }
+            "llm.effort" => { if let Some(cc) = self.cc.take() { tokio::spawn(async move { cc.stop().await; }); } }
+            _ => {}
+        }
+        match harness::config::Config::save_setting(key, val) { Ok(()) => self.set_status(format!("{key} = {val} (saved)")), Err(e) => self.set_status(format!("{key} = {val} (not saved: {e})")) }
+    }
     fn set_perm_mode(&mut self, m: harness::permissions::Mode) {
         self.perm_mode = m; if let Some(p) = &self.live_policy { p.set_mode(m); }
         if m == harness::permissions::Mode::Bypass { if let Some((_, tx)) = self.pending_ask.take() { let _ = tx.send(harness::permissions::Approval::Once); self.blocks.push(Block::System("🔒 pending prompt auto-approved (bypass)".into())); } }
@@ -571,6 +635,18 @@ impl App {
                             if let Some(&(_, _, idx)) = self.line_map.iter().find(|(a, b, _)| line >= *a && line < *b) { self.toggle_fold(idx); }
                         }
                     }
+                    _ => {}
+                }
+            }
+            CEvent::Key(k) if k.kind == KeyEventKind::Press && self.settings_open => {
+                let n = SETTINGS.len();
+                match k.code {
+                    KeyCode::Esc | KeyCode::Char('q') => self.settings_open = false,
+                    KeyCode::Up | KeyCode::Char('k') => self.settings_cursor = self.settings_cursor.saturating_sub(1),
+                    KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => self.settings_cursor = (self.settings_cursor + 1).min(n - 1),
+                    KeyCode::Right | KeyCode::Enter | KeyCode::Char(' ') | KeyCode::Char('l') => self.cycle_setting(1),
+                    KeyCode::Left | KeyCode::Char('h') => self.cycle_setting(-1),
+                    KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => self.settings_open = false,
                     _ => {}
                 }
             }
@@ -623,7 +699,7 @@ impl App {
                 if km.is("next_task", k.code, k.modifiers) { self.next_task(); return; }
                 if km.is("toggle_panel", k.code, k.modifiers) { self.panel = Some(!self.panel_visible(200)); return; }
                 if km.is("toggle_thinking", k.code, k.modifiers) { self.show_thinking = !self.show_thinking; return; }
-                if km.is("expand_tools", k.code, k.modifiers) { self.expand_tools = !self.expand_tools; return; }
+                if km.is("expand_tools", k.code, k.modifiers) { self.tool_view = match self.tool_view.as_str() { "summary" => "full".into(), "full" => "hidden".into(), _ => "summary".into() }; if self.tool_view == "full" { self.expand_tools = !self.expand_tools; } self.set_status(format!("tool calls: {}{}", self.tool_view, if self.tool_view == "full" && self.expand_tools { " (outputs expanded)" } else { "" })); return; }
                 if km.is("paste", k.code, k.modifiers) { let tx = self.tx.clone(); let store = if self.cfg.memory.enabled { harness::memory::MemoryStore::open(&self.cfg.memory).ok() } else { None }; self.set_status("reading clipboard…"); tokio::spawn(async move { let _ = tx.send(Msg::Pasted(clipboard_image(store).await)); }); return; }
                 if km.is("cycle_permissions", k.code, k.modifiers) { use harness::permissions::Mode::*; let m = match self.perm_mode { Auto => Ask, Ask => Plan, Plan => Bypass, Bypass => Auto }; self.set_perm_mode(m); self.set_status(format!("permissions → {}", self.perm_mode.label())); return; }
                 if km.is("newline", k.code, k.modifiers) || (k.code == KeyCode::Enter && alt) { self.insert_str("\n"); return; }
@@ -895,7 +971,7 @@ impl App {
             "/expand" => { self.expand_tools = !self.expand_tools; }
             "/panel" => { self.panel = Some(!self.panel_visible(200)); }
             "/cost" | "/stats" => self.blocks.push(Block::System(format!("session tokens: {} prompt + {} completion · last context {} · turns in history {}", self.total_prompt, self.total_completion, self.last_prompt_tokens, self.history.len()))),
-            "/config" => self.blocks.push(Block::Banner(vec![format!("server  {}", self.cfg.llm.base_url), format!("model   {}", self.model), format!("context {} · compaction at {} tokens · max_turns {} · tool timeout {}s", fmt_k(self.metrics.ctx_len), fmt_k(self.cfg.llm.effective_budget(if self.metrics.ctx_len > 0 { Some(self.metrics.ctx_len) } else { None })), self.cfg.agent.max_turns, self.cfg.agent.tool_timeout_secs), format!("net {} · segments {}", self.net, self.cfg.net.download_segments)])),
+            "/config" if !arg.is_empty() => self.blocks.push(Block::Banner(vec![format!("server  {}", self.cfg.llm.base_url), format!("model   {}", self.model), format!("context {} · compaction at {} tokens · max_turns {} · tool timeout {}s", fmt_k(self.metrics.ctx_len), fmt_k(self.cfg.llm.effective_budget(if self.metrics.ctx_len > 0 { Some(self.metrics.ctx_len) } else { None })), self.cfg.agent.max_turns, self.cfg.agent.tool_timeout_secs), format!("net {} · segments {}", self.net, self.cfg.net.download_segments)])),
             "/memory" | "/brain" | "/workflows" => {
                 let file = match cmd { "/memory" => "MEMORY", "/brain" => "BRAIN", _ => "WORKFLOWS" };
                 match harness::memory::MemoryStore::open(&self.cfg.memory).and_then(|s| Ok((s.path(file)?, s.read(file)?))) {
@@ -1032,6 +1108,7 @@ impl App {
                     }
                 }
             }
+            "/settings" | "/config" if arg.is_empty() => { self.settings_open = true; self.settings_cursor = 0; }
             "/keybindings" | "/keys" | "/shortcuts" => {
                 self.blocks.push(Block::Banner(vec![
                     "Keyboard shortcuts".into(),
@@ -1304,7 +1381,7 @@ impl App {
     }
 
     fn start_run(&mut self, text: String) {
-        self.fold_previous();
+        if self.cfg.ui.fold_previous { self.fold_previous(); }
         self.think_scroll = 0;
         self.harvest_image_paths(&text);
         let atts: Vec<Attachment> = std::mem::take(&mut self.attachments);
@@ -1615,8 +1692,14 @@ impl App {
             Event::Permission { tool, summary, decision } => { if decision.starts_with("denied") { self.blocks.push(Block::Error(format!("🔒 {tool}({}) {decision}", truncate(&summary, 80)))); } }
         }
     }
-    /// Click on a block: fold/unfold it.
+    /// Click on a block: fold/unfold it (a summarized tool burst opens/closes as a group).
     fn toggle_fold(&mut self, idx: usize) {
+        if matches!(self.blocks.get(idx), Some(Block::Tool { .. })) && self.tool_view != "full" {
+            let mut start = idx; while start > 0 && matches!(self.blocks.get(start - 1), Some(Block::Tool { .. })) { start -= 1; }
+            let mut end = idx; while matches!(self.blocks.get(end + 1), Some(Block::Tool { .. })) { end += 1; }
+            if self.tool_groups_open.contains(&start) { for k in start..=end { self.tool_groups_open.remove(&k); } } else { for k in start..=end { self.tool_groups_open.insert(k); } }
+            return;
+        }
         let global_tools = self.expand_tools; let global_think = self.show_thinking;
         if let Some(b) = self.blocks.get_mut(idx) {
             match b {
@@ -1666,7 +1749,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ("/usage", "Claude backend: subscription usage (proxied Claude Code /usage); otherwise same as /cost"),
     ("/compact", "compact the context into a precise handoff note: /compact [focus]"),
     ("/context", "context map: what fills the window (prompt, tools, memory, messages) + heaviest items"),
-    ("/config", "effective configuration"),
+    ("/settings", "interactive settings panel (also /config)"),
     ("/memory", "show MEMORY.md (settings · preferences · ideas)"),
     ("/brain", "show BRAIN.md (what the agent learned)"),
     ("/workflows", "show WORKFLOWS.md (recipes)"),
@@ -1750,15 +1833,39 @@ fn draw(f: &mut Frame, app: &mut App) {
     let (tr_area, no_area, top_area, in_area, bot_area, st_area) = (chunks[0], chunks[1], chunks[2], chunks[3], chunks[4], chunks[5]);
 
     if app.video.is_some() { draw_video(f, app, tr_area); }
+    if app.settings_open { draw_settings(f, app, tr_area); }
     // transcript
     let mut lines: Vec<Line> = Vec::new();
     let mut ph: Vec<Placeholder> = Vec::new();
     let mut line_map: Vec<(usize, usize, usize)> = Vec::new();
     let attach_prefix: Option<String> = app.attached.and_then(|id| app.subenv.as_ref().and_then(|e| e.list().into_iter().find(|a| a.id == id)).map(|a| format!("{} ", a.label)));
     if let Some(pfx) = &attach_prefix { lines.push(Line::from(vec![Span::styled(format!(" attached to sub-agent {} ", pfx.trim()), Style::default().fg(Color::Black).bg(pal().orange).bold()), Span::styled("  its tool calls and report below · type to message it · /agents detach", Style::default().fg(pal().dim))])); }
-    for (i, b) in app.blocks.iter().enumerate() {
-        if let Some(pfx) = &attach_prefix { let keep = match b { Block::Tool { name, .. } => name.starts_with(pfx.as_str()), Block::Error(t) | Block::System(t) => t.contains(pfx.trim()), _ => false }; if !keep { continue; } }
+    let mut i = 0usize;
+    while i < app.blocks.len() {
+        let b = &app.blocks[i];
+        if let Some(pfx) = &attach_prefix { let keep = match b { Block::Tool { name, .. } => name.starts_with(pfx.as_str()), Block::Error(t) | Block::System(t) => t.contains(pfx.trim()), _ => false }; if !keep { i += 1; continue; } }
+        // tool bursts: consecutive Tool blocks collapse to one line in summary mode (hidden: nothing, except pending/error)
+        if matches!(b, Block::Tool { .. }) && app.tool_view != "full" && attach_prefix.is_none() && !app.tool_groups_open.contains(&i) {
+            let start_i = i; let mut j = i; let mut names: Vec<String> = Vec::new(); let mut pending = 0; let mut errors = 0; let mut secs = 0.0;
+            while j < app.blocks.len() { if let Block::Tool { name, result, secs: sc, .. } = &app.blocks[j] { names.push(name.split_whitespace().last().unwrap_or(name).to_string()); if result.is_none() { pending += 1; } else if result.as_ref().map(|r| r.starts_with("error:")).unwrap_or(false) { errors += 1; } secs += sc; j += 1; } else { break; } }
+            let a = lines.len();
+            if app.tool_view == "summary" || pending > 0 || errors > 0 {
+                let mut counts: Vec<(String, usize)> = Vec::new(); for n in &names { if let Some(c) = counts.iter_mut().find(|(k, _)| k == n) { c.1 += 1; } else { counts.push((n.clone(), 1)); } }
+                let desc = counts.iter().map(|(k, c)| if *c > 1 { format!("{k}×{c}") } else { k.clone() }).collect::<Vec<_>>().join(", ");
+                let bullet_style = if pending > 0 { Style::default().fg(if (app.tick / 4) % 2 == 0 { pal().orange } else { pal().dim }) } else if errors > 0 { Style::default().fg(pal().err) } else { Style::default().fg(pal().ok) };
+                let mut spans = vec![Span::styled("⚙ ", bullet_style), Span::styled(format!("{} tool call{}", names.len(), if names.len() == 1 { "" } else { "s" }), Style::default().fg(pal().dim).bold()), Span::styled(format!(" · {}", truncate(&desc, width.saturating_sub(40))), Style::default().fg(pal().dim))];
+                if pending > 0 { spans.push(Span::styled(" · running…", Style::default().fg(pal().orange))); } else { spans.push(Span::styled(format!(" · {:.1}s", secs), Style::default().fg(pal().dim))); }
+                if errors > 0 { spans.push(Span::styled(format!(" · {errors} error{}", if errors == 1 { "" } else { "s" }), Style::default().fg(pal().err))); }
+                spans.push(Span::styled("  (click to expand)", Style::default().fg(pal().dim).italic()));
+                push_wrapped(&mut lines, spans, width, 2);
+                out_line_pad(&mut lines);
+            }
+            // every block of the burst maps to the summary line so a click expands the group
+            for k in start_i..j { line_map.push((a, lines.len(), k)); }
+            i = j; continue;
+        }
         let a = lines.len(); render_block(b, app, width, &mut lines, &mut ph); line_map.push((a, lines.len(), i));
+        i += 1;
     }
     let total = lines.len();
     let h = tr_area.height as usize;
@@ -1768,7 +1875,7 @@ fn draw(f: &mut Frame, app: &mut App) {
     app.line_map = line_map; app.tr_rect = tr_area; app.tr_start = start;
     app.panel_rect = panel_area.map(|(_, pa)| pa).unwrap_or_default();
     let visible: Vec<Line> = lines.into_iter().skip(start).take(h).collect();
-    if app.video.is_none() { f.render_widget(Paragraph::new(visible), tr_area); }
+    if app.video.is_none() && !app.settings_open { f.render_widget(Paragraph::new(visible), tr_area); }
     // images: draw those whose slot is fully inside the visible window
     for p in ph {
         if app.video.is_some() { break; }
@@ -1831,6 +1938,25 @@ fn draw(f: &mut Frame, app: &mut App) {
     let pad = width.saturating_sub(lw + right.chars().count() + 1);
     st.push(Span::raw(" ".repeat(pad))); st.push(Span::styled(right, Style::default().fg(pal().dim)));
     f.render_widget(Paragraph::new(Line::from(st)), st_area);
+}
+
+// ───────────────────────── settings panel ─────────────────────────
+fn draw_settings(f: &mut Frame, app: &mut App, area: Rect) {
+    f.render_widget(ratatui::widgets::Clear, area);
+    let dim = Style::default().fg(pal().dim);
+    let mut lines: Vec<Line> = vec![Line::from(Span::styled(" Settings  ·  ↑/↓ select · ←/→ or enter change · esc close  ·  saved to ~/.config/harness/settings.toml ", Style::default().fg(Color::Black).bg(pal().orange).bold())), Line::raw("")];
+    for (i, (key, label, choices, help)) in SETTINGS.iter().enumerate() {
+        let sel = i == app.settings_cursor;
+        let val = app.setting_value(key);
+        let mut spans = vec![Span::styled(if sel { " ▸ " } else { "   " }, Style::default().fg(pal().orange)), Span::styled(format!("{:<26}", label), if sel { Style::default().bold() } else { Style::default() })];
+        if choices.is_empty() { spans.push(Span::styled(truncate(&val, 50), dim)); }
+        else { for c in choices.iter() { let on = **c == val; spans.push(Span::styled(format!(" {} ", c), if on { Style::default().fg(Color::Black).bg(if sel { pal().orange } else { pal().dim }).bold() } else { dim })); spans.push(Span::raw(" ")); } }
+        lines.push(Line::from(spans));
+        if sel && !help.is_empty() { lines.push(Line::from(vec![Span::raw("     "), Span::styled(help.to_string(), dim.italic())])); }
+    }
+    lines.push(Line::raw(""));
+    lines.push(Line::from(Span::styled(format!("   config file: {}   ·   {}", short_path(&harness::setup::config_dir().join("harness.toml")), harness::version()), dim)));
+    f.render_widget(Paragraph::new(lines), area);
 }
 
 // ───────────────────────── video scrubber ─────────────────────────
@@ -2185,6 +2311,8 @@ fn render_block(b: &Block, app: &App, width: usize, out: &mut Vec<Line<'static>>
         Block::Finished(t) => { push_wrapped(out, vec![Span::styled("  ✓ ", Style::default().fg(pal().ok)), Span::styled(t.clone(), Style::default().fg(pal().dim))], w, 4); }
     }
 }
+
+fn out_line_pad(out: &mut Vec<Line<'static>>) { out.push(Line::raw("")); }
 
 fn parse_row(l: &str) -> Vec<String> { let t = l.trim().trim_start_matches('|').trim_end_matches('|'); t.split('|').map(|c| c.trim().to_string()).collect() }
 

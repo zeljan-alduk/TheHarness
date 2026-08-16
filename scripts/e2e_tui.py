@@ -68,11 +68,12 @@ for cmd, marker in [("/help", "Commands"), ("/tools", "download_file"), ("/confi
                     ("/mcp", "MCP servers configured"), ("/memory", "MEMORY"), ("/brain", "BRAIN"), ("/workflows", "WORKFLOWS"),
                     ("/remember e2e marker preference", "MEMORY › Preferences"), ("/plugin bogus", "usage: /plugin"), ("/reload", "reloading tools"),
                     ("/context", "Context map"), ("/workflow", "Workflows"), ("/workflow nope", "no workflow named"),
-                    ("/keybindings", "Keyboard shortcuts"), ("/status", "backend"), ("/vim", "vim mode on"), ("/vim", "vim mode off"),
+                    ("/keybindings", "Keyboard shortcuts"), ("/settings", "Settings"), ("/status", "backend"), ("/vim", "vim mode on"), ("/vim", "vim mode off"),
                     ("/permissions add bash:echo *", "rule added"), ("/permissions remove bash:echo *", "removed 1 rule"), ("/trust", "trusted directory"),
                     ("/sessions live", "Live sessions"), ("/msg nobody hi", "delivered to 1 session"), ("/agents", "Sub-agents"), ("/plugin update all", None), ("/doctor", "Doctor"), ("/todos", "todo"), ("/hooks", "Hooks"), ("/skills", None), ("/agents", "Sub-agents"), ("/effort", "effort"), ("/backend", "backend:"), ("/rename e2e session", "session renamed"), ("/export", None), ("/release-notes", "Recent commits")]:
     send(cmd + "\r"); pump(0.8)
     step(f"{cmd}", marker is None or marker in screen())
+    if cmd == "/settings": send("\x1b"); pump(0.3)
 send("/mod\t"); pump(0.3); step("tab-completes /model", "/model " in screen()); send("\x15")  # ctrl+u clears line
 buf = b""; send(f"look at {IMG}"); pump(0.5); step("image path harvested on submit (pending)", True)
 if NO_MODEL:

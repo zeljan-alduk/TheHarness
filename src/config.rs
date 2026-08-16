@@ -50,9 +50,21 @@ pub struct UiConfig {
     #[serde(default = "d_theme")] pub theme: String,
     /// Append every event to ~/.config/harness/logs/<date>/tui-<pid>.jsonl
     #[serde(default = "d_true")] pub event_log: bool,
+    /// How tool calls appear in the transcript: "summary" (one line per burst, click to expand), "hidden", "full"
+    #[serde(default = "d_tool_view")] pub tool_view: String,
+    /// Show the model's thinking inline by default
+    #[serde(default)] pub show_thinking: bool,
+    /// Dashboard panel: "auto" (by width) | "on" | "off"
+    #[serde(default = "d_panel")] pub panel: String,
+    /// Vim-style editing in the prompt
+    #[serde(default)] pub vim: bool,
+    /// Auto-fold the previous turn's outputs when a new turn starts
+    #[serde(default = "d_true")] pub fold_previous: bool,
 }
 fn d_theme() -> String { "dark".into() }
-impl Default for UiConfig { fn default() -> Self { Self { notify: true, theme: d_theme(), event_log: true } } }
+fn d_tool_view() -> String { "summary".into() }
+fn d_panel() -> String { "auto".into() }
+impl Default for UiConfig { fn default() -> Self { Self { notify: true, theme: d_theme(), event_log: true, tool_view: d_tool_view(), show_thinking: false, panel: d_panel(), vim: false, fold_previous: true } } }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct SecurityConfig {
@@ -198,8 +210,57 @@ impl Config {
             let dropped = cfg.sanitize_untrusted();
             if !dropped.is_empty() { eprintln!("config: {} defines {} — ignored because this directory is not trusted (/trust to enable)", path.display(), dropped.join(" and ")); }
         }
+        cfg.apply_settings_overlay();
         cfg.apply_env();
         Ok(cfg)
+    }
+
+    /// ~/.config/harness/settings.toml — values changed from the /settings panel; a flat "section.key = value" overlay.
+    pub fn settings_overlay_path() -> PathBuf { crate::setup::config_dir().join("settings.toml") }
+    pub fn apply_settings_overlay(&mut self) {
+        let Ok(t) = std::fs::read_to_string(Self::settings_overlay_path()) else { return };
+        let Ok(v) = t.parse::<toml::Value>() else { return };
+        let Some(tbl) = v.as_table() else { return };
+        for (k, val) in tbl { let sv = match val { toml::Value::String(x) => x.clone(), other => other.to_string() }; let _ = self.set_setting(k, &sv); }
+    }
+    /// Apply one setting by dotted key (used by the /settings panel and the overlay). Err for unknown keys/values.
+    pub fn set_setting(&mut self, key: &str, val: &str) -> anyhow::Result<()> {
+        let b = |v: &str| matches!(v, "true" | "on" | "yes" | "1");
+        match key {
+            "ui.theme" => self.ui.theme = val.into(),
+            "ui.tool_view" => self.ui.tool_view = val.into(),
+            "ui.notify" => self.ui.notify = b(val),
+            "ui.event_log" => self.ui.event_log = b(val),
+            "ui.show_thinking" => self.ui.show_thinking = b(val),
+            "ui.panel" => self.ui.panel = val.into(),
+            "ui.vim" => self.ui.vim = b(val),
+            "ui.fold_previous" => self.ui.fold_previous = b(val),
+            "permissions.mode" => self.permissions.mode = crate::permissions::Mode::parse(val).context("bad mode")?,
+            "llm.compact_at_fraction" => self.llm.compact_at_fraction = val.parse().context("bad fraction")?,
+            "llm.effort" => self.llm.effort = if val.is_empty() || val == "default" { None } else { Some(val.into()) },
+            "llm.provider" => self.llm.provider = if val.is_empty() || val == "local" { None } else { Some(val.into()) },
+            "llm.model" => self.llm.model = val.into(),
+            "memory.auto_reflect" => self.memory.auto_reflect = b(val),
+            "memory.enabled" => self.memory.enabled = b(val),
+            "security.redact_secrets" => self.security.redact_secrets = b(val),
+            "agent.max_task_secs" => self.agent.max_task_secs = val.parse().context("bad number")?,
+            "agent.max_turns" => self.agent.max_turns = val.parse().context("bad number")?,
+            "net.enabled" => self.net.enabled = b(val),
+            "sandbox.mode" => self.sandbox.mode = if val == "none" { String::new() } else { val.into() },
+            _ => anyhow::bail!("unknown setting {key}"),
+        }
+        Ok(())
+    }
+    /// Persist one setting to the overlay file.
+    pub fn save_setting(key: &str, val: &str) -> anyhow::Result<()> {
+        let p = Self::settings_overlay_path();
+        let mut tbl = std::fs::read_to_string(&p).ok().and_then(|t| t.parse::<toml::Value>().ok()).and_then(|v| v.as_table().cloned()).unwrap_or_default();
+        tbl.insert(key.to_string(), toml::Value::String(val.to_string()));
+        std::fs::create_dir_all(p.parent().unwrap())?;
+        let mut out = String::from("# Settings changed from /settings (override harness.toml). Delete a line to fall back to harness.toml.\n");
+        for (k, v) in &tbl { out.push_str(&format!("\"{k}\" = {}\n", v)); }
+        std::fs::write(&p, out)?;
+        Ok(())
     }
 
     /// Drop hooks and downgrade bypass → auto (project-local configs in untrusted dirs). Returns what was dropped.
