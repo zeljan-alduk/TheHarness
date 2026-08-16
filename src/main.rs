@@ -20,6 +20,12 @@ struct Cli {
     /// Emit machine-readable JSONL events on stdout instead of human logs (for UIs)
     #[arg(long, global = true)]
     json: bool,
+    /// Non-interactive approval: answer "yes" to permission prompts (otherwise they are denied)
+    #[arg(short = 'y', long, global = true)]
+    yes: bool,
+    /// Permission mode override: bypass | auto | ask | plan
+    #[arg(long, global = true)]
+    permissions: Option<String>,
     /// No subcommand → interactive terminal UI
     #[command(subcommand)]
     cmd: Option<Cmd>,
@@ -104,6 +110,7 @@ enum PluginCmd {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     let mut cfg = config::Config::load(cli.config.as_deref())?;
+    if let Some(m) = &cli.permissions { cfg.permissions.mode = harness::permissions::Mode::parse(m).context("--permissions must be bypass|auto|ask|plan")?; }
     let client = llm::Client::new(&cfg.llm)?;
 
     match cli.cmd.unwrap_or(Cmd::Chat) {
@@ -173,7 +180,7 @@ async fn main() -> Result<()> {
             if let Some(n) = max_turns { cfg.agent.max_turns = n; }
             if no_net { cfg.net.enabled = false; }
             let workdir = dir.unwrap_or(std::env::current_dir()?).canonicalize().context("workdir does not exist")?;
-            let (text, _stats) = run_agent(&cfg, &client, &workdir, &task, None, cli.verbose, cli.json).await?;
+            let (text, _stats) = run_agent(&cfg, &client, &workdir, &task, None, cli.verbose, cli.json, cli.yes).await?;
             if !cli.json { println!("\n{text}"); }
         }
         Cmd::Eval { filter, out } => {
@@ -210,7 +217,7 @@ Ground rules:
 - After edits: `cargo build --release` must succeed and `cargo test` must pass (use timeout_secs 600 for cargo commands; the first build is slow).
 - Then run `./target/release/harness eval` (timeout_secs 1800) and report the score.
 - Commit your work on this branch with a message that states the change and the eval result. Never merge into main; a human (or the arbiter) does that. Do not touch other branches or worktrees.");
-            let (text, _stats) = run_agent(&cfg, &client, &wt, &task, Some(&extra), cli.verbose, cli.json).await?;
+            let (text, _stats) = run_agent(&cfg, &client, &wt, &task, Some(&extra), cli.verbose, cli.json, true).await?;
             if !cli.json { println!("\n{text}"); }
             eprintln!("Review with: git log --oneline main..{branch} && git diff main..{branch}\nWorktree: {} (remove with: git worktree remove --force '{}')", wt.display(), wt.display());
         }
@@ -218,7 +225,7 @@ Ground rules:
     Ok(())
 }
 
-async fn run_agent(cfg: &config::Config, client: &llm::Client, workdir: &std::path::Path, task: &str, extra: Option<&str>, verbose: bool, json: bool) -> Result<(String, agent::RunStats)> {
+async fn run_agent(cfg: &config::Config, client: &llm::Client, workdir: &std::path::Path, task: &str, extra: Option<&str>, verbose: bool, json: bool, yes: bool) -> Result<(String, agent::RunStats)> {
     let sink: Box<dyn events::Sink> = if json { Box::new(events::JsonlSink) } else { Box::new(events::StderrSink { verbose }) };
     let ctx = tools::ToolCtx {
         workdir: workdir.to_path_buf(),
@@ -238,7 +245,12 @@ async fn run_agent(cfg: &config::Config, client: &llm::Client, workdir: &std::pa
     let detected = llm::detect_context_length(&cfg.llm.base_url, &cfg.llm.model).await;
     let budget = cfg.llm.effective_budget(detected.map(|d| d.0));
     if let Some((n, src)) = detected { eprintln!("· context {} tokens ({src}) · auto-compact at {}", n, budget); } else { eprintln!("· context length unknown · auto-compact at {budget}"); }
-    let a = agent::Agent { client, registry, ctx: &ctx, max_turns: cfg.agent.max_turns, context_budget: budget, sink: sink.as_ref(), stream: true };
+    let mut pcfg = cfg.permissions.clone();
+    pcfg.allow.extend(harness::permissions::persisted_rules());
+    let policy = harness::permissions::Policy::new(pcfg, workdir);
+    let approver = harness::permissions::AutoApprover { yes };
+    if !yes && policy.mode() != harness::permissions::Mode::Bypass { eprintln!("· permissions: {} (non-interactive: prompts are denied; pass -y to approve, or --permissions bypass)", policy.mode().label()); }
+    let a = agent::Agent { client, registry, ctx: &ctx, max_turns: cfg.agent.max_turns, context_budget: budget, sink: sink.as_ref(), stream: true, policy: &policy, approver: &approver };
     let mut msgs = Vec::new();
     let out = a.run_turn(&mut msgs, &system, task).await?;
     if let Some(m) = &store { agent::reflect_after_run(client, m, &msgs, &out.1, sink.as_ref()).await; }

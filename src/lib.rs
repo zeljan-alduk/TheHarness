@@ -8,6 +8,7 @@ pub mod events;
 pub mod llm;
 pub mod mcp;
 pub mod memory;
+pub mod permissions;
 pub mod plugins;
 pub mod sandbox;
 pub mod setup;

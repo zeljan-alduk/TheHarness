@@ -33,3 +33,11 @@ max_fetch_bytes = 2000000
 # download_file: parallel range segments and per-call wall-clock cap (auto-resumes on the next call)
 download_segments = 4
 download_timeout_secs = 3600
+
+[permissions]
+# bypass | auto | ask | plan.  auto: reads free, writes inside the workdir free, risky shell commands
+# and writes outside the workdir ask for approval. Rules: "<tool>" or "<tool>:<glob on primary arg>".
+mode = "auto"
+allow = ["bash:git status*", "bash:git diff*", "bash:git log*", "bash:cargo *", "bash:npm test*", "bash:pytest*"]
+deny = ["bash:rm -rf /*", "bash:rm -rf ~*", "bash:*mkfs*", "bash:*dd if=*"]
+ask = []

@@ -26,6 +26,8 @@ pub struct Agent<'a> {
     pub sink: &'a dyn Sink,
     /// Stream tokens (emits ReasoningDelta/AssistantDelta). Requires a server that supports SSE.
     pub stream: bool,
+    pub policy: &'a crate::permissions::Policy,
+    pub approver: &'a dyn crate::permissions::Approver,
 }
 
 /// Precise LLM compaction: summarize everything but the last `keep_last` messages into a dense,
@@ -281,16 +283,39 @@ impl<'a> Agent<'a> {
                 self.sink.emit(&Event::ToolCall { id: id.clone(), name: call.function.name.clone(), args: call.function.arguments.clone() });
                 prepared.push((id, call.function.name.clone(), call.function.arguments.clone()));
             }
+            // permissions
+            let mut blocked: Vec<Option<String>> = Vec::new();
+            for (_, name, args) in &prepared {
+                let av: serde_json::Value = serde_json::from_str(args).unwrap_or(serde_json::Value::Null);
+                let ro = self.registry.is_read_only(name);
+                let d = self.policy.check(name, &av, ro);
+                let msg = match d {
+                    crate::permissions::Decision::Allow => None,
+                    crate::permissions::Decision::Deny(r) => { self.sink.emit(&Event::Permission { tool: name.clone(), summary: crate::permissions::Policy::primary_arg(name, &av), decision: format!("denied: {r}") }); Some(format!("error: blocked by permission policy ({r}). Ask the user or choose another approach.")) }
+                    crate::permissions::Decision::Ask(r) => {
+                        let arg = crate::permissions::Policy::primary_arg(name, &av);
+                        let req = crate::permissions::ApprovalRequest { tool: name.clone(), summary: arg.clone(), suggested_rule: crate::permissions::Policy::suggested_rule(name, &arg), reason: r.clone() };
+                        self.sink.emit(&Event::Permission { tool: name.clone(), summary: arg.clone(), decision: format!("asking: {r}") });
+                        match self.approver.ask(req.clone()).await {
+                            crate::permissions::Approval::Once => { self.sink.emit(&Event::Permission { tool: name.clone(), summary: arg, decision: "allowed once".into() }); None }
+                            crate::permissions::Approval::Always => { self.policy.allow_always(&req.suggested_rule); self.sink.emit(&Event::Permission { tool: name.clone(), summary: arg, decision: format!("always allowed ({})", req.suggested_rule) }); None }
+                            crate::permissions::Approval::Deny => { self.sink.emit(&Event::Permission { tool: name.clone(), summary: arg, decision: "denied by user".into() }); Some("error: the user declined this action. Do not retry it; ask what to do instead or take a different approach.".to_string()) }
+                        }
+                    }
+                };
+                blocked.push(msg);
+            }
             let outputs: Vec<(crate::tools::ToolOutput, f64)> = if all_read_only && prepared.len() > 1 {
                 // independent reads: run concurrently
-                let futs = prepared.iter().map(|(_, name, args)| async move { let t0 = Instant::now(); let o = self.registry.call(name, args, self.ctx).await; (o, t0.elapsed().as_secs_f64()) });
+                let futs = prepared.iter().zip(blocked.iter()).map(|((_, name, args), b)| async move { if b.is_some() { return (crate::tools::ToolOutput::default(), 0.0); } let t0 = Instant::now(); let o = self.registry.call(name, args, self.ctx).await; (o, t0.elapsed().as_secs_f64()) });
                 futures_util::future::join_all(futs).await
             } else {
                 let mut v = Vec::new();
-                for (_, name, args) in &prepared { let t0 = Instant::now(); let o = self.registry.call(name, args, self.ctx).await; v.push((o, t0.elapsed().as_secs_f64())); }
+                for ((_, name, args), b) in prepared.iter().zip(blocked.iter()) { if b.is_some() { v.push((crate::tools::ToolOutput::default(), 0.0)); continue; } let t0 = Instant::now(); let o = self.registry.call(name, args, self.ctx).await; v.push((o, t0.elapsed().as_secs_f64())); }
                 v
             };
-            for ((id, name, _), (out, secs)) in prepared.into_iter().zip(outputs) {
+            for (((id, name, _), (out, secs)), block) in prepared.into_iter().zip(outputs).zip(blocked) {
+                let out = match block { Some(m) => crate::tools::ToolOutput { text: m, images: vec![] }, None => out };
                 self.sink.emit(&Event::ToolResult { id: id.clone(), name: name.clone(), result: out.text.clone(), secs,
                     images: out.images.iter().map(|(m, b)| format!("data:{m};base64,{b}")).collect() });
                 msgs.push(Message::tool(id, name.clone(), out.text));

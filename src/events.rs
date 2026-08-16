@@ -22,6 +22,8 @@ pub enum Event {
     ModelResponse { prompt_tokens: u64, completion_tokens: u64, ttft_secs: f64, secs: f64, tool_calls: usize },
     RunFinished { stop_reason: String, turns: usize, tool_calls: usize, prompt_tokens: u64, completion_tokens: u64, wall_secs: f64 },
     Error { message: String },
+    /// A tool call was blocked or is awaiting approval.
+    Permission { tool: String, summary: String, decision: String },
     /// Something was written to persistent memory (by the tool or by reflection).
     Memory { file: String, section: String, text: String },
 }
@@ -52,6 +54,7 @@ impl Sink for StderrSink {
                 eprintln!("— {turns} turns, {tool_calls} tool calls, {prompt_tokens}+{completion_tokens} tokens, {wall_secs:.0}s, stop={stop_reason}"),
             Event::Error { message } => eprintln!("✖ {message}"),
             Event::Memory { file, section, text } => eprintln!("🧠 {file} › {section}: {text}"),
+            Event::Permission { tool, summary, decision } => eprintln!("🔒 {tool}({}) → {decision}", crate::llm::truncate_for_log(summary, 100)),
         }
     }
 }

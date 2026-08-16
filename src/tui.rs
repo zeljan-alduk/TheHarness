@@ -31,7 +31,7 @@ const CYAN: Color = Color::Rgb(90, 205, 220);
 const SPINNER: [&str; 10] = ["✻", "✼", "✽", "✾", "✿", "❀", "✿", "✾", "✽", "✼"];
 const WORDS: [&str; 12] = ["Thinking", "Pondering", "Working", "Reasoning", "Cooking", "Tinkering", "Brewing", "Mulling", "Crunching", "Percolating", "Noodling", "Computing"];
 
-enum Msg { Ev(Event), Done(Result<(String, harness::agent::RunStats), String>), Sys(SysSample), CtxLen(u64), Pasted(Result<PathBuf, String>), Frames(Result<(PathBuf, f64, Vec<(f64, PathBuf)>), String>), Toolset(Arc<Toolset>), Catalog(Result<harness::plugins::Catalog, String>), Notice(String) }
+enum Msg { Ask(harness::permissions::ApprovalRequest, tokio::sync::oneshot::Sender<harness::permissions::Approval>), Ev(Event), Done(Result<(String, harness::agent::RunStats), String>), Sys(SysSample), CtxLen(u64), Pasted(Result<PathBuf, String>), Frames(Result<(PathBuf, f64, Vec<(f64, PathBuf)>), String>), Toolset(Arc<Toolset>), Catalog(Result<harness::plugins::Catalog, String>), Notice(String) }
 
 /// Video scrubber state (modal over the transcript).
 struct VideoPicker { path: PathBuf, duration: f64, frames: Vec<(f64, PathBuf, String)>, cur: usize, selected: std::collections::BTreeSet<usize>, loading: bool, error: Option<String> }
@@ -217,6 +217,17 @@ async fn fetch_ctx_len(base_url: String, model: String, tx: mpsc::UnboundedSende
 struct TuiSink(mpsc::UnboundedSender<Msg>);
 impl Sink for TuiSink { fn emit(&self, e: &Event) { let _ = self.0.send(Msg::Ev(e.clone())); } }
 
+/// Routes permission prompts to the UI and waits for the answer.
+struct TuiApprover(mpsc::UnboundedSender<Msg>);
+#[async_trait::async_trait]
+impl harness::permissions::Approver for TuiApprover {
+    async fn ask(&self, req: harness::permissions::ApprovalRequest) -> harness::permissions::Approval {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        if self.0.send(Msg::Ask(req, tx)).is_err() { return harness::permissions::Approval::Deny; }
+        rx.await.unwrap_or(harness::permissions::Approval::Deny)
+    }
+}
+
 enum Block {
     Banner(Vec<String>),
     User(String, Vec<String>),
@@ -267,6 +278,8 @@ struct App {
     img_seq: u64,
     think_scroll: usize,
     toolset: Option<Arc<Toolset>>,
+    perm_mode: harness::permissions::Mode,
+    pending_ask: Option<(harness::permissions::ApprovalRequest, tokio::sync::oneshot::Sender<harness::permissions::Approval>)>,
     video: Option<VideoPicker>,
     strip_rects: Vec<(Rect, usize)>,
     // geometry from the last draw, for mouse hit-testing
@@ -289,9 +302,10 @@ pub async fn run(cfg: Config) -> Result<()> {
         quit: false, tick: 0, word: 0, models: vec![],
         metrics: Metrics::new(0), panel: None, attachments: vec![], tool_previews: Default::default(),
         picker, images: Default::default(), img_seq: 0,
-        think_scroll: 0, toolset: None, video: None, strip_rects: vec![], tr_rect: Rect::default(), panel_rect: Rect::default(), tr_start: 0, line_map: vec![],
+        think_scroll: 0, toolset: None, perm_mode: harness::permissions::Mode::Auto, pending_ask: None, video: None, strip_rects: vec![], tr_rect: Rect::default(), panel_rect: Rect::default(), tr_start: 0, line_map: vec![],
     };
     app.metrics.ctx_len = app.cfg.llm.context_budget_tokens.unwrap_or(0);
+    app.perm_mode = app.cfg.permissions.mode;
     app.banner();
     app.reload_toolset();
     tokio::spawn(sampler(tx.clone()));
@@ -389,6 +403,16 @@ impl App {
                     _ => {}
                 }
             }
+            CEvent::Key(k) if k.kind == KeyEventKind::Press && self.pending_ask.is_some() => {
+                let ans = match k.code {
+                    KeyCode::Char('y') | KeyCode::Enter => Some(harness::permissions::Approval::Once),
+                    KeyCode::Char('a') => Some(harness::permissions::Approval::Always),
+                    KeyCode::Char('n') | KeyCode::Esc => Some(harness::permissions::Approval::Deny),
+                    KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => Some(harness::permissions::Approval::Deny),
+                    _ => None,
+                };
+                if let Some(a) = ans { if let Some((req, tx)) = self.pending_ask.take() { let label = match &a { harness::permissions::Approval::Once => "allowed once".to_string(), harness::permissions::Approval::Always => format!("always allow {}", req.suggested_rule), harness::permissions::Approval::Deny => "denied".into() }; self.blocks.push(Block::System(format!("🔒 {label}"))); let _ = tx.send(a); } }
+            }
             CEvent::Key(k) if k.kind == KeyEventKind::Press && self.video.is_some() => {
                 let n = self.video.as_ref().map(|v| v.frames.len()).unwrap_or(0);
                 match k.code {
@@ -435,6 +459,7 @@ impl App {
                     (KeyCode::Down, true, _) | (KeyCode::PageDown, _, _) => { self.scroll_up = self.scroll_up.saturating_sub(10); }
                     (KeyCode::Up, _, _) => { if !self.input.contains('\n') { self.history_prev(); } }
                     (KeyCode::Down, _, _) => { if !self.input.contains('\n') { self.history_next(); } }
+                    (KeyCode::BackTab, _, _) => { use harness::permissions::Mode::*; self.perm_mode = match self.perm_mode { Auto => Ask, Ask => Plan, Plan => Bypass, Bypass => Auto }; self.set_status(format!("permissions → {}", self.perm_mode.label())); }
                     (KeyCode::Tab, _, _) => { self.complete_slash(); }
                     (KeyCode::Char(c), false, false) => { self.insert_str(&c.to_string()); }
                     _ => {}
@@ -659,6 +684,16 @@ impl App {
                 }
             }
             "/video" => { if arg.is_empty() { self.blocks.push(Block::Error("usage: /video <path>".into())); } else { let p = if arg.starts_with('~') { PathBuf::from(arg.replacen('~', &std::env::var("HOME").unwrap_or_default(), 1)) } else { PathBuf::from(&arg) }; if p.is_file() { self.open_video(&p); } else { self.blocks.push(Block::Error(format!("no such file: {arg}"))); } } }
+            "/permissions" | "/perm" | "/mode" => {
+                if arg.is_empty() {
+                    let rules = harness::permissions::persisted_rules();
+                    let mut lines = vec![format!("permission mode: {} ({})", format!("{:?}", self.perm_mode).to_lowercase(), self.perm_mode.label()), "switch: /permissions bypass|auto|ask|plan   (shift+tab cycles)".into(), format!("config allow: {:?}", self.cfg.permissions.allow), format!("config deny:  {:?}", self.cfg.permissions.deny), format!("always-allowed (this machine): {:?}", rules)];
+                    lines.push("Rules are '<tool>' or '<tool>:<glob>' matched on the primary argument (bash cmd, file path, url).".into());
+                    self.blocks.push(Block::Banner(lines));
+                } else if let Some(m) = harness::permissions::Mode::parse(&arg) { self.perm_mode = m; self.blocks.push(Block::System(format!("permissions → {}", m.label()))); }
+                else { self.blocks.push(Block::Error("usage: /permissions [bypass|auto|ask|plan]".into())); }
+            }
+            "/plan" => { self.perm_mode = if self.perm_mode == harness::permissions::Mode::Plan { harness::permissions::Mode::Auto } else { harness::permissions::Mode::Plan }; self.blocks.push(Block::System(format!("permissions → {}", self.perm_mode.label()))); }
             "/queue" => {
                 if self.queued.is_empty() { self.blocks.push(Block::System("queue is empty".into())); }
                 else { let mut lines = vec![format!("Queued tasks ({}) — /next skips the current one, /queue clear empties the queue", self.queued.len())]; for (i, q) in self.queued.iter().enumerate() { lines.push(format!("  {}. {}", i + 1, truncate(q, 120))); } self.blocks.push(Block::Banner(lines)); }
@@ -788,6 +823,7 @@ impl App {
         let mut cfg = self.cfg.clone(); cfg.llm.model = self.model.clone(); cfg.net.enabled = self.net;
         let workdir = self.workdir.clone();
         let toolset = self.toolset.clone();
+        let perm_mode = self.perm_mode;
         let budget = self.cfg.llm.effective_budget(if self.metrics.ctx_len > 0 { Some(self.metrics.ctx_len) } else { None });
         self.run_started = Instant::now();
         self.metrics.turn_start = Some(Instant::now()); self.metrics.live_peak = 0.0; self.metrics.live_chars.clear();
@@ -799,7 +835,10 @@ impl App {
                 let fallback = Registry::defaults(cfg.net.enabled);
                 let (registry, extra_prompt): (&Registry, String) = match &toolset { Some(ts) => (&ts.registry, ts.prompt_extra.clone()), None => (&fallback, String::new()) };
                 let sink = TuiSink(tx.clone());
-                let agent = Agent { client: &client, registry, ctx: &ctx, max_turns: cfg.agent.max_turns, context_budget: budget, sink: &sink, stream: true };
+                let mut pcfg = cfg.permissions.clone(); pcfg.mode = perm_mode; pcfg.allow.extend(harness::permissions::persisted_rules());
+                let policy = harness::permissions::Policy::new(pcfg, &workdir);
+                let approver = TuiApprover(tx.clone());
+                let agent = Agent { client: &client, registry, ctx: &ctx, max_turns: cfg.agent.max_turns, context_budget: budget, sink: &sink, stream: true, policy: &policy, approver: &approver };
                 let extra = format!("You are in an interactive session: the user can see everything and will reply; keep final answers concise.{extra_prompt}");
                 let system = harness::agent::system_prompt_with_memory(&workdir.display().to_string(), &registry.names(), Some(&extra), store.as_ref());
                 let mut msgs = session.lock().await;
@@ -856,6 +895,7 @@ impl App {
 
     fn on_msg(&mut self, m: Msg) {
         match m {
+            Msg::Ask(req, tx) => { self.blocks.push(Block::System(format!("🔒 approval needed — {}({}) · {}", req.tool, truncate(&req.summary, 100), req.reason))); self.pending_ask = Some((req, tx)); }
             Msg::Ev(e) => self.on_event(e),
             Msg::Sys(s) => self.metrics.on_sys(s),
             Msg::CtxLen(n) => { self.metrics.ctx_len = n; self.blocks.push(Block::System(format!("auto-compaction at {} tokens ({}% of context); /compact to force", fmt_k(self.cfg.llm.effective_budget(Some(n))), (self.cfg.llm.compact_at_fraction * 100.0) as u64))); }
@@ -931,6 +971,7 @@ impl App {
             }
             Event::Error { message } => { self.finish_streaming(); self.blocks.push(Block::Error(message)); }
             Event::Memory { file, section, text } => { self.blocks.push(Block::Memory(format!("{} › {section}: {text}", file.trim_end_matches(".md")))); }
+            Event::Permission { tool, summary, decision } => { if decision.starts_with("denied") { self.blocks.push(Block::Error(format!("🔒 {tool}({}) {decision}", truncate(&summary, 80)))); } }
         }
     }
     /// Click on a block: fold/unfold it.
@@ -987,6 +1028,8 @@ const COMMANDS: &[(&str, &str)] = &[
     ("/plugin", "plugins: list · install <owner/repo> · enable|disable|remove|update|info <name>"),
     ("/mcp", "show configured MCP servers and live MCP tools"),
     ("/reload", "restart tools, MCP servers and plugins"),
+    ("/permissions", "show or set permission mode: bypass|auto|ask|plan"),
+    ("/plan", "toggle plan mode (read-only)"),
     ("/queue", "show queued tasks (/queue clear)"),
     ("/next", "stop the current task and start the next queued one (ctrl+n)"),
     ("/exit", "quit"),
@@ -1012,7 +1055,11 @@ fn draw(f: &mut Frame, app: &mut App) {
     let sugg = suggestions(&app.input);
     let input_h = (input_lines.len().clamp(1, 8) + sugg.len() + if app.attachments.is_empty() { 0 } else { 1 }) as u16;
     // notice line above the box: spinner while running, or a transient status message
-    let notice: Option<Vec<Span>> = if app.running.is_some() {
+    let notice: Option<Vec<Span>> = if let Some((req, _)) = &app.pending_ask {
+        Some(vec![Span::styled(" 🔒 ", Style::default().fg(Color::Black).bg(ORANGE)), Span::styled(format!(" {}({}) ", req.tool, truncate(&req.summary, width.saturating_sub(70))), Style::default().fg(Color::Black).bg(ORANGE).bold()),
+                  Span::styled(format!("  {} · ", req.reason), Style::default().fg(ORANGE)),
+                  Span::styled("[y] allow once  ", Style::default().fg(OK).bold()), Span::styled(format!("[a] always ({})  ", req.suggested_rule), Style::default().fg(CYAN)), Span::styled("[n] deny", Style::default().fg(ERR).bold())])
+    } else if app.running.is_some() {
         let sp = SPINNER[(app.tick as usize / 2) % SPINNER.len()];
         let el = app.run_started.elapsed().as_secs();
         let live = app.metrics.live_tps();
@@ -1080,7 +1127,8 @@ fn draw(f: &mut Frame, app: &mut App) {
 
     // mode line: ▶▶ bypass permissions on · model · cwd · ctx
     let dot = || Span::styled(" · ", Style::default().fg(DIM));
-    let mut st = vec![Span::styled("  ▶▶ bypass permissions on", Style::default().fg(PINK)), dot(),
+    let (mode_txt, mode_col) = match app.perm_mode { harness::permissions::Mode::Bypass => ("▶▶ bypass permissions on", PINK), harness::permissions::Mode::Auto => ("▶▶ auto permissions", CYAN), harness::permissions::Mode::Ask => ("▶▶ ask before changes", ORANGE), harness::permissions::Mode::Plan => ("▶▶ plan mode · read-only", THINK) };
+    let mut st = vec![Span::styled(format!("  {mode_txt}"), Style::default().fg(mode_col)), dot(),
         Span::styled(app.model.clone(), Style::default().fg(CYAN)), dot(),
         Span::styled(short_path(&app.workdir), Style::default().fg(CYAN)), dot(),
         Span::styled(format!("ctx {}", fmt_k(app.last_prompt_tokens)), Style::default().fg(CYAN))];

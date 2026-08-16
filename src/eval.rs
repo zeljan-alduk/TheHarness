@@ -97,7 +97,9 @@ pub async fn run_task(cfg: &Config, client: &Client, task_dir: &Path, spec: &Tas
     let registry = Registry::defaults(cfg.net.enabled);
     let sink = crate::events::StderrSink { verbose };
     let budget = cfg.llm.effective_budget(crate::llm::detect_context_length(&cfg.llm.base_url, &cfg.llm.model).await.map(|d| d.0));
-    let agent = Agent { client, registry: &registry, ctx: &ctx, max_turns: spec.max_turns.unwrap_or(cfg.agent.max_turns), context_budget: budget, sink: &sink, stream: true };
+    let policy = crate::permissions::Policy::new(crate::permissions::PermissionsConfig { mode: crate::permissions::Mode::Bypass, ..Default::default() }, &ctx.workdir);
+    let approver = crate::permissions::AutoApprover { yes: true };
+    let agent = Agent { client, registry: &registry, ctx: &ctx, max_turns: spec.max_turns.unwrap_or(cfg.agent.max_turns), context_budget: budget, sink: &sink, stream: true, policy: &policy, approver: &approver };
     let system = crate::agent::system_prompt(&ctx.workdir.display().to_string(), &registry.names(), None);
     let timeout = Duration::from_secs(spec.timeout_secs.unwrap_or(cfg.eval.task_timeout_secs));
 

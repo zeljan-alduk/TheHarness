@@ -68,7 +68,10 @@ async fn start_run(app: AppHandle, state: State<'_, RunState>, task: String, wor
             let system = harness::agent::system_prompt_with_memory(&workdir.display().to_string(), &registry.names(), None, store.as_ref());
             let sink = TauriSink { app: app2.clone() };
             let budget = cfg.llm.effective_budget(harness::llm::detect_context_length(&cfg.llm.base_url, &cfg.llm.model).await.map(|d| d.0));
-            let agent = Agent { client: &client, registry: &registry, ctx: &ctx, max_turns: cfg.agent.max_turns, context_budget: budget, sink: &sink, stream: true };
+            let mut pcfg = cfg.permissions.clone(); pcfg.allow.extend(harness::permissions::persisted_rules());
+            let policy = harness::permissions::Policy::new(pcfg, &workdir);
+            let approver = harness::permissions::AutoApprover { yes: true }; // desktop UI: approvals coming in a later iteration; auto-approve
+            let agent = Agent { client: &client, registry: &registry, ctx: &ctx, max_turns: cfg.agent.max_turns, context_budget: budget, sink: &sink, stream: true, policy: &policy, approver: &approver };
             agent.run(&system, &task).await.map(|(t, _)| t).map_err(|e| format!("{e:#}"))
         }.await;
         let payload = match result {

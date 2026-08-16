@@ -12,6 +12,8 @@ pub struct Config {
     pub net: NetConfig,
     #[serde(default)]
     pub memory: crate::memory::MemoryConfig,
+    #[serde(default)]
+    pub permissions: crate::permissions::PermissionsConfig,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
