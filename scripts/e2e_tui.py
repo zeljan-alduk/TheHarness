@@ -22,7 +22,7 @@ def png(path, w=160, h=100):
 IMG = os.path.join(WORK, "gradient.png"); png(IMG)
 
 # isolate: memory, sessions, plugins go to a scratch config dir so the test never touches the user's data
-ISO = os.path.join(WORK, "config"); os.makedirs(ISO, exist_ok=True)
+ISO = os.path.join(WORK, "config"); import shutil; shutil.rmtree(ISO, ignore_errors=True); os.makedirs(ISO, exist_ok=True)
 pid, fd = pty.fork()
 if pid == 0:
     os.environ.update(TERM="xterm-256color", COLUMNS=str(COLS), LINES=str(ROWS), HARNESS_SESSIONS_DIR=os.path.join(ISO, "sessions"), HARNESS_PLUGINS_DIR=os.path.join(ISO, "plugins"), HARNESS_MEMORY_DIR=os.path.join(ISO, "memory"))
