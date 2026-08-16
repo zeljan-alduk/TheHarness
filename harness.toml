@@ -1,0 +1,22 @@
+# Harness configuration. Every key can be overridden with HARNESS_<UPPER_KEY> env vars.
+
+[llm]
+# Any OpenAI-compatible server: LM Studio (:1234), llama-server (:8080), Ollama (:11434/v1)
+base_url = "http://localhost:1234/v1"
+model = "qwen3.8-27b-mlx"
+temperature = 0.2
+max_tokens = 4096
+# Rough prompt-token budget; when exceeded, old tool outputs are compacted.
+context_budget_tokens = 24000
+
+[agent]
+max_turns = 40
+# Per tool call
+tool_timeout_secs = 120
+# Max characters of a tool result fed back to the model (head+tail kept)
+max_tool_output_chars = 16000
+
+[eval]
+tasks_dir = "evals/tasks"
+runs_dir = "target/eval-runs"
+task_timeout_secs = 900

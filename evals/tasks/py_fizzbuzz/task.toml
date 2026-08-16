@@ -1,0 +1,5 @@
+name = "py_fizzbuzz"
+tags = ["python", "greenfield", "easy"]
+prompt = "Create fizzbuzz.py that prints FizzBuzz for 1..=100, one per line (Fizz for multiples of 3, Buzz for 5, FizzBuzz for both). Run it to verify."
+check = "python3 fizzbuzz.py | sed -n '1p;3p;5p;15p;100p' | tr '\\n' ' ' | grep -qx '1 Fizz Buzz FizzBuzz Buzz '"
+max_turns = 15

@@ -1,0 +1,24 @@
+[package]
+name = "harness"
+version = "0.1.0"
+edition = "2021"
+description = "Local-first agentic coding harness with an eval-gated self-improvement loop"
+
+[[bin]]
+name = "harness"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+toml = "0.8"
+async-trait = "0.1"
+libc = "0.2"
+
+[profile.release]
+lto = true
+codegen-units = 1

@@ -1,0 +1,5 @@
+name = "py_edit_existing"
+tags = ["python", "edit", "easy"]
+prompt = "The function `slugify` in text_utils.py has bugs: it does not lowercase, and it leaves leading/trailing dashes. Fix it so `slugify('  Hello, World!  ')` returns 'hello-world' and `slugify('A--B')` returns 'a-b'. Add tests in test_text_utils.py using only the standard library (unittest) and run them."
+check = "python3 -c \"from text_utils import slugify as s; assert s('  Hello, World!  ')=='hello-world', s('  Hello, World!  '); assert s('A--B')=='a-b'; assert s('Rust & C++')=='rust-c'\" && python3 -m unittest -q test_text_utils"
+max_turns = 20
