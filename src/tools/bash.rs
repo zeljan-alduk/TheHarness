@@ -17,13 +17,20 @@ impl Tool for Bash {
             "type": "object",
             "properties": {
                 "cmd": {"type": "string", "description": "The command line to run"},
-                "timeout_secs": {"type": "integer", "description": "Optional override of the default timeout"}
+                "timeout_secs": {"type": "integer", "description": "Optional override of the default timeout"},
+                "background": {"type": "boolean", "description": "Run detached (servers, watchers, long jobs); returns a process id. Manage with the `process` tool (list/tail/kill)."}
             },
             "required": ["cmd"]
         })
     }
     async fn call(&self, args: Value, ctx: &ToolCtx) -> Result<ToolOutput> {
         let cmd = arg_str(&args, "cmd")?;
+        if args.get("background").and_then(|v| v.as_bool()).unwrap_or(false) {
+            let (id, log) = crate::procs::start(cmd, &ctx.workdir).await?;
+            tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+            let head = crate::procs::tail(id, 15).unwrap_or_default();
+            return Ok(format!("started background process #{id} (log: {})\n{}\nUse process {{action:\"tail\", id:{id}}} to read more, {{action:\"kill\", id:{id}}} to stop.", log.display(), head).into());
+        }
         let timeout = args.get("timeout_secs").and_then(|v| v.as_u64())
             .map(std::time::Duration::from_secs)
             .map(|t| t.min(ctx.timeout * 5))

@@ -101,11 +101,12 @@ fn render_for_summary(msgs: &[Message], max_chars: usize) -> String {
 /// After a finished turn: reflect into BRAIN/MEMORY/WORKFLOWS and consolidate if files got long.
 pub async fn reflect_after_run(client: &Client, store: &crate::memory::MemoryStore, msgs: &[Message], stats: &RunStats, sink: &dyn Sink) {
     if !store.cfg.auto_reflect || stats.tool_calls < store.cfg.reflect_min_tool_calls || stats.stop_reason != "done" { return; }
-    match store.reflect(client, msgs).await {
+    let aux = client.aux();
+    match store.reflect(&aux, msgs).await {
         Ok(items) => for (file, section, text) in items { sink.emit(&Event::Memory { file, section, text }); },
         Err(e) => sink.emit(&Event::Error { message: format!("memory reflection skipped: {e:#}") }),
     }
-    if let Ok(done) = store.maybe_consolidate(client).await { for f in done { sink.emit(&Event::Memory { file: f, section: "consolidated".into(), text: "file was long; merged and de-duplicated".into() }); } }
+    if let Ok(done) = store.maybe_consolidate(&aux).await { for f in done { sink.emit(&Event::Memory { file: f, section: "consolidated".into(), text: "file was long; merged and de-duplicated".into() }); } }
 }
 
 pub fn system_prompt(workdir: &str, tools: &[&str], extra: Option<&str>) -> String {
@@ -229,7 +230,7 @@ impl<'a> Agent<'a> {
             }
             if last_usage.prompt_tokens > self.context_budget {
                 let before = last_usage.prompt_tokens;
-                match compact_llm(self.client, msgs, 8, None).await {
+                match compact_llm(&self.client.aux(), msgs, 8, None).await {
                     Ok((n, summary)) => { stats.compactions += 1; self.sink.emit(&Event::Compacted { count: n, prompt_tokens: before, summary }); }
                     Err(_) => { let n = compact(msgs, 6); if n > 0 { stats.compactions += 1; self.sink.emit(&Event::Compacted { count: n, prompt_tokens: before, summary: String::new() }); } }
                 }
@@ -300,6 +301,7 @@ impl<'a> Agent<'a> {
                 stats.wall_secs = start.elapsed().as_secs_f64();
                 if text.trim().is_empty() { self.sink.emit(&Event::Error { message: "model returned empty message with no tool calls".into() }); bail!("model returned empty message with no tool calls"); }
                 self.finish(&stats);
+                if !self.ctx.hooks.on_stop.is_empty() { crate::hooks::run_on_stop(&self.ctx.hooks, &text, &self.ctx.workdir).await; }
                 return Ok((text, stats));
             }
             msgs.push(assistant);
@@ -316,9 +318,12 @@ impl<'a> Agent<'a> {
                 self.sink.emit(&Event::ToolCall { id: id.clone(), name: call.function.name.clone(), args: call.function.arguments.clone() });
                 prepared.push((id, call.function.name.clone(), call.function.arguments.clone()));
             }
-            // permissions
+            // permissions + pre-tool hooks
             let mut blocked: Vec<Option<String>> = Vec::new();
             for (_, name, args) in &prepared {
+                if !self.ctx.hooks.pre_tool.is_empty() {
+                    if let Some(reason) = crate::hooks::run_pre_tool(&self.ctx.hooks, name, args, &self.ctx.workdir).await { self.sink.emit(&Event::Permission { tool: name.clone(), summary: crate::llm::truncate_for_log(args, 80), decision: format!("blocked by hook: {reason}") }); blocked.push(Some(format!("error: blocked by a pre-tool hook: {reason}"))); continue; }
+                }
                 let av: serde_json::Value = serde_json::from_str(args).unwrap_or(serde_json::Value::Null);
                 let ro = self.registry.is_read_only(name);
                 let d = self.policy.check(name, &av, ro);

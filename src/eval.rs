@@ -94,6 +94,7 @@ pub async fn run_task(cfg: &Config, client: &Client, task_dir: &Path, spec: &Tas
         // evals get a throwaway memory store so the fitness function never depends on (or pollutes) the user's memory
         memory: crate::memory::MemoryStore::scratch(&workdir.join(".harness-memory"), &cfg.memory).ok(),
         subagent: None,
+        redact_secrets: cfg.security.redact_secrets, hooks: cfg.hooks.clone(),
     };
     let registry = Registry::defaults(cfg.net.enabled);
     let sink: std::sync::Arc<dyn crate::events::Sink> = std::sync::Arc::new(crate::events::StderrSink { verbose });

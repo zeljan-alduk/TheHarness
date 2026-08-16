@@ -118,6 +118,7 @@ pub struct Client {
     api_key: Option<String>,
     temperature: f32,
     max_tokens: u32,
+    aux_model: Option<String>,
 }
 
 impl Client {
@@ -135,10 +136,15 @@ impl Client {
             api_key: cfg.api_key.clone(),
             temperature: cfg.temperature,
             max_tokens: cfg.max_tokens,
+            aux_model: cfg.aux_model.clone().filter(|m| !m.trim().is_empty()),
         })
     }
+    /// Client for auxiliary calls (reflection, compaction): the configured aux model, or this one.
+    pub fn aux(&self) -> Client { match &self.aux_model { Some(m) => self.with_model(m), None => self.clone() } }
 
     pub fn model(&self) -> &str { &self.model }
+    /// Same server/settings, different model (auxiliary calls).
+    pub fn with_model(&self, model: &str) -> Client { let mut c = self.clone(); c.model = model.to_string(); c }
 
     pub async fn list_models(&self) -> Result<Vec<String>> {
         let mut req = self.http.get(format!("{}/models", self.base_url));

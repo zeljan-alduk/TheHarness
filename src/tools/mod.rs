@@ -5,6 +5,7 @@ pub mod fs;
 pub mod image;
 pub mod memory;
 pub mod patch;
+pub mod process;
 pub mod search;
 pub mod skill;
 pub mod subagent;
@@ -26,6 +27,8 @@ pub struct ToolCtx {
     pub memory: Option<crate::memory::MemoryStore>,
     /// Environment for spawning sub-agents (None = spawn_agent unavailable / nested).
     pub subagent: Option<std::sync::Arc<crate::agent::SubAgentEnv>>,
+    pub redact_secrets: bool,
+    pub hooks: crate::hooks::HooksConfig,
 }
 
 impl ToolCtx {
@@ -101,6 +104,7 @@ impl Registry {
             Arc::new(archive::ReadPdf),
             Arc::new(archive::ExtractArchive),
             Arc::new(subagent::SpawnAgent),
+            Arc::new(process::Process),
         ];
         if net_enabled {
             tools.push(Arc::new(web::WebFetch));
@@ -139,10 +143,14 @@ impl Registry {
                 Err(e) => return format!("error: tool arguments are not valid JSON ({e}): {args_json}").into(),
             }
         };
-        match tool.call(args, ctx).await {
+        let mut out = match tool.call(args, ctx).await {
             Ok(s) => s,
             Err(e) => format!("error: {e:#}").into(),
-        }
+        };
+        if ctx.redact_secrets { out.text = crate::security::redact(&out.text); }
+        // hooks: post_tool (fire and forget)
+        if !ctx.hooks.post_tool.is_empty() { crate::hooks::run_post_tool(&ctx.hooks, name, &out.text, &ctx.workdir).await; }
+        out
     }
 }
 
@@ -178,7 +186,7 @@ mod tests {
     fn ctx() -> ToolCtx {
         let d = std::env::temp_dir().join(format!("harness-test-{}", std::process::id()));
         std::fs::create_dir_all(&d).unwrap();
-        ToolCtx { workdir: d, timeout: Duration::from_secs(5), max_output: 1000, net: crate::config::NetConfig::default(), memory: None, subagent: None }
+        ToolCtx { workdir: d, timeout: Duration::from_secs(5), max_output: 1000, net: crate::config::NetConfig::default(), memory: None, subagent: None, redact_secrets: true, hooks: Default::default() }
     }
     #[test]
     fn resolve_rejects_escape() {

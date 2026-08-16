@@ -14,7 +14,19 @@ pub struct Config {
     pub memory: crate::memory::MemoryConfig,
     #[serde(default)]
     pub permissions: crate::permissions::PermissionsConfig,
+    #[serde(default)]
+    pub hooks: crate::hooks::HooksConfig,
+    #[serde(default)]
+    pub security: SecurityConfig,
 }
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct SecurityConfig {
+    /// Redact well-known secret formats (API keys, tokens, private keys) in tool outputs.
+    #[serde(default = "d_true")]
+    pub redact_secrets: bool,
+}
+impl Default for SecurityConfig { fn default() -> Self { Self { redact_secrets: true } } }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct LlmConfig {
@@ -31,6 +43,9 @@ pub struct LlmConfig {
     pub context_budget_tokens: Option<u64>,
     #[serde(default = "d_compact_frac")]
     pub compact_at_fraction: f64,
+    /// Optional smaller/faster model for auxiliary calls (memory reflection, compaction, consolidation).
+    #[serde(default)]
+    pub aux_model: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

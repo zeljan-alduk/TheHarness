@@ -641,7 +641,7 @@ impl App {
                         let res: Result<(), String> = async {
                             let client = Client::new(&cfg.llm).map_err(|e| e.to_string())?;
                             let mut msgs = session.lock().await;
-                            let (n, summary) = harness::agent::compact_llm(&client, &mut msgs, 4, focus.as_deref()).await.map_err(|e| format!("{e:#}"))?;
+                            let (n, summary) = harness::agent::compact_llm(&client.aux(), &mut msgs, 4, focus.as_deref()).await.map_err(|e| format!("{e:#}"))?;
                             sink.emit(&Event::Compacted { count: n, prompt_tokens: 0, summary });
                             Ok(())
                         }.await;
@@ -848,7 +848,7 @@ impl App {
                 let policy = Arc::new(harness::permissions::Policy::new(pcfg, &workdir));
                 let approver: Arc<dyn harness::permissions::Approver> = Arc::new(TuiApprover(tx.clone()));
                 let env = Arc::new(harness::agent::SubAgentEnv::new(client.clone(), registry.clone(), policy.clone(), approver.clone(), sink.clone(), budget, true));
-                let ctx = ToolCtx { workdir: workdir.clone(), timeout: Duration::from_secs(cfg.agent.tool_timeout_secs), max_output: cfg.agent.max_tool_output_chars, net: cfg.net.clone(), memory: store.clone(), subagent: Some(env) };
+                let ctx = ToolCtx { workdir: workdir.clone(), timeout: Duration::from_secs(cfg.agent.tool_timeout_secs), max_output: cfg.agent.max_tool_output_chars, net: cfg.net.clone(), memory: store.clone(), subagent: Some(env), redact_secrets: cfg.security.redact_secrets, hooks: cfg.hooks.clone() };
                 let agent = Agent { client: &client, registry, ctx: &ctx, max_turns: cfg.agent.max_turns, context_budget: budget, sink: sink.as_ref(), stream: true, policy: &policy, approver: approver.as_ref() };
                 let extra = format!("You are in an interactive session: the user can see everything and will reply; keep final answers concise.{extra_prompt}");
                 let system = harness::agent::system_prompt_with_memory(&workdir.display().to_string(), &registry.names(), Some(&extra), store.as_ref());
@@ -870,6 +870,7 @@ impl App {
             let sink = TuiSink(tx.clone());
             let Ok(store) = harness::memory::MemoryStore::open(&cfg.memory) else { return };
             let Ok(client) = Client::new(&cfg.llm) else { return };
+            let client = client.aux();
             let msgs = session.lock().await.clone();
             match store.reflect(&client, &msgs).await {
                 Ok(items) => for (f, s, t) in items { sink.emit(&Event::Memory { file: f, section: s, text: t }); },

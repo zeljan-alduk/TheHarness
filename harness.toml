@@ -12,6 +12,8 @@ max_tokens = 16384
 # context_budget_tokens to pin an explicit value instead.
 compact_at_fraction = 0.75
 # context_budget_tokens = 60000
+# Optional smaller model for reflection/compaction (must be loaded on the same server):
+# aux_model = "qwen/qwen3.6-35b-a3b"
 
 [agent]
 max_turns = 40
@@ -41,3 +43,13 @@ mode = "auto"
 allow = ["bash:git status*", "bash:git diff*", "bash:git log*", "bash:cargo *", "bash:npm test*", "bash:pytest*"]
 deny = ["bash:rm -rf /*", "bash:rm -rf ~*", "bash:*mkfs*", "bash:*dd if=*"]
 ask = []
+
+[hooks]
+# Shell hooks (JSON on stdin). pre_tool exit code 2 blocks the call. See src/hooks.rs.
+pre_tool = []
+post_tool = []
+on_stop = []
+on_prompt = []
+
+[security]
+redact_secrets = true
