@@ -180,6 +180,14 @@ enum Cmd {
         #[arg(long)]
         allow_remote: bool,
     },
+    /// Run the network allow-list proxy on its own (point other tools at it with HTTPS_PROXY)
+    Proxy {
+        #[arg(long, default_value = "127.0.0.1:8899")]
+        bind: String,
+        /// Extra host globs to allow, on top of [net.proxy] allow
+        #[arg(long)]
+        allow: Vec<String>,
+    },
     /// Attach this terminal to a running `harness serve` (local or remote); the session outlives the client
     Attach {
         /// The URL `harness serve` printed (it carries ?token=…), or host:port with --token
@@ -332,6 +340,7 @@ async fn main() -> Result<()> {
     let mut cfg = config::Config::load_layered(cli.config.as_deref(), cli.setting_sources.as_deref(), &cli.sets)?;
     if let Some(m) = &cli.permissions { cfg.permissions.mode = harness::permissions::Mode::parse(m).context("--permissions must be bypass|auto|ask|plan")?; }
     harness::checkpoints::configure(&cfg.checkpoints);
+    if cfg.net.proxy.enabled { harness::proxy::configure(cfg.net.proxy.clone()).await.context("starting the network allow-list proxy")?; }
     sandbox::configure_seatbelt(cfg.sandbox.mode == "seatbelt" || cfg.sandbox.mode == "bwrap", cfg.sandbox.deny_network, cfg.sandbox.allow_write.clone());
     let client = llm::Client::new(&cfg.llm)?;
 
@@ -395,6 +404,16 @@ async fn main() -> Result<()> {
         }
         Cmd::Acp => { harness::acp::serve(cfg).await?; }
         Cmd::Serve { bind, allow_remote } => { harness::serve::serve_with(cfg, &bind, allow_remote).await?; }
+        Cmd::Proxy { bind, allow } => {
+            let mut pcfg = cfg.net.proxy.clone();
+            pcfg.enabled = true; pcfg.bind = Some(bind.clone()); pcfg.verbose = true;
+            pcfg.allow.extend(allow);
+            let p = harness::proxy::start(pcfg).await?;
+            eprintln!("network allow-list proxy on http://{} — export HTTPS_PROXY=http://{} (ctrl+c to stop)\nallowing: {}", p.addr, p.addr, p.cfg.allow.join(", "));
+            tokio::signal::ctrl_c().await?;
+            let (ok, blocked) = p.stats();
+            eprintln!("\n{ok} connection(s) allowed, {blocked} blocked");
+        }
         Cmd::Attach { url, token, dir, task } => { harness::attach::attach(&url, token.as_deref(), dir, task).await?; }
         Cmd::Improve { hint, no_install, skip_arbiter } => {
             // the loop rebuilds/installs the harness: never run it from the binary being replaced

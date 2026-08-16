@@ -66,6 +66,15 @@ download_timeout_secs = 3600
 # hook = "qwen3.6-8b"             # { prompt = … } hooks
 # vision = { model = "qwen2.5-vl-7b", base_url = "http://localhost:1234/v1" }
 
+[net.proxy]
+# Route tool and shell traffic through an allow-list proxy: hosts that do not match get a 403 the agent
+# can read, and Authorization/Cookie headers (and bodies that look like credentials) never reach a host
+# outside `credentials_to`. Loopback bypasses the proxy, so a local model server is unaffected.
+enabled = false
+# allow = ["github.com", "*.githubusercontent.com", "crates.io", "registry.npmjs.org", "pypi.org"]
+# credentials_to = ["api.github.com"]
+# verbose = true
+
 [permissions]
 # bypass | auto | ask | plan.  auto: reads free, writes inside the workdir free, risky shell commands
 # and writes outside the workdir ask for approval. Regardless of mode (except bypass) the harness

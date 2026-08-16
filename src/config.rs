@@ -199,6 +199,9 @@ pub struct NetConfig {
     pub max_fetch_bytes: usize,
     #[serde(default = "d_ua")]
     pub user_agent: String,
+    /// Network allow-list proxy for tools and shell commands ([net.proxy]).
+    #[serde(default)]
+    pub proxy: crate::proxy::ProxyConfig,
     /// Parallel segments for download_file on servers that support HTTP ranges.
     #[serde(default = "d_dl_segments")]
     pub download_segments: usize,
@@ -231,7 +234,7 @@ impl Default for EvalConfig {
 }
 impl Default for NetConfig {
     fn default() -> Self {
-        Self { enabled: true, timeout_secs: d_fetch_timeout(), max_fetch_bytes: d_fetch_bytes(), user_agent: d_ua(), download_segments: d_dl_segments(), download_timeout_secs: d_dl_timeout() }
+        Self { enabled: true, timeout_secs: d_fetch_timeout(), max_fetch_bytes: d_fetch_bytes(), user_agent: d_ua(), proxy: Default::default(), download_segments: d_dl_segments(), download_timeout_secs: d_dl_timeout() }
     }
 }
 
@@ -377,6 +380,8 @@ impl Config {
             "agent.max_task_secs" => self.agent.max_task_secs = val.parse().context("bad number")?,
             "agent.max_turns" => self.agent.max_turns = val.parse().context("bad number")?,
             "net.enabled" => self.net.enabled = b(val),
+            "net.proxy.enabled" => self.net.proxy.enabled = b(val),
+            "net.proxy.verbose" => self.net.proxy.verbose = b(val),
             "llm.base_url" => self.llm.base_url = val.into(),
             "llm.api_key" => self.llm.api_key = (!val.is_empty()).then(|| val.to_string()),
             "llm.aux_model" => self.llm.aux_model = (!val.is_empty()).then(|| val.to_string()),
