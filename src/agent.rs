@@ -1,7 +1,7 @@
 //! The core loop: model -> tool calls -> results -> model, with budgets and context compaction.
 
 use crate::events::{Event, Sink};
-use crate::llm::{Client, Message, Usage};
+use crate::llm::{Client, Content, Message, Usage};
 use crate::tools::{Registry, ToolCtx};
 use anyhow::{bail, Result};
 use std::time::Instant;
@@ -76,13 +76,13 @@ impl<'a> Agent<'a> {
             last_usage = usage;
 
             if let Some(r) = &msg.reasoning_content { if !r.trim().is_empty() { self.sink.emit(&Event::Reasoning { text: r.clone() }); } }
-            if let Some(c) = &msg.content { if !c.trim().is_empty() { self.sink.emit(&Event::Assistant { text: c.clone() }); } }
+            { let c = msg.text(); if !c.trim().is_empty() { self.sink.emit(&Event::Assistant { text: c }); } }
 
             let calls = msg.tool_calls.clone().unwrap_or_default();
             let mut assistant = msg.clone();
             assistant.reasoning_content = None;
             if calls.is_empty() {
-                let text = assistant.content.clone().unwrap_or_default();
+                let text = assistant.text();
                 msgs.push(assistant);
                 stats.stop_reason = "done".into();
                 stats.wall_secs = start.elapsed().as_secs_f64();
@@ -92,6 +92,7 @@ impl<'a> Agent<'a> {
             }
             msgs.push(assistant);
 
+            let mut pending_images: Vec<(String, Vec<(String, String)>)> = Vec::new();
             for call in calls {
                 stats.tool_calls += 1;
                 let name = call.function.name.clone();
@@ -99,9 +100,21 @@ impl<'a> Agent<'a> {
                 let id = if call.id.is_empty() { format!("call_{}", stats.tool_calls) } else { call.id.clone() };
                 self.sink.emit(&Event::ToolCall { id: id.clone(), name: name.clone(), args: args.clone() });
                 let t0 = Instant::now();
-                let result = self.registry.call(&name, &args, self.ctx).await;
-                self.sink.emit(&Event::ToolResult { id: id.clone(), name: name.clone(), result: result.clone(), secs: t0.elapsed().as_secs_f64() });
-                msgs.push(Message::tool(id, name, result));
+                let out = self.registry.call(&name, &args, self.ctx).await;
+                self.sink.emit(&Event::ToolResult { id: id.clone(), name: name.clone(), result: out.text.clone(), secs: t0.elapsed().as_secs_f64() });
+                msgs.push(Message::tool(id, name.clone(), out.text));
+                if !out.images.is_empty() { pending_images.push((name, out.images)); }
+            }
+            // Tool results are text-only in the OpenAI protocol; images ride in a follow-up user turn.
+            if !pending_images.is_empty() {
+                let mut parts = vec![Content::text_part("[harness] image(s) returned by the tool call(s) above:")];
+                for (name, imgs) in pending_images {
+                    for (mime, b64) in imgs {
+                        parts.push(Content::text_part(&format!("(from {name})")));
+                        parts.push(Content::image_part(&mime, &b64));
+                    }
+                }
+                msgs.push(Message::user_parts(parts));
             }
         }
     }
@@ -112,7 +125,7 @@ impl<'a> Agent<'a> {
 }
 
 fn last_text(msgs: &[Message]) -> Option<String> {
-    msgs.iter().rev().find(|m| m.role == "assistant").and_then(|m| m.content.clone()).filter(|c| !c.trim().is_empty())
+    msgs.iter().rev().find(|m| m.role == "assistant").map(|m| m.text()).filter(|c| !c.trim().is_empty())
 }
 
 /// Replace the content of tool results older than the last `keep_last` tool messages with a stub.
@@ -122,10 +135,15 @@ fn compact(msgs: &mut [Message], keep_last: usize) -> usize {
     let mut n = 0;
     for &i in &idxs[..idxs.len() - keep_last] {
         let m = &mut msgs[i];
-        let len = m.content.as_ref().map(|c| c.len()).unwrap_or(0);
-        if len > 200 {
-            let head: String = m.content.as_ref().unwrap().chars().take(120).collect();
-            m.content = Some(format!("{head}… [older tool output compacted; re-run the tool if you need it]"));
+        let text = m.text();
+        if text.len() > 200 {
+            let head: String = text.chars().take(120).collect();
+            m.content = Some(Content::Text(format!("{head}… [older tool output compacted; re-run the tool if you need it]")));
+            n += 1;
+        }
+        // Drop image payloads that follow an old tool result (they are the expensive part).
+        if i + 1 < msgs.len() && msgs[i + 1].role == "user" && matches!(msgs[i + 1].content, Some(Content::Parts(_))) {
+            msgs[i + 1].content = Some(Content::Text("[harness] earlier image(s) removed from context; call view_image again if needed.".into()));
             n += 1;
         }
     }

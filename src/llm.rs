@@ -4,11 +4,39 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+/// OpenAI content: either a plain string or an array of parts (text / image_url).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum Content {
+    Text(String),
+    Parts(Vec<Value>),
+}
+
+impl Content {
+    /// Concatenated text of the content (image parts contribute a placeholder).
+    pub fn text(&self) -> String {
+        match self {
+            Content::Text(s) => s.clone(),
+            Content::Parts(parts) => parts.iter().map(|p| match p["type"].as_str() {
+                Some("text") => p["text"].as_str().unwrap_or("").to_string(),
+                Some("image_url") => "[image]".to_string(),
+                _ => String::new(),
+            }).collect::<Vec<_>>().join("\n"),
+        }
+    }
+    pub fn image_part(mime: &str, b64: &str) -> Value {
+        json!({"type": "image_url", "image_url": {"url": format!("data:{mime};base64,{b64}")}})
+    }
+    pub fn text_part(s: &str) -> Value { json!({"type": "text", "text": s}) }
+}
+impl From<String> for Content { fn from(s: String) -> Self { Content::Text(s) } }
+impl From<&str> for Content { fn from(s: &str) -> Self { Content::Text(s.to_string()) } }
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Message {
     pub role: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub content: Option<String>,
+    pub content: Option<Content>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ToolCall>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -21,11 +49,14 @@ pub struct Message {
 }
 
 impl Message {
-    pub fn system(s: impl Into<String>) -> Self { Self { role: "system".into(), content: Some(s.into()), ..Default::default() } }
-    pub fn user(s: impl Into<String>) -> Self { Self { role: "user".into(), content: Some(s.into()), ..Default::default() } }
+    pub fn system(s: impl Into<String>) -> Self { Self { role: "system".into(), content: Some(Content::Text(s.into())), ..Default::default() } }
+    pub fn user(s: impl Into<String>) -> Self { Self { role: "user".into(), content: Some(Content::Text(s.into())), ..Default::default() } }
+    pub fn user_parts(parts: Vec<Value>) -> Self { Self { role: "user".into(), content: Some(Content::Parts(parts)), ..Default::default() } }
     pub fn tool(id: impl Into<String>, name: impl Into<String>, s: impl Into<String>) -> Self {
-        Self { role: "tool".into(), content: Some(s.into()), tool_call_id: Some(id.into()), name: Some(name.into()), ..Default::default() }
+        Self { role: "tool".into(), content: Some(Content::Text(s.into())), tool_call_id: Some(id.into()), name: Some(name.into()), ..Default::default() }
     }
+    /// Text view of the content ("" if none).
+    pub fn text(&self) -> String { self.content.as_ref().map(|c| c.text()).unwrap_or_default() }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -135,12 +166,13 @@ impl Client {
         let mut msg = choice.message;
         // Some servers leave <think>…</think> inline instead of a reasoning field; split it out.
         if let Some(c) = msg.content.take() {
-            let (think, rest) = split_think(&c);
+            let (think, rest) = split_think(&c.text());
             if let Some(t) = think { msg.reasoning_content.get_or_insert_with(String::new).push_str(&t); }
-            msg.content = Some(rest);
+            msg.content = Some(Content::Text(rest));
         }
         if choice.finish_reason.as_deref() == Some("length") {
-            msg.content.get_or_insert_with(String::new).push_str("\n[output truncated by max_tokens]");
+            let mut t = msg.text(); t.push_str("\n[output truncated by max_tokens]");
+            msg.content = Some(Content::Text(t));
         }
         choice.finish_reason = None;
         Ok((msg, r.usage.unwrap_or_default()))

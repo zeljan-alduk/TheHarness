@@ -1,6 +1,6 @@
 //! Internet access: fetch a URL as readable text, and a key-less web search (DuckDuckGo HTML).
 
-use super::{arg_str, Tool, ToolCtx};
+use super::{arg_str, Tool, ToolCtx, ToolOutput};
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use serde_json::{json, Value};
@@ -72,12 +72,12 @@ impl Tool for WebFetch {
     fn parameters(&self) -> Value {
         json!({"type":"object","properties":{"url":{"type":"string"},"raw":{"type":"boolean","description":"return raw body without HTML->text conversion"}},"required":["url"]})
     }
-    async fn call(&self, args: Value, ctx: &ToolCtx) -> Result<String> {
+    async fn call(&self, args: Value, ctx: &ToolCtx) -> Result<ToolOutput> {
         let url = arg_str(&args, "url")?;
         let raw = args.get("raw").and_then(|v| v.as_bool()).unwrap_or(false);
         let (ctype, body) = get_text(ctx, url).await?;
         let text = if !raw && (ctype.contains("html") || body.trim_start().starts_with('<')) { html_to_text(&body) } else { body };
-        Ok(crate::sandbox::truncate_middle(&text, ctx.max_output))
+        Ok((crate::sandbox::truncate_middle(&text, ctx.max_output)).into())
     }
 }
 
@@ -88,16 +88,16 @@ impl Tool for WebSearch {
     fn parameters(&self) -> Value {
         json!({"type":"object","properties":{"query":{"type":"string"},"max_results":{"type":"integer","description":"default 8"}},"required":["query"]})
     }
-    async fn call(&self, args: Value, ctx: &ToolCtx) -> Result<String> {
+    async fn call(&self, args: Value, ctx: &ToolCtx) -> Result<ToolOutput> {
         let q = arg_str(&args, "query")?;
         let max = args.get("max_results").and_then(|v| v.as_u64()).unwrap_or(8) as usize;
         let url = format!("https://html.duckduckgo.com/html/?q={}", urlencode(q));
         let (_, body) = get_text(ctx, &url).await?;
         let results = parse_ddg(&body, max);
         if results.is_empty() {
-            return Ok(format!("no results parsed (page was {} bytes). Try rephrasing, or web_fetch a known URL.", body.len()));
+            return Ok(format!("no results parsed (page was {} bytes). Try rephrasing, or web_fetch a known URL.", body.len()).into());
         }
-        Ok(results.iter().enumerate().map(|(i, r)| format!("{}. {}\n   {}\n   {}", i + 1, r.0, r.1, r.2)).collect::<Vec<_>>().join("\n\n"))
+        Ok((results.iter().enumerate().map(|(i, r)| format!("{}. {}\n   {}\n   {}", i + 1, r.0, r.1, r.2)).collect::<Vec<_>>().join("\n\n")).into())
     }
 }
 

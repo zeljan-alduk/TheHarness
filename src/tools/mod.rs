@@ -1,5 +1,6 @@
 pub mod bash;
 pub mod fs;
+pub mod image;
 pub mod web;
 
 use crate::llm::ToolDef;
@@ -43,12 +44,23 @@ impl ToolCtx {
     }
 }
 
+/// What a tool hands back: text for the tool message, plus optional images that the
+/// agent loop attaches as a follow-up user message (OpenAI tool results are text-only).
+#[derive(Debug, Default)]
+pub struct ToolOutput {
+    pub text: String,
+    /// (mime, base64)
+    pub images: Vec<(String, String)>,
+}
+impl From<String> for ToolOutput { fn from(text: String) -> Self { Self { text, images: vec![] } } }
+impl From<&str> for ToolOutput { fn from(text: &str) -> Self { Self { text: text.to_string(), images: vec![] } } }
+
 #[async_trait]
 pub trait Tool: Send + Sync {
     fn name(&self) -> &'static str;
     fn description(&self) -> &'static str;
     fn parameters(&self) -> Value;
-    async fn call(&self, args: Value, ctx: &ToolCtx) -> Result<String>;
+    async fn call(&self, args: Value, ctx: &ToolCtx) -> Result<ToolOutput>;
 }
 
 pub struct Registry {
@@ -63,6 +75,7 @@ impl Registry {
             Box::new(fs::WriteFile),
             Box::new(fs::EditFile),
             Box::new(fs::ListDir),
+            Box::new(image::ViewImage),
         ];
         if net_enabled {
             tools.push(Box::new(web::WebFetch));
@@ -78,21 +91,21 @@ impl Registry {
     pub fn names(&self) -> Vec<&'static str> { self.tools.iter().map(|t| t.name()).collect() }
 
     /// Errors are returned as text so the model can recover.
-    pub async fn call(&self, name: &str, args_json: &str, ctx: &ToolCtx) -> String {
+    pub async fn call(&self, name: &str, args_json: &str, ctx: &ToolCtx) -> ToolOutput {
         let Some(tool) = self.tools.iter().find(|t| t.name() == name) else {
-            return format!("error: unknown tool '{name}'. Available: {:?}", self.names());
+            return format!("error: unknown tool '{name}'. Available: {:?}", self.names()).into();
         };
         let args: Value = if args_json.trim().is_empty() {
             Value::Object(Default::default())
         } else {
             match serde_json::from_str(args_json) {
                 Ok(v) => v,
-                Err(e) => return format!("error: tool arguments are not valid JSON ({e}): {args_json}"),
+                Err(e) => return format!("error: tool arguments are not valid JSON ({e}): {args_json}").into(),
             }
         };
         match tool.call(args, ctx).await {
             Ok(s) => s,
-            Err(e) => format!("error: {e:#}"),
+            Err(e) => format!("error: {e:#}").into(),
         }
     }
 }
