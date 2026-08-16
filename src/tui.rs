@@ -19,15 +19,17 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use unicode_width::UnicodeWidthChar;
 
-// ───────────────────────── palette ─────────────────────────
-const ORANGE: Color = Color::Rgb(255, 140, 40);
-const DIM: Color = Color::Rgb(128, 136, 152);
-const OK: Color = Color::Rgb(76, 195, 138);
-const ERR: Color = Color::Rgb(255, 107, 107);
-const THINK: Color = Color::Rgb(167, 139, 250);
-const BLUE: Color = Color::Rgb(78, 161, 255);
-const PINK: Color = Color::Rgb(255, 110, 130);
-const CYAN: Color = Color::Rgb(90, 205, 220);
+// ───────────────────────── palette (dark / light) ─────────────────────────
+#[derive(Clone, Copy)]
+struct Pal { orange: Color, dim: Color, ok: Color, err: Color, think: Color, blue: Color, pink: Color, cyan: Color, fg: Color, panel_bg: Color }
+static LIGHT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+fn pal() -> Pal {
+    if LIGHT.load(std::sync::atomic::Ordering::Relaxed) {
+        Pal { orange: Color::Rgb(200, 90, 0), dim: Color::Rgb(110, 116, 130), ok: Color::Rgb(20, 140, 80), err: Color::Rgb(200, 40, 40), think: Color::Rgb(110, 70, 220), blue: Color::Rgb(20, 100, 220), pink: Color::Rgb(200, 40, 90), cyan: Color::Rgb(0, 130, 150), fg: Color::Black, panel_bg: Color::Rgb(225, 228, 235) }
+    } else {
+        Pal { orange: Color::Rgb(255, 140, 40), dim: Color::Rgb(128, 136, 152), ok: Color::Rgb(76, 195, 138), err: Color::Rgb(255, 107, 107), think: Color::Rgb(167, 139, 250), blue: Color::Rgb(78, 161, 255), pink: Color::Rgb(255, 110, 130), cyan: Color::Rgb(90, 205, 220), fg: pal().fg, panel_bg: pal().panel_bg }
+    }
+}
 const SPINNER: [&str; 10] = ["✻", "✼", "✽", "✾", "✿", "❀", "✿", "✾", "✽", "✼"];
 const WORDS: [&str; 12] = ["Thinking", "Pondering", "Working", "Reasoning", "Cooking", "Tinkering", "Brewing", "Mulling", "Crunching", "Percolating", "Noodling", "Computing"];
 
@@ -280,6 +282,8 @@ struct App {
     toolset: Option<Arc<Toolset>>,
     perm_mode: harness::permissions::Mode,
     session_meta: harness::sessions::Meta,
+    todos: Arc<std::sync::Mutex<Vec<harness::tools::todo::TodoItem>>>,
+    event_log: Option<std::fs::File>,
     pending_ask: Option<(harness::permissions::ApprovalRequest, tokio::sync::oneshot::Sender<harness::permissions::Approval>)>,
     video: Option<VideoPicker>,
     strip_rects: Vec<(Rect, usize)>,
@@ -303,10 +307,12 @@ pub async fn run(cfg: Config, resume: Option<String>) -> Result<()> {
         quit: false, tick: 0, word: 0, models: vec![],
         metrics: Metrics::new(0), panel: None, attachments: vec![], tool_previews: Default::default(),
         picker, images: Default::default(), img_seq: 0,
-        think_scroll: 0, toolset: None, perm_mode: harness::permissions::Mode::Auto, session_meta: harness::sessions::Meta::default(), pending_ask: None, video: None, strip_rects: vec![], tr_rect: Rect::default(), panel_rect: Rect::default(), tr_start: 0, line_map: vec![],
+        think_scroll: 0, toolset: None, perm_mode: harness::permissions::Mode::Auto, session_meta: harness::sessions::Meta::default(), todos: Default::default(), event_log: None, pending_ask: None, video: None, strip_rects: vec![], tr_rect: Rect::default(), panel_rect: Rect::default(), tr_start: 0, line_map: vec![],
     };
     app.metrics.ctx_len = app.cfg.llm.context_budget_tokens.unwrap_or(0);
     app.perm_mode = app.cfg.permissions.mode;
+    if app.cfg.ui.event_log { if let Ok(h) = std::env::var("HOME") { let d = std::path::PathBuf::from(h).join(".config/harness/logs").join(harness::memory::today_iso()); let _ = std::fs::create_dir_all(&d); app.event_log = std::fs::OpenOptions::new().create(true).append(true).open(d.join(format!("tui-{}.jsonl", std::process::id()))).ok(); } }
+    if app.cfg.ui.theme == "light" { LIGHT.store(true, std::sync::atomic::Ordering::Relaxed); }
     app.banner();
     if let Some(r) = resume { app.resume_session(&r); }
     app.reload_toolset();
@@ -593,6 +599,7 @@ impl App {
             "/resume" => { if self.running.is_some() { self.set_status("finish or interrupt the current task first"); } else { self.resume_session(&arg); } }
             "/clear" | "/new" => {
                 self.session_meta = harness::sessions::Meta::default();
+                if let Ok(mut t) = self.todos.lock() { t.clear(); }
                 let s = self.session.clone(); tokio::spawn(async move { s.lock().await.clear(); });
                 self.blocks.clear(); self.total_prompt = 0; self.total_completion = 0; self.last_prompt_tokens = 0; self.banner();
                 self.blocks.push(Block::System("new session".into()));
@@ -703,6 +710,7 @@ impl App {
                 } else if let Some(m) = harness::permissions::Mode::parse(&arg) { self.perm_mode = m; self.blocks.push(Block::System(format!("permissions → {}", m.label()))); }
                 else { self.blocks.push(Block::Error("usage: /permissions [bypass|auto|ask|plan]".into())); }
             }
+            "/theme" => { let light = match arg.as_str() { "light" => true, "dark" => false, _ => !LIGHT.load(std::sync::atomic::Ordering::Relaxed) }; LIGHT.store(light, std::sync::atomic::Ordering::Relaxed); self.blocks.push(Block::System(format!("theme → {}", if light { "light" } else { "dark" }))); }
             "/plan" => { self.perm_mode = if self.perm_mode == harness::permissions::Mode::Plan { harness::permissions::Mode::Auto } else { harness::permissions::Mode::Plan }; self.blocks.push(Block::System(format!("permissions → {}", self.perm_mode.label()))); }
             "/queue" => {
                 if self.queued.is_empty() { self.blocks.push(Block::System("queue is empty".into())); }
@@ -833,6 +841,7 @@ impl App {
         let mut cfg = self.cfg.clone(); cfg.llm.model = self.model.clone(); cfg.net.enabled = self.net;
         let workdir = self.workdir.clone();
         let toolset = self.toolset.clone();
+        let todos = self.todos.clone();
         let perm_mode = self.perm_mode;
         let budget = self.cfg.llm.effective_budget(if self.metrics.ctx_len > 0 { Some(self.metrics.ctx_len) } else { None });
         self.run_started = Instant::now();
@@ -848,7 +857,7 @@ impl App {
                 let policy = Arc::new(harness::permissions::Policy::new(pcfg, &workdir));
                 let approver: Arc<dyn harness::permissions::Approver> = Arc::new(TuiApprover(tx.clone()));
                 let env = Arc::new(harness::agent::SubAgentEnv::new(client.clone(), registry.clone(), policy.clone(), approver.clone(), sink.clone(), budget, true));
-                let ctx = ToolCtx { workdir: workdir.clone(), timeout: Duration::from_secs(cfg.agent.tool_timeout_secs), max_output: cfg.agent.max_tool_output_chars, net: cfg.net.clone(), memory: store.clone(), subagent: Some(env), redact_secrets: cfg.security.redact_secrets, hooks: cfg.hooks.clone() };
+                let ctx = ToolCtx { workdir: workdir.clone(), timeout: Duration::from_secs(cfg.agent.tool_timeout_secs), max_output: cfg.agent.max_tool_output_chars, net: cfg.net.clone(), memory: store.clone(), subagent: Some(env), redact_secrets: cfg.security.redact_secrets, hooks: cfg.hooks.clone(), todos: todos.clone() };
                 let agent = Agent { client: &client, registry, ctx: &ctx, max_turns: cfg.agent.max_turns, context_budget: budget, sink: sink.as_ref(), stream: true, policy: &policy, approver: approver.as_ref() };
                 let extra = format!("You are in an interactive session: the user can see everything and will reply; keep final answers concise.{extra_prompt}");
                 let system = harness::agent::system_prompt_with_memory(&workdir.display().to_string(), &registry.names(), Some(&extra), store.as_ref());
@@ -974,6 +983,12 @@ impl App {
             Msg::Pasted(Err(e)) => self.set_status(e),
             Msg::Done(res) => {
                 self.running = None;
+                if self.cfg.ui.notify && self.run_started.elapsed() > Duration::from_secs(20) {
+                    let title = match &res { Ok(_) => "Harness: task finished", Err(_) => "Harness: task stopped" };
+                    let body = truncate(&self.blocks.iter().rev().find_map(|b| if let Block::User(t, _) = b { Some(t.clone()) } else { None }).unwrap_or_default(), 80).replace('"', "'");
+                    let script = format!("display notification \"{body}\" with title \"{title}\" sound name \"Glass\"");
+                    tokio::spawn(async move { let _ = tokio::process::Command::new("osascript").arg("-e").arg(script).output().await; });
+                }
                 match &res {
                     Ok((_, stats)) => { self.session_meta.prompt_tokens += stats.prompt_tokens; self.session_meta.completion_tokens += stats.completion_tokens; }
                     Err(_) => {}
@@ -993,6 +1008,7 @@ impl App {
     }
 
     fn on_event(&mut self, e: Event) {
+        if let Some(f) = &mut self.event_log { if !matches!(e, Event::ReasoningDelta { .. } | Event::AssistantDelta { .. } | Event::Turn { .. }) { use std::io::Write; let _ = writeln!(f, "{}", serde_json::to_string(&e).unwrap_or_default()); } }
         match e {
             Event::RunStarted { model, workdir, .. } if workdir == "\u{0}models" => { self.models = model.split('\u{1f}').map(String::from).collect(); }
             Event::RunStarted { .. } | Event::Turn { .. } => {}
@@ -1098,6 +1114,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ("/reload", "restart tools, MCP servers and plugins"),
     ("/permissions", "show or set permission mode: bypass|auto|ask|plan"),
     ("/plan", "toggle plan mode (read-only)"),
+    ("/theme", "switch theme: /theme light|dark"),
     ("/queue", "show queued tasks (/queue clear)"),
     ("/next", "stop the current task and start the next queued one (ctrl+n)"),
     ("/exit", "quit"),
@@ -1113,7 +1130,7 @@ fn draw(f: &mut Frame, app: &mut App) {
         (cols[0], Some((cols[1], cols[2])))
     } else { (full, None) };
     if let Some((div, pa)) = panel_area {
-        let divider: Vec<Line> = (0..div.height).map(|_| Line::from(Span::styled("│", Style::default().fg(DIM)))).collect();
+        let divider: Vec<Line> = (0..div.height).map(|_| Line::from(Span::styled("│", Style::default().fg(pal().dim)))).collect();
         f.render_widget(Paragraph::new(divider), div);
         draw_panel(f, app, pa);
     }
@@ -1124,16 +1141,16 @@ fn draw(f: &mut Frame, app: &mut App) {
     let input_h = (input_lines.len().clamp(1, 8) + sugg.len() + if app.attachments.is_empty() { 0 } else { 1 }) as u16;
     // notice line above the box: spinner while running, or a transient status message
     let notice: Option<Vec<Span>> = if let Some((req, _)) = &app.pending_ask {
-        Some(vec![Span::styled(" 🔒 ", Style::default().fg(Color::Black).bg(ORANGE)), Span::styled(format!(" {}({}) ", req.tool, truncate(&req.summary, width.saturating_sub(70))), Style::default().fg(Color::Black).bg(ORANGE).bold()),
-                  Span::styled(format!("  {} · ", req.reason), Style::default().fg(ORANGE)),
-                  Span::styled("[y] allow once  ", Style::default().fg(OK).bold()), Span::styled(format!("[a] always ({})  ", req.suggested_rule), Style::default().fg(CYAN)), Span::styled("[n] deny", Style::default().fg(ERR).bold())])
+        Some(vec![Span::styled(" 🔒 ", Style::default().fg(Color::Black).bg(pal().orange)), Span::styled(format!(" {}({}) ", req.tool, truncate(&req.summary, width.saturating_sub(70))), Style::default().fg(Color::Black).bg(pal().orange).bold()),
+                  Span::styled(format!("  {} · ", req.reason), Style::default().fg(pal().orange)),
+                  Span::styled("[y] allow once  ", Style::default().fg(pal().ok).bold()), Span::styled(format!("[a] always ({})  ", req.suggested_rule), Style::default().fg(pal().cyan)), Span::styled("[n] deny", Style::default().fg(pal().err).bold())])
     } else if app.running.is_some() {
         let sp = SPINNER[(app.tick as usize / 2) % SPINNER.len()];
         let el = app.run_started.elapsed().as_secs();
         let live = app.metrics.live_tps();
-        Some(vec![Span::styled(format!("{sp} {}… ", WORDS[app.word]), Style::default().fg(ORANGE)),
-                  Span::styled(format!("({el}s · {} tok/s · esc to interrupt{})", if live > 0.0 { format!("{live:.0}") } else { "–".into() }, if app.queued.is_empty() { String::new() } else { format!(" · {} queued", app.queued.len()) }), Style::default().fg(DIM))])
-    } else if let Some((m, t)) = &app.status_msg { if t.elapsed() < Duration::from_secs(4) { Some(vec![Span::styled(format!("· {m}"), Style::default().fg(ORANGE))]) } else { None } } else { None };
+        Some(vec![Span::styled(format!("{sp} {}… ", WORDS[app.word]), Style::default().fg(pal().orange)),
+                  Span::styled(format!("({el}s · {} tok/s · esc to interrupt{})", if live > 0.0 { format!("{live:.0}") } else { "–".into() }, if app.queued.is_empty() { String::new() } else { format!(" · {} queued", app.queued.len()) }), Style::default().fg(pal().dim))])
+    } else if let Some((m, t)) = &app.status_msg { if t.elapsed() < Duration::from_secs(4) { Some(vec![Span::styled(format!("· {m}"), Style::default().fg(pal().orange))]) } else { None } } else { None };
     let notice_h = if notice.is_some() { 1 } else { 0 };
     let chunks = Layout::vertical([Constraint::Min(1), Constraint::Length(notice_h), Constraint::Length(1), Constraint::Length(input_h), Constraint::Length(1), Constraint::Length(1)]).split(area);
     let (tr_area, no_area, top_area, in_area, bot_area, st_area) = (chunks[0], chunks[1], chunks[2], chunks[3], chunks[4], chunks[5]);
@@ -1166,25 +1183,25 @@ fn draw(f: &mut Frame, app: &mut App) {
     if app.scroll_up > 0 {
         let tag = format!(" ↓ {} more lines ", app.scroll_up);
         let r = Rect { x: area.x + area.width.saturating_sub(tag.len() as u16 + 1), y: tr_area.bottom().saturating_sub(1), width: tag.len() as u16, height: 1 };
-        f.render_widget(Paragraph::new(Span::styled(tag, Style::default().fg(Color::Black).bg(ORANGE))), r);
+        f.render_widget(Paragraph::new(Span::styled(tag, Style::default().fg(Color::Black).bg(pal().orange))), r);
     }
     if let Some(n) = notice { f.render_widget(Paragraph::new(Line::from(n)), no_area); }
 
     // input box: rule / › text / rule
-    let rule = Line::from(Span::styled("─".repeat(width), Style::default().fg(DIM)));
+    let rule = Line::from(Span::styled("─".repeat(width), Style::default().fg(pal().dim)));
     f.render_widget(Paragraph::new(rule.clone()), top_area);
     let mut in_lines: Vec<Line> = Vec::new();
     for (i, l) in input_lines.iter().enumerate().take(8) {
-        let prompt = if i == 0 { Span::styled("› ", Style::default().fg(Color::White).bold()) } else { Span::raw("  ") };
+        let prompt = if i == 0 { Span::styled("› ", Style::default().fg(pal().fg).bold()) } else { Span::raw("  ") };
         in_lines.push(Line::from(vec![prompt, Span::raw(l.clone())]));
     }
     if app.input.is_empty() {
-        in_lines[0] = Line::from(vec![Span::styled("› ", Style::default().fg(Color::White).bold()), Span::styled(if app.running.is_some() { "type to queue the next message…" } else { "Ask the agent to do something… (/help)" }, Style::default().fg(DIM))]);
+        in_lines[0] = Line::from(vec![Span::styled("› ", Style::default().fg(pal().fg).bold()), Span::styled(if app.running.is_some() { "type to queue the next message…" } else { "Ask the agent to do something… (/help)" }, Style::default().fg(pal().dim))]);
     }
-    for (c, d) in &sugg { in_lines.push(Line::from(vec![Span::raw("  "), Span::styled(format!("{c:<12}"), Style::default().fg(BLUE)), Span::styled(d.to_string(), Style::default().fg(DIM))])); }
+    for (c, d) in &sugg { in_lines.push(Line::from(vec![Span::raw("  "), Span::styled(format!("{c:<12}"), Style::default().fg(pal().blue)), Span::styled(d.to_string(), Style::default().fg(pal().dim))])); }
     if !app.attachments.is_empty() {
-        let mut spans = vec![Span::styled("  📎 ", Style::default().fg(BLUE))];
-        for (i, a) in app.attachments.iter().enumerate() { spans.push(Span::styled(format!("#{} {} {}×{}  ", i + 1, a.path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default(), a.dims.0, a.dims.1), Style::default().fg(BLUE))); }
+        let mut spans = vec![Span::styled("  📎 ", Style::default().fg(pal().blue))];
+        for (i, a) in app.attachments.iter().enumerate() { spans.push(Span::styled(format!("#{} {} {}×{}  ", i + 1, a.path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default(), a.dims.0, a.dims.1), Style::default().fg(pal().blue))); }
         in_lines.push(Line::from(spans));
     }
     f.render_widget(Paragraph::new(in_lines), in_area);
@@ -1194,31 +1211,31 @@ fn draw(f: &mut Frame, app: &mut App) {
     if crow < 8 { f.set_cursor_position((in_area.x + 2 + ccol as u16, in_area.y + crow as u16)); }
 
     // mode line: ▶▶ bypass permissions on · model · cwd · ctx
-    let dot = || Span::styled(" · ", Style::default().fg(DIM));
-    let (mode_txt, mode_col) = match app.perm_mode { harness::permissions::Mode::Bypass => ("▶▶ bypass permissions on", PINK), harness::permissions::Mode::Auto => ("▶▶ auto permissions", CYAN), harness::permissions::Mode::Ask => ("▶▶ ask before changes", ORANGE), harness::permissions::Mode::Plan => ("▶▶ plan mode · read-only", THINK) };
+    let dot = || Span::styled(" · ", Style::default().fg(pal().dim));
+    let (mode_txt, mode_col) = match app.perm_mode { harness::permissions::Mode::Bypass => ("▶▶ bypass permissions on", pal().pink), harness::permissions::Mode::Auto => ("▶▶ auto permissions", pal().cyan), harness::permissions::Mode::Ask => ("▶▶ ask before changes", pal().orange), harness::permissions::Mode::Plan => ("▶▶ plan mode · read-only", pal().think) };
     let mut st = vec![Span::styled(format!("  {mode_txt}"), Style::default().fg(mode_col)), dot(),
-        Span::styled(app.model.clone(), Style::default().fg(CYAN)), dot(),
-        Span::styled(short_path(&app.workdir), Style::default().fg(CYAN)), dot(),
-        Span::styled(format!("ctx {}", fmt_k(app.last_prompt_tokens)), Style::default().fg(CYAN))];
-    if !app.net { st.push(dot()); st.push(Span::styled("offline", Style::default().fg(PINK))); }
-    if !app.queued.is_empty() { st.push(dot()); st.push(Span::styled(format!("{} queued", app.queued.len()), Style::default().fg(CYAN))); }
+        Span::styled(app.model.clone(), Style::default().fg(pal().cyan)), dot(),
+        Span::styled(short_path(&app.workdir), Style::default().fg(pal().cyan)), dot(),
+        Span::styled(format!("ctx {}", fmt_k(app.last_prompt_tokens)), Style::default().fg(pal().cyan))];
+    if !app.net { st.push(dot()); st.push(Span::styled("offline", Style::default().fg(pal().pink))); }
+    if !app.queued.is_empty() { st.push(dot()); st.push(Span::styled(format!("{} queued", app.queued.len()), Style::default().fg(pal().cyan))); }
     let lw: usize = st.iter().map(|s| s.content.chars().count()).sum();
     let right = if app.running.is_none() { "? for shortcuts · /help" } else { "esc to interrupt" };
     let pad = width.saturating_sub(lw + right.chars().count() + 1);
-    st.push(Span::raw(" ".repeat(pad))); st.push(Span::styled(right, Style::default().fg(DIM)));
+    st.push(Span::raw(" ".repeat(pad))); st.push(Span::styled(right, Style::default().fg(pal().dim)));
     f.render_widget(Paragraph::new(Line::from(st)), st_area);
 }
 
 // ───────────────────────── video scrubber ─────────────────────────
 fn draw_video(f: &mut Frame, app: &mut App, area: Rect) {
-    let dim = Style::default().fg(DIM);
+    let dim = Style::default().fg(pal().dim);
     f.render_widget(ratatui::widgets::Clear, area);
     let Some(v) = &app.video else { return };
     let title = format!(" 🎞  {}  ·  {:.1}s  ·  {} frames  ·  {} selected ", short_path(&v.path), v.duration, v.frames.len(), v.selected.len());
     let rows = Layout::vertical([Constraint::Length(1), Constraint::Min(8), Constraint::Length(1), Constraint::Length(7), Constraint::Length(2)]).split(area);
-    f.render_widget(Paragraph::new(Line::from(vec![Span::styled(title, Style::default().fg(Color::Black).bg(ORANGE).bold())])), rows[0]);
-    if v.loading { f.render_widget(Paragraph::new(Span::styled("  extracting frames with ffmpeg…", Style::default().fg(ORANGE))), rows[1]); }
-    else if let Some(e) = &v.error { f.render_widget(Paragraph::new(Span::styled(format!("  {e}"), Style::default().fg(ERR))), rows[1]); }
+    f.render_widget(Paragraph::new(Line::from(vec![Span::styled(title, Style::default().fg(Color::Black).bg(pal().orange).bold())])), rows[0]);
+    if v.loading { f.render_widget(Paragraph::new(Span::styled("  extracting frames with ffmpeg…", Style::default().fg(pal().orange))), rows[1]); }
+    else if let Some(e) = &v.error { f.render_widget(Paragraph::new(Span::styled(format!("  {e}"), Style::default().fg(pal().err))), rows[1]); }
     // main frame
     let cur = v.cur; let frames: Vec<(f64, String)> = v.frames.iter().map(|(t, _, k)| (*t, k.clone())).collect();
     let selected = v.selected.clone();
@@ -1233,7 +1250,7 @@ fn draw_video(f: &mut Frame, app: &mut App, area: Rect) {
             f.render_stateful_widget(StatefulImage::default(), Rect { x, y: rows[1].y + 1, width: cols, height: rws }, proto);
         }
         let mark = if selected.contains(&cur) { "● selected" } else { "○ not selected" };
-        f.render_widget(Paragraph::new(Line::from(vec![Span::styled(format!("  frame {}/{}  ·  t = {:.1}s  ·  ", cur + 1, frames.len(), ts), dim), Span::styled(mark, Style::default().fg(if selected.contains(&cur) { OK } else { DIM }))])), rows[2]);
+        f.render_widget(Paragraph::new(Line::from(vec![Span::styled(format!("  frame {}/{}  ·  t = {:.1}s  ·  ", cur + 1, frames.len(), ts), dim), Span::styled(mark, Style::default().fg(if selected.contains(&cur) { pal().ok } else { pal().dim }))])), rows[2]);
     }
     // strip: thumbnails around cur
     app.strip_rects.clear();
@@ -1246,7 +1263,7 @@ fn draw_video(f: &mut Frame, app: &mut App, area: Rect) {
         let (_, key) = &frames[i];
         if let Some((proto, _)) = app.images.get_mut(key) { f.render_stateful_widget(StatefulImage::default(), Rect { x: r.x + 1, y: r.y, width: tw - 2, height: th - 1 }, proto); }
         let lbl = format!("{}{:.1}s", if selected.contains(&i) { "●" } else { " " }, frames[i].0);
-        let st = if i == cur { Style::default().fg(Color::Black).bg(ORANGE).bold() } else if selected.contains(&i) { Style::default().fg(OK) } else { dim };
+        let st = if i == cur { Style::default().fg(Color::Black).bg(pal().orange).bold() } else if selected.contains(&i) { Style::default().fg(pal().ok) } else { dim };
         f.render_widget(Paragraph::new(Span::styled(format!("{:^w$}", lbl, w = tw as usize), st)), Rect { x: r.x, y: r.y + th - 1, width: tw, height: 1 });
         app.strip_rects.push((r, i));
         x += tw + gap as u16;
@@ -1260,22 +1277,32 @@ fn draw_video(f: &mut Frame, app: &mut App, area: Rect) {
 // ───────────────────────── dashboard panel ─────────────────────────
 fn draw_panel(f: &mut Frame, app: &App, area: Rect) {
     let m = &app.metrics;
-    let title = |t: &str| Line::from(vec![Span::styled(format!("── {t} "), Style::default().fg(ORANGE).bold()), Span::styled("─".repeat((area.width as usize).saturating_sub(t.len() + 4)), Style::default().fg(DIM))]);
-    let dim = Style::default().fg(DIM);
+    let title = |t: &str| Line::from(vec![Span::styled(format!("── {t} "), Style::default().fg(pal().orange).bold()), Span::styled("─".repeat((area.width as usize).saturating_sub(t.len() + 4)), Style::default().fg(pal().dim))]);
+    let dim = Style::default().fg(pal().dim);
     let running = app.running.is_some();
+    let todos: Vec<harness::tools::todo::TodoItem> = app.todos.lock().map(|t| t.clone()).unwrap_or_default();
+    let todo_h = if todos.is_empty() { 0 } else { (todos.len() as u16).min(8) + 1 };
     let rows = Layout::vertical([
         Constraint::Length(1), Constraint::Min(6),          // thinking
+        Constraint::Length(todo_h),                         // tasks
         Constraint::Length(1), Constraint::Length(6),       // tokens
         Constraint::Length(1), Constraint::Length(8),       // speed
         Constraint::Length(1), Constraint::Length(9),       // system
     ]).split(area);
+    let (r_tokens_t, r_tokens, r_speed_t, r_speed, r_sys_t, r_sys) = (rows[3], rows[4], rows[5], rows[6], rows[7], rows[8]);
+    if todo_h > 0 {
+        let done = todos.iter().filter(|t| t.status == "done").count();
+        let mut tl: Vec<Line> = vec![title(&format!("Tasks {}/{}", done, todos.len()))];
+        for t in todos.iter().take(8) { let (mark, st) = match t.status.as_str() { "done" => ("☑ ", Style::default().fg(pal().ok)), "in_progress" => ("▶ ", Style::default().fg(pal().orange).bold()), _ => ("☐ ", dim) }; tl.push(Line::from(vec![Span::styled(mark, st), Span::styled(truncate(&t.text, area.width.saturating_sub(4) as usize), if t.status == "done" { dim } else { Style::default() })])); }
+        f.render_widget(Paragraph::new(tl), rows[2]);
+    }
 
     // ── Thinking ──
     f.render_widget(Paragraph::new(title(&format!("{}{}", if running { "Thinking · live" } else { "Thinking · last" }, if app.think_scroll > 0 { " ↑" } else { "" }))), rows[0]);
     let think = app.blocks.iter().rev().find_map(|b| if let Block::Reasoning { text, .. } = b { Some(text.clone()) } else { None }).unwrap_or_default();
     let tw = rows[1].width as usize;
     let mut tl: Vec<Line> = Vec::new();
-    for l in think.lines().filter(|l| !l.trim().is_empty()) { push_wrapped(&mut tl, vec![Span::styled(l.trim().to_string(), Style::default().fg(THINK))], tw, 0); }
+    for l in think.lines().filter(|l| !l.trim().is_empty()) { push_wrapped(&mut tl, vec![Span::styled(l.trim().to_string(), Style::default().fg(pal().think))], tw, 0); }
     let th = rows[1].height as usize;
     let max_up = tl.len().saturating_sub(th);
     let up = app.think_scroll.min(max_up);
@@ -1284,30 +1311,30 @@ fn draw_panel(f: &mut Frame, app: &App, area: Rect) {
     if tail.is_empty() { f.render_widget(Paragraph::new(Span::styled("(reasoning will stream here)", dim)), rows[1]); } else { f.render_widget(Paragraph::new(tail), rows[1]); }
 
     // ── Tokens ──
-    f.render_widget(Paragraph::new(title("Tokens")), rows[2]);
-    let tk = Layout::vertical([Constraint::Length(1), Constraint::Length(1), Constraint::Length(1), Constraint::Length(3)]).split(rows[3]);
+    f.render_widget(Paragraph::new(title("Tokens")), r_tokens_t);
+    let tk = Layout::vertical([Constraint::Length(1), Constraint::Length(1), Constraint::Length(1), Constraint::Length(3)]).split(r_tokens);
     let ctx = m.ctx_len.max(1);
     let ratio = (app.last_prompt_tokens as f64 / ctx as f64).clamp(0.0, 1.0);
-    let gcolor = if ratio > 0.85 { ERR } else if ratio > 0.6 { ORANGE } else { OK };
-    f.render_widget(Gauge::default().gauge_style(Style::default().fg(gcolor).bg(Color::Rgb(38, 44, 56))).ratio(ratio).label(format!("context {} / {} ({:.0}%)", fmt_k(app.last_prompt_tokens), fmt_k(ctx), ratio * 100.0)), tk[0]);
+    let gcolor = if ratio > 0.85 { pal().err } else if ratio > 0.6 { pal().orange } else { pal().ok };
+    f.render_widget(Gauge::default().gauge_style(Style::default().fg(gcolor).bg(pal().panel_bg)).ratio(ratio).label(format!("context {} / {} ({:.0}%)", fmt_k(app.last_prompt_tokens), fmt_k(ctx), ratio * 100.0)), tk[0]);
     f.render_widget(Paragraph::new(Line::from(vec![Span::styled("session ", dim), Span::raw(format!("{} in · {} out", fmt_k(app.total_prompt), fmt_k(app.total_completion))), Span::styled(format!(" · {} calls", m.calls), dim)])), tk[1]);
     let (lp, lc) = m.last_call.map(|(p, c, _, _)| (p, c)).unwrap_or((0, 0));
     f.render_widget(Paragraph::new(Line::from(vec![Span::styled("last call ", dim), Span::raw(format!("{} in · {} out", fmt_k(lp), fmt_k(lc))), Span::styled("   out/call ▸", dim)])), tk[2]);
-    f.render_widget(Sparkline::default().data(&m.completion_per_call.iter().cloned().collect::<Vec<_>>()).style(Style::default().fg(BLUE)), tk[3]);
+    f.render_widget(Sparkline::default().data(&m.completion_per_call.iter().cloned().collect::<Vec<_>>()).style(Style::default().fg(pal().blue)), tk[3]);
 
     // ── Speed ──
-    f.render_widget(Paragraph::new(title("Speed")), rows[4]);
-    let sp = Layout::vertical([Constraint::Length(1), Constraint::Length(1), Constraint::Length(1), Constraint::Min(3)]).split(rows[5]);
+    f.render_widget(Paragraph::new(title("Speed")), r_speed_t);
+    let sp = Layout::vertical([Constraint::Length(1), Constraint::Length(1), Constraint::Length(1), Constraint::Min(3)]).split(r_speed);
     let live = if running { m.live_tps() } else { 0.0 };
     let (ttft, gen, psp) = m.last_call.map(|(p, c, t, s)| (t, if s > t && c > 0 { c as f64 / (s - t) } else { 0.0 }, if t > 0.0 { p as f64 / t } else { 0.0 })).unwrap_or((0.0, 0.0, 0.0));
-    f.render_widget(Paragraph::new(Line::from(vec![Span::styled("live ", dim), Span::styled(format!("{live:>5.1} tok/s"), Style::default().fg(if running { ORANGE } else { DIM }).bold()), Span::styled(format!("  peak {:.1}", m.live_peak), dim)])), sp[0]);
+    f.render_widget(Paragraph::new(Line::from(vec![Span::styled("live ", dim), Span::styled(format!("{live:>5.1} tok/s"), Style::default().fg(if running { pal().orange } else { pal().dim }).bold()), Span::styled(format!("  peak {:.1}", m.live_peak), dim)])), sp[0]);
     f.render_widget(Paragraph::new(Line::from(vec![Span::styled("gen  ", dim), Span::raw(format!("{gen:>5.1} tok/s")), Span::styled("  ttft ", dim), Span::raw(format!("{:.2}s", ttft))])), sp[1]);
     f.render_widget(Paragraph::new(Line::from(vec![Span::styled("prompt ", dim), Span::raw(format!("{psp:>6.0} tok/s")), Span::styled(format!("  turn {}s", m.turn_start.map(|t| t.elapsed().as_secs()).filter(|_| running).unwrap_or(0)), dim)])), sp[2]);
     // chart: gen tok/s per call
     let pts: Vec<(f64, f64)> = m.gen_speed.iter().enumerate().map(|(i, v)| (i as f64, *v as f64)).collect();
     if pts.len() >= 2 {
         let ymax = pts.iter().map(|p| p.1).fold(1.0, f64::max) * 1.15;
-        let ds = Dataset::default().name("tok/s").marker(symbols::Marker::Braille).graph_type(GraphType::Line).style(Style::default().fg(OK)).data(&pts);
+        let ds = Dataset::default().name("tok/s").marker(symbols::Marker::Braille).graph_type(GraphType::Line).style(Style::default().fg(pal().ok)).data(&pts);
         let chart = Chart::new(vec![ds])
             .x_axis(Axis::default().bounds([0.0, (pts.len() - 1) as f64]).style(dim))
             .y_axis(Axis::default().bounds([0.0, ymax]).labels(vec![Span::styled("0", dim), Span::styled(format!("{:.0}", ymax), dim)]).style(dim));
@@ -1317,22 +1344,22 @@ fn draw_panel(f: &mut Frame, app: &App, area: Rect) {
     }
 
     // ── System ──
-    f.render_widget(Paragraph::new(title("System")), rows[6]);
-    let sy = Layout::vertical([Constraint::Length(1), Constraint::Length(2), Constraint::Length(1), Constraint::Length(2), Constraint::Length(1), Constraint::Length(2)]).split(rows[7]);
+    f.render_widget(Paragraph::new(title("System")), r_sys_t);
+    let sy = Layout::vertical([Constraint::Length(1), Constraint::Length(2), Constraint::Length(1), Constraint::Length(2), Constraint::Length(1), Constraint::Length(2)]).split(r_sys);
     let last = &m.last;
     let cpu = last.cpu;
-    f.render_widget(Paragraph::new(Line::from(vec![Span::styled("cpu ", dim), Span::styled(format!("{cpu:>5.1}%"), Style::default().fg(if cpu > 80.0 { ERR } else { Color::White })), Span::styled(format!("   harness rss {}", fmt_bytes(last.harness_rss)), dim)])), sy[0]);
-    f.render_widget(Sparkline::default().data(&m.cpu.iter().cloned().collect::<Vec<_>>()).max(100).style(Style::default().fg(BLUE)), sy[1]);
+    f.render_widget(Paragraph::new(Line::from(vec![Span::styled("cpu ", dim), Span::styled(format!("{cpu:>5.1}%"), Style::default().fg(if cpu > 80.0 { pal().err } else { pal().fg })), Span::styled(format!("   harness rss {}", fmt_bytes(last.harness_rss)), dim)])), sy[0]);
+    f.render_widget(Sparkline::default().data(&m.cpu.iter().cloned().collect::<Vec<_>>()).max(100).style(Style::default().fg(pal().blue)), sy[1]);
     match (last.gpu_util, last.gpu_mem) {
         (Some(g), gm) => {
-            f.render_widget(Paragraph::new(Line::from(vec![Span::styled("gpu ", dim), Span::styled(format!("{g:>5.0}%"), Style::default().fg(if g > 80.0 { ORANGE } else { Color::White })), Span::styled(format!("   gpu mem {}", gm.map(fmt_bytes).unwrap_or_else(|| "?".into())), dim)])), sy[2]);
-            f.render_widget(Sparkline::default().data(&m.gpu.iter().cloned().collect::<Vec<_>>()).max(100).style(Style::default().fg(THINK)), sy[3]);
+            f.render_widget(Paragraph::new(Line::from(vec![Span::styled("gpu ", dim), Span::styled(format!("{g:>5.0}%"), Style::default().fg(if g > 80.0 { pal().orange } else { pal().fg })), Span::styled(format!("   gpu mem {}", gm.map(fmt_bytes).unwrap_or_else(|| "?".into())), dim)])), sy[2]);
+            f.render_widget(Sparkline::default().data(&m.gpu.iter().cloned().collect::<Vec<_>>()).max(100).style(Style::default().fg(pal().think)), sy[3]);
         }
         _ => { f.render_widget(Paragraph::new(Span::styled("gpu  n/a on this platform", dim)), sy[2]); }
     }
     let mr = if last.mem_total > 0 { last.mem_used as f64 / last.mem_total as f64 } else { 0.0 };
     f.render_widget(Paragraph::new(Line::from(vec![Span::styled("ram ", dim), Span::raw(format!("{} / {}", fmt_bytes(last.mem_used), fmt_bytes(last.mem_total))), Span::styled(format!("   server rss {}", fmt_bytes(last.server_rss)), dim)])), sy[4]);
-    f.render_widget(Gauge::default().gauge_style(Style::default().fg(if mr > 0.9 { ERR } else { BLUE }).bg(Color::Rgb(38, 44, 56))).ratio(mr.clamp(0.0, 1.0)).label(format!("{:.0}%", mr * 100.0)), Rect { height: 1, ..sy[5] });
+    f.render_widget(Gauge::default().gauge_style(Style::default().fg(if mr > 0.9 { pal().err } else { pal().blue }).bg(pal().panel_bg)).ratio(mr.clamp(0.0, 1.0)).label(format!("{:.0}%", mr * 100.0)), Rect { height: 1, ..sy[5] });
 }
 
 fn fmt_bytes(n: u64) -> String { if n < 1 << 20 { format!("{} KB", n >> 10) } else if n < 1 << 30 { format!("{:.0} MB", n as f64 / 1048576.0) } else { format!("{:.1} GB", n as f64 / 1073741824.0) } }
@@ -1359,7 +1386,7 @@ fn render_block(b: &Block, app: &App, width: usize, out: &mut Vec<Line<'static>>
     match b {
         Block::Banner(ls) => {
             let inner = ls.iter().map(|l| l.chars().count()).max().unwrap_or(0).min(w.saturating_sub(4));
-            let bs = Style::default().fg(ORANGE);
+            let bs = Style::default().fg(pal().orange);
             out.push(Line::from(Span::styled(format!("╭{}╮", "─".repeat(inner + 2)), bs)));
             for l in ls { let t = truncate(l, inner); out.push(Line::from(vec![Span::styled("│ ", bs), Span::raw(format!("{:<inner$}", t)), Span::styled(" │", bs)])); }
             out.push(Line::from(Span::styled(format!("╰{}╯", "─".repeat(inner + 2)), bs)));
@@ -1367,7 +1394,7 @@ fn render_block(b: &Block, app: &App, width: usize, out: &mut Vec<Line<'static>>
         }
         Block::User(t, imgs) => {
             out.push(Line::raw(""));
-            for (i, l) in t.lines().enumerate() { push_wrapped(out, vec![Span::styled(if i == 0 { "› " } else { "  " }, Style::default().fg(DIM)), Span::styled(l.to_string(), Style::default().bold())], w, 2); }
+            for (i, l) in t.lines().enumerate() { push_wrapped(out, vec![Span::styled(if i == 0 { "› " } else { "  " }, Style::default().fg(pal().dim)), Span::styled(l.to_string(), Style::default().bold())], w, 2); }
             for k in imgs { image_slot(app, k, (w.saturating_sub(4)).min(60) as u16, 12, 2, out, ph); out.push(Line::raw("")); }
             out.push(Line::raw(""));
         }
@@ -1375,22 +1402,22 @@ fn render_block(b: &Block, app: &App, width: usize, out: &mut Vec<Line<'static>>
             if *folded && !*streaming {
                 let n = text.lines().count();
                 let first = text.lines().find(|l| !l.trim().is_empty()).unwrap_or("").to_string();
-                push_wrapped(out, vec![Span::styled("⏺ ", Style::default().fg(Color::White)), Span::raw(truncate(&first, w.saturating_sub(30))), Span::styled(format!("  … +{} lines (click)", n.saturating_sub(1)), Style::default().fg(DIM).italic())], w, 2);
+                push_wrapped(out, vec![Span::styled("⏺ ", Style::default().fg(pal().fg)), Span::raw(truncate(&first, w.saturating_sub(30))), Span::styled(format!("  … +{} lines (click)", n.saturating_sub(1)), Style::default().fg(pal().dim).italic())], w, 2);
                 out.push(Line::raw(""));
                 return;
             }
             let mut first = true;
             for l in text.lines() {
-                let bullet = if first { Span::styled("⏺ ", Style::default().fg(Color::White)) } else { Span::raw("  ") };
+                let bullet = if first { Span::styled("⏺ ", Style::default().fg(pal().fg)) } else { Span::raw("  ") };
                 push_wrapped(out, vec![bullet, Span::raw(l.to_string())], w, 2);
                 first = false;
             }
-            if *streaming { if let Some(last) = out.last_mut() { last.spans.push(Span::styled("▍", Style::default().fg(ORANGE))); } }
-            if text.is_empty() && *streaming { out.push(Line::from(vec![Span::styled("⏺ ", Style::default().fg(Color::White)), Span::styled("▍", Style::default().fg(ORANGE))])); }
+            if *streaming { if let Some(last) = out.last_mut() { last.spans.push(Span::styled("▍", Style::default().fg(pal().orange))); } }
+            if text.is_empty() && *streaming { out.push(Line::from(vec![Span::styled("⏺ ", Style::default().fg(pal().fg)), Span::styled("▍", Style::default().fg(pal().orange))])); }
             out.push(Line::raw(""));
         }
         Block::Reasoning { text, streaming, show } => {
-            let st = Style::default().fg(THINK).italic();
+            let st = Style::default().fg(pal().think).italic();
             if show.unwrap_or(app.show_thinking) {
                 let mut first = true;
                 for l in text.lines().filter(|l| !l.trim().is_empty()) { push_wrapped(out, vec![Span::styled(if first { "✻ " } else { "  " }, st), Span::styled(l.to_string(), st)], w, 2); first = false; }
@@ -1399,46 +1426,48 @@ fn render_block(b: &Block, app: &App, width: usize, out: &mut Vec<Line<'static>>
                 let firstline = text.lines().find(|l| !l.trim().is_empty()).unwrap_or("").trim().to_string();
                 let n = text.chars().count();
                 let lbl = if *streaming { format!("✻ Thinking… {}", truncate(&firstline, w.saturating_sub(40))) } else { format!("✻ Thought for {} chars: {}", n, truncate(&firstline, w.saturating_sub(40))) };
-                push_wrapped(out, vec![Span::styled(lbl, st), Span::styled("  (click · ctrl+t)", Style::default().fg(DIM))], w, 2);
+                push_wrapped(out, vec![Span::styled(lbl, st), Span::styled("  (click · ctrl+t)", Style::default().fg(pal().dim))], w, 2);
             }
             out.push(Line::raw(""));
         }
         Block::Tool { id, name, args, result, secs, images, interrupted, fold } => {
             let expanded = fold.map(|f| !f).unwrap_or(app.expand_tools);
             let (bullet_style, done) = match (result, interrupted) {
-                (Some(r), _) if r.starts_with("error:") => (Style::default().fg(ERR), true),
-                (Some(_), _) => (Style::default().fg(OK), true),
-                (None, true) => (Style::default().fg(ERR), true),
-                (None, false) => (Style::default().fg(if (app.tick / 4) % 2 == 0 { ORANGE } else { DIM }), false),
+                (Some(r), _) if r.starts_with("error:") => (Style::default().fg(pal().err), true),
+                (Some(_), _) => (Style::default().fg(pal().ok), true),
+                (None, true) => (Style::default().fg(pal().err), true),
+                (None, false) => (Style::default().fg(if (app.tick / 4) % 2 == 0 { pal().orange } else { pal().dim }), false),
             };
             let summary = args_summary(name, args, w.saturating_sub(name.len() + 6));
-            push_wrapped(out, vec![Span::styled("⏺ ", bullet_style), Span::styled(name.clone(), Style::default().bold()), Span::styled(format!("({summary})"), Style::default().fg(DIM))], w, 2);
+            push_wrapped(out, vec![Span::styled("⏺ ", bullet_style), Span::styled(name.clone(), Style::default().bold()), Span::styled(format!("({summary})"), Style::default().fg(pal().dim))], w, 2);
             match result {
-                None if *interrupted => out.push(Line::from(vec![Span::styled("  ⎿  ", Style::default().fg(DIM)), Span::styled("interrupted", Style::default().fg(ERR))])),
-                None => out.push(Line::from(vec![Span::styled("  ⎿  ", Style::default().fg(DIM)), Span::styled("running…", Style::default().fg(DIM))])),
+                None if *interrupted => out.push(Line::from(vec![Span::styled("  ⎿  ", Style::default().fg(pal().dim)), Span::styled("interrupted", Style::default().fg(pal().err))])),
+                None => out.push(Line::from(vec![Span::styled("  ⎿  ", Style::default().fg(pal().dim)), Span::styled("running…", Style::default().fg(pal().dim))])),
                 Some(r) => {
                     let is_err = r.starts_with("error:");
+                    let diffish = matches!(name.as_str(), "edit_file" | "apply_patch" | "write_file") || name.ends_with("edit_file");
                     let lines: Vec<&str> = r.lines().collect();
-                    let show = if expanded { lines.len().min(60) } else { 1 };
+                    let show = if expanded { lines.len().min(60) } else if diffish && fold.is_none() { lines.len().min(12) } else { 1 };
                     for (i, l) in lines.iter().take(show).enumerate() {
                         let pre = if i == 0 { "  ⎿  " } else { "     " };
-                        let mut spans = vec![Span::styled(pre, Style::default().fg(DIM)), Span::styled(l.to_string(), Style::default().fg(if is_err { ERR } else { DIM }))];
-                        if i == show - 1 && lines.len() > show { spans.push(Span::styled(format!("  … +{} lines (click · ctrl+o)", lines.len() - show), Style::default().fg(DIM).italic())); }
+                        let lstyle = if is_err { Style::default().fg(pal().err) } else if diffish && l.starts_with("+ ") { Style::default().fg(pal().ok) } else if diffish && l.starts_with("- ") { Style::default().fg(pal().err) } else { Style::default().fg(pal().dim) };
+                        let mut spans = vec![Span::styled(pre, Style::default().fg(pal().dim)), Span::styled(l.to_string(), lstyle)];
+                        if i == show - 1 && lines.len() > show { spans.push(Span::styled(format!("  … +{} lines (click · ctrl+o)", lines.len() - show), Style::default().fg(pal().dim).italic())); }
                         push_wrapped(out, spans, w, 5);
                     }
-                    if lines.is_empty() { out.push(Line::from(vec![Span::styled("  ⎿  ", Style::default().fg(DIM)), Span::styled("(no output)", Style::default().fg(DIM))])); }
+                    if lines.is_empty() { out.push(Line::from(vec![Span::styled("  ⎿  ", Style::default().fg(pal().dim)), Span::styled("(no output)", Style::default().fg(pal().dim))])); }
                     if *images > 0 {
-                        out.push(Line::from(vec![Span::styled("     ", Style::default()), Span::styled(format!("[{} image{} shown to the model]", images, if *images == 1 { "" } else { "s" }), Style::default().fg(BLUE))]));
+                        out.push(Line::from(vec![Span::styled("     ", Style::default()), Span::styled(format!("[{} image{} shown to the model]", images, if *images == 1 { "" } else { "s" }), Style::default().fg(pal().blue))]));
                         if let Some(keys) = app.tool_previews.get(id) { for k in keys { image_slot(app, k, (w.saturating_sub(7)).min(60) as u16, 14, 5, out, ph); } }
                     }
                     let _ = (done, secs);
                 }
             }
         }
-        Block::System(t) => { push_wrapped(out, vec![Span::styled("· ", Style::default().fg(DIM)), Span::styled(t.clone(), Style::default().fg(DIM))], w, 2); }
-        Block::Memory(t) => { push_wrapped(out, vec![Span::styled("🧠 ", Style::default()), Span::styled(t.clone(), Style::default().fg(OK))], w, 3); }
-        Block::Error(t) => { for (i, l) in t.lines().enumerate() { push_wrapped(out, vec![Span::styled(if i == 0 { "✗ " } else { "  " }, Style::default().fg(ERR)), Span::styled(l.to_string(), Style::default().fg(ERR))], w, 2); } out.push(Line::raw("")); }
-        Block::Finished(t) => { push_wrapped(out, vec![Span::styled("  ✓ ", Style::default().fg(OK)), Span::styled(t.clone(), Style::default().fg(DIM))], w, 4); }
+        Block::System(t) => { push_wrapped(out, vec![Span::styled("· ", Style::default().fg(pal().dim)), Span::styled(t.clone(), Style::default().fg(pal().dim))], w, 2); }
+        Block::Memory(t) => { push_wrapped(out, vec![Span::styled("🧠 ", Style::default()), Span::styled(t.clone(), Style::default().fg(pal().ok))], w, 3); }
+        Block::Error(t) => { for (i, l) in t.lines().enumerate() { push_wrapped(out, vec![Span::styled(if i == 0 { "✗ " } else { "  " }, Style::default().fg(pal().err)), Span::styled(l.to_string(), Style::default().fg(pal().err))], w, 2); } out.push(Line::raw("")); }
+        Block::Finished(t) => { push_wrapped(out, vec![Span::styled("  ✓ ", Style::default().fg(pal().ok)), Span::styled(t.clone(), Style::default().fg(pal().dim))], w, 4); }
     }
 }
 

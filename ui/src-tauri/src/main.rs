@@ -71,7 +71,7 @@ async fn start_run(app: AppHandle, state: State<'_, RunState>, task: String, wor
             let policy = std::sync::Arc::new(harness::permissions::Policy::new(pcfg, &workdir));
             let approver: std::sync::Arc<dyn harness::permissions::Approver> = std::sync::Arc::new(harness::permissions::AutoApprover { yes: true }); // desktop UI: approvals coming in a later iteration; auto-approve
             let env = std::sync::Arc::new(harness::agent::SubAgentEnv::new(client.clone(), registry.clone(), policy.clone(), approver.clone(), sink.clone(), budget, true));
-            let ctx = ToolCtx { workdir: workdir.clone(), timeout: Duration::from_secs(cfg.agent.tool_timeout_secs), max_output: cfg.agent.max_tool_output_chars, net: cfg.net.clone(), memory: store.clone(), subagent: Some(env), redact_secrets: cfg.security.redact_secrets, hooks: cfg.hooks.clone() };
+            let ctx = ToolCtx { workdir: workdir.clone(), timeout: Duration::from_secs(cfg.agent.tool_timeout_secs), max_output: cfg.agent.max_tool_output_chars, net: cfg.net.clone(), memory: store.clone(), subagent: Some(env), redact_secrets: cfg.security.redact_secrets, hooks: cfg.hooks.clone(), todos: Default::default() };
             let agent = Agent { client: &client, registry: &registry, ctx: &ctx, max_turns: cfg.agent.max_turns, context_budget: budget, sink: sink.as_ref(), stream: true, policy: &policy, approver: approver.as_ref() };
             agent.run(&system, &task).await.map(|(t, _)| t).map_err(|e| format!("{e:#}"))
         }.await;

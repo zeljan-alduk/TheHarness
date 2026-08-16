@@ -47,8 +47,12 @@ impl Tool for WriteFile {
         let path = ctx.resolve(arg_str(&args, "path")?)?;
         let content = arg_str(&args, "content")?;
         if let Some(p) = path.parent() { tokio::fs::create_dir_all(p).await?; }
+        let existed = tokio::fs::read_to_string(&path).await.ok();
         tokio::fs::write(&path, content).await.with_context(|| format!("writing {}", path.display()))?;
-        Ok((format!("wrote {} bytes to {}", content.len(), path.display())).into())
+        match existed {
+            Some(old) => { let (a, r) = line_delta(&old, content); Ok(format!("overwrote {} ({} lines, +{a} -{r})", path.display(), content.lines().count()).into()) }
+            None => Ok(format!("created {} ({} bytes, {} lines)", path.display(), content.len(), content.lines().count()).into()),
+        }
     }
 }
 
@@ -69,9 +73,23 @@ impl Tool for EditFile {
         if n == 0 { bail!("`old` not found in {}", path.display()); }
         if n > 1 { bail!("`old` matches {n} times in {}; add context to make it unique", path.display()); }
         let out = text.replacen(old, new, 1);
-        tokio::fs::write(&path, out).await?;
-        Ok((format!("edited {}", path.display())).into())
+        tokio::fs::write(&path, &out).await?;
+        // show the change as a mini diff (the UI colors +/- lines)
+        let line_no = text[..text.find(old).unwrap_or(0)].matches('\n').count() + 1;
+        let mut d = format!("edited {} @@ line {}\n", path.display(), line_no);
+        for l in old.lines() { d.push_str(&format!("- {l}\n")); }
+        for l in new.lines() { d.push_str(&format!("+ {l}\n")); }
+        Ok(d.trim_end().to_string().into())
     }
+}
+
+/// Rough added/removed line counts between two texts (multiset difference).
+fn line_delta(old: &str, new: &str) -> (usize, usize) {
+    let mut counts: std::collections::HashMap<&str, i64> = std::collections::HashMap::new();
+    for l in old.lines() { *counts.entry(l).or_default() -= 1; }
+    for l in new.lines() { *counts.entry(l).or_default() += 1; }
+    let added: i64 = counts.values().filter(|v| **v > 0).sum(); let removed: i64 = -counts.values().filter(|v| **v < 0).sum::<i64>();
+    (added as usize, removed as usize)
 }
 
 #[async_trait]

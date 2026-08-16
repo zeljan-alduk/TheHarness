@@ -18,7 +18,21 @@ pub struct Config {
     pub hooks: crate::hooks::HooksConfig,
     #[serde(default)]
     pub security: SecurityConfig,
+    #[serde(default)]
+    pub ui: UiConfig,
 }
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct UiConfig {
+    /// macOS notification when a task longer than 20s finishes.
+    #[serde(default = "d_true")] pub notify: bool,
+    /// "dark" | "light"
+    #[serde(default = "d_theme")] pub theme: String,
+    /// Append every event to ~/.config/harness/logs/<date>/tui-<pid>.jsonl
+    #[serde(default = "d_true")] pub event_log: bool,
+}
+fn d_theme() -> String { "dark".into() }
+impl Default for UiConfig { fn default() -> Self { Self { notify: true, theme: d_theme(), event_log: true } } }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct SecurityConfig {

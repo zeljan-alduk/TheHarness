@@ -29,7 +29,7 @@ impl Tool for SpawnAgent {
         let max_turns = args.get("max_turns").and_then(|v| v.as_u64()).unwrap_or(25) as usize;
         let read_only = args.get("read_only").and_then(|v| v.as_bool()).unwrap_or(false);
         let registry = env.registry.without("spawn_agent");
-        let sub_ctx = ToolCtx { workdir: workdir.clone(), timeout: ctx.timeout, max_output: ctx.max_output, net: ctx.net.clone(), memory: ctx.memory.clone(), subagent: None, redact_secrets: ctx.redact_secrets, hooks: ctx.hooks.clone() };
+        let sub_ctx = ToolCtx { workdir: workdir.clone(), timeout: ctx.timeout, max_output: ctx.max_output, net: ctx.net.clone(), memory: ctx.memory.clone(), subagent: None, redact_secrets: ctx.redact_secrets, hooks: ctx.hooks.clone(), todos: ctx.todos.clone() };
         let mut pcfg = env.policy.cfg.clone();
         if read_only { pcfg.mode = crate::permissions::Mode::Plan; }
         let policy = crate::permissions::Policy::new(pcfg, &workdir);

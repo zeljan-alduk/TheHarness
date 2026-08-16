@@ -9,6 +9,7 @@ pub mod process;
 pub mod search;
 pub mod skill;
 pub mod subagent;
+pub mod todo;
 pub mod web;
 
 use crate::llm::ToolDef;
@@ -29,6 +30,8 @@ pub struct ToolCtx {
     pub subagent: Option<std::sync::Arc<crate::agent::SubAgentEnv>>,
     pub redact_secrets: bool,
     pub hooks: crate::hooks::HooksConfig,
+    /// Shared task list (todo tool) — the UI renders it.
+    pub todos: std::sync::Arc<std::sync::Mutex<Vec<todo::TodoItem>>>,
 }
 
 impl ToolCtx {
@@ -105,6 +108,7 @@ impl Registry {
             Arc::new(archive::ExtractArchive),
             Arc::new(subagent::SpawnAgent),
             Arc::new(process::Process),
+            Arc::new(todo::Todo),
         ];
         if net_enabled {
             tools.push(Arc::new(web::WebFetch));
@@ -186,7 +190,7 @@ mod tests {
     fn ctx() -> ToolCtx {
         let d = std::env::temp_dir().join(format!("harness-test-{}", std::process::id()));
         std::fs::create_dir_all(&d).unwrap();
-        ToolCtx { workdir: d, timeout: Duration::from_secs(5), max_output: 1000, net: crate::config::NetConfig::default(), memory: None, subagent: None, redact_secrets: true, hooks: Default::default() }
+        ToolCtx { workdir: d, timeout: Duration::from_secs(5), max_output: 1000, net: crate::config::NetConfig::default(), memory: None, subagent: None, redact_secrets: true, hooks: Default::default(), todos: Default::default() }
     }
     #[test]
     fn resolve_rejects_escape() {

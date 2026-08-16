@@ -53,3 +53,8 @@ on_prompt = []
 
 [security]
 redact_secrets = true
+
+[ui]
+notify = true          # macOS notification when a long task finishes
+theme = "dark"         # dark | light  (/theme toggles at runtime)
+event_log = true       # ~/.config/harness/logs/<date>/tui-<pid>.jsonl
