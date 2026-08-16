@@ -100,19 +100,25 @@ async fn main() -> Result<()> {
             let o = sandbox::run_shell("git rev-parse --is-inside-work-tree && git status --porcelain", &repo, Duration::from_secs(10), 4000).await?;
             if !o.success() { bail!("{} is not a git repository; run `git init` first", repo.display()); }
             if o.stdout.lines().count() > 1 { bail!("working tree is dirty; commit or stash before `harness self`:\n{}", o.stdout); }
-            let o = sandbox::run_shell(&format!("git checkout -q -b '{branch}'"), &repo, Duration::from_secs(10), 4000).await?;
-            if !o.success() { bail!("could not create branch {branch}: {}", o.stderr); }
-            eprintln!("on branch {branch} in {}", repo.display());
+            // Work in a separate git worktree so this checkout (and any human editing it) is untouched.
+            let wt = std::env::temp_dir().join("harness-proposals").join(branch.replace('/', "__"));
+            std::fs::create_dir_all(wt.parent().unwrap())?;
+            let cmd = format!("git worktree add -q -b '{branch}' '{}'", wt.display());
+            let o = sandbox::run_shell(&cmd, &repo, Duration::from_secs(30), 4000).await?;
+            if !o.success() { bail!("could not create worktree for {branch}: {}{}", o.stdout, o.stderr); }
+            eprintln!("branch {branch} → worktree {}", wt.display());
             let extra = format!(
-"SELF-IMPROVEMENT MODE. You are editing your own harness (a Rust project). You are on git branch `{branch}`.
+"SELF-IMPROVEMENT MODE. You are editing your own harness (a Rust project) in a git worktree on branch `{branch}`. The working directory IS the repo root.
 Ground rules:
-- Read README.md and the relevant src/ files before changing anything.
-- Do NOT edit src/main.rs, src/llm.rs, src/sandbox.rs or the eval runner unless the task explicitly requires it; prefer changing tools, prompts, and evals/tasks.
-- After edits: `cargo build --release` must succeed and `cargo test` must pass. Then run `./target/release/harness eval` and report the score before/after.
-- Commit your work on this branch with a message that states the change and the eval delta. Never merge into main; a human (or the arbiter) does that.");
-            let (text, _stats) = run_agent(&cfg, &client, &repo, &task, Some(&extra), cli.verbose, cli.json).await?;
+- Read README.md and the relevant src/ files (src/tools/mod.rs, an existing tool like src/tools/web.rs) before changing anything.
+- Do NOT edit src/main.rs, src/llm.rs, src/sandbox.rs, src/agent.rs or src/eval.rs unless the task explicitly requires it; prefer adding tools under src/tools/, adjusting the system prompt, and adding evals/tasks.
+- Register new tools in src/tools/mod.rs (Registry::defaults) and add unit tests.
+- After edits: `cargo build --release` must succeed and `cargo test` must pass (use timeout_secs 600 for cargo commands; the first build is slow).
+- Then run `./target/release/harness eval` (timeout_secs 1800) and report the score.
+- Commit your work on this branch with a message that states the change and the eval result. Never merge into main; a human (or the arbiter) does that. Do not touch other branches or worktrees.");
+            let (text, _stats) = run_agent(&cfg, &client, &wt, &task, Some(&extra), cli.verbose, cli.json).await?;
             if !cli.json { println!("\n{text}"); }
-            eprintln!("Review with: git log --oneline main..{branch} && git diff main..{branch}");
+            eprintln!("Review with: git log --oneline main..{branch} && git diff main..{branch}\nWorktree: {} (remove with: git worktree remove --force '{}')", wt.display(), wt.display());
         }
     }
     Ok(())
