@@ -1,0 +1,8 @@
+name = "extract_and_read_pdf"
+tags = ["archives", "pdf"]
+prompt = """The working directory contains data.zip and report.pdf. Do two things:
+1. Extract data.zip into a new directory named 'data' (use the extract_archive tool).
+2. Read data/report.pdf with the read_pdf tool and tell me what it says.
+"""
+check = "test -f \"$WORKDIR/data/report.pdf\" && test -f \"$WORKDIR/data/notes.txt\" && pdftotext \"$WORKDIR/data/report.pdf\" - | grep -q 'quick brown fox'"
+max_turns = 15
