@@ -147,7 +147,7 @@ fn render_for_summary(msgs: &[Message], max_chars: usize) -> String {
 /// After a finished turn: reflect into BRAIN/MEMORY/WORKFLOWS and consolidate if files got long.
 pub async fn reflect_after_run(client: &Client, store: &crate::memory::MemoryStore, msgs: &[Message], stats: &RunStats, sink: &dyn Sink) {
     if !store.cfg.auto_reflect || stats.tool_calls < store.cfg.reflect_min_tool_calls || stats.stop_reason != "done" { return; }
-    let aux = client.aux();
+    let aux = client.role("memory");
     match store.reflect(&aux, msgs).await {
         Ok(items) => for (file, section, text) in items { sink.emit(&Event::Memory { file, section, text }); },
         Err(e) => sink.emit(&Event::Error { message: format!("memory reflection skipped: {e:#}") }),
@@ -162,7 +162,7 @@ pub async fn goal_check(client: &Client, goal: &str, last_answer: &str, transcri
     let system = "You check whether an autonomous coding agent has met the user's success condition. Judge only from evidence in the transcript (files written, commands run and their output, tests passing). Reply with JSON only: {\"met\": true|false, \"reason\": \"<= 20 words\"}. If the evidence is missing or ambiguous, answer false — the agent will keep working.";
     let tail = crate::agent::render_tail(transcript_tail, 6000);
     let user = format!("Success condition:\n{goal}\n\nThe agent's last answer:\n{}\n\nRecent activity:\n{tail}\n\nJSON:", crate::llm::truncate_for_log(last_answer, 3000));
-    let Ok((reply, _)) = client.aux().chat(&[Message::system(system), Message::user(user)], &[]).await else { return (false, "goal check failed (model unavailable)".into()) };
+    let Ok((reply, _)) = client.role("goal").chat(&[Message::system(system), Message::user(user)], &[]).await else { return (false, "goal check failed (model unavailable)".into()) };
     let text = reply.text();
     let Some(json) = crate::memory::extract_json(&text) else { return (false, "goal check returned no JSON".into()) };
     let v: serde_json::Value = serde_json::from_str(&json).unwrap_or_default();
@@ -383,7 +383,7 @@ impl<'a> Agent<'a> {
             if last_usage.prompt_tokens.max(est_tokens) > self.context_budget {
                 let before = last_usage.prompt_tokens.max(est_tokens);
                 if self.ctx.hooks.any("pre_compact") { let _ = crate::hooks::run_event(&self.ctx.hooks, "pre_compact", "auto", serde_json::json!({"trigger": "auto", "prompt_tokens": before}), &self.ctx.workdir).await; }
-                match compact_llm_with(&self.client.aux(), msgs, 8, None, Some(self.sink)).await {
+                match compact_llm_with(&self.client.role("compaction"), msgs, 8, None, Some(self.sink)).await {
                     Ok((n, summary, mb, ma)) => {
                         stats.compactions += 1;
                         if self.ctx.hooks.any("post_compact") { let _ = crate::hooks::run_event(&self.ctx.hooks, "post_compact", "auto", serde_json::json!({"trigger": "auto", "removed": n, "prompt_tokens_before": before, "summary": crate::llm::truncate_for_log(&summary, 2000)}), &self.ctx.workdir).await; }

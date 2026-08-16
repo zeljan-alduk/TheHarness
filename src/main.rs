@@ -139,6 +139,18 @@ enum Cmd {
     },
     /// Run as an ACP agent on stdio (Zed, JetBrains, Neovim, Emacs and other Agent Client Protocol editors)
     Acp,
+    /// Best-of-n: run one task on several models in isolated worktrees and let a judge pick the winner
+    Arena {
+        #[arg(short = 'C', long)]
+        dir: Option<PathBuf>,
+        /// Contenders: "a,b,c" or "model x3" (default: the configured model, three times)
+        #[arg(long)]
+        models: Option<String>,
+        #[arg(long)]
+        max_turns: Option<usize>,
+        /// The task, in natural language
+        task: String,
+    },
     /// Serve the web UI (same UI as the desktop app) on localhost
     Serve {
         /// address to bind, e.g. 127.0.0.1:7878 (use 0.0.0.0:7878 to reach it from other devices — no auth!)
@@ -236,6 +248,16 @@ async fn main() -> Result<()> {
             let v = harness::arbiter::judge(&repo, &branch, runs.max(1), filter.as_deref(), merge, &mut log)?;
             println!("{}", serde_json::to_string(&serde_json::json!({"branch": v.branch, "green": v.green, "tests_ok": v.tests_ok, "reasons": v.reasons}))?);
             if !v.green { std::process::exit(1); }
+        }
+        Cmd::Arena { dir, models, max_turns, task } => {
+            let workdir = dir.unwrap_or(std::env::current_dir()?).canonicalize().context("workdir does not exist")?;
+            if let Some(n) = max_turns { cfg.agent.max_turns = n; }
+            let spec = models.unwrap_or_else(|| format!("{} x3", cfg.llm.model));
+            let list = harness::arena::parse_models(&spec, &cfg.llm.model);
+            let sink: std::sync::Arc<dyn events::Sink> = if cli.json { std::sync::Arc::new(events::JsonlSink) } else { std::sync::Arc::new(events::StderrSink { verbose: cli.verbose }) };
+            let r = harness::arena::run(&cfg, &workdir, &task, &list, sink, true).await?;
+            if cli.json { println!("{}", serde_json::to_string(&r)?); } else { for l in harness::arena::render(&r) { println!("{l}"); } }
+            if r.winner.is_none() { std::process::exit(1); }
         }
         Cmd::Acp => { harness::acp::serve(cfg).await?; }
         Cmd::Serve { bind } => { harness::serve::serve(cfg, &bind).await?; }

@@ -253,7 +253,7 @@ impl Policy {
             self.workdir.display());
         let user = format!("tool: {tool}\nprimary argument: {}\nfull arguments: {}\nwhy the heuristic hesitated: {reason}\n\nJSON:", crate::llm::truncate_for_log(&arg, 400), crate::llm::truncate_for_log(&args.to_string(), 1200));
         let req = vec![crate::llm::Message::system(system), crate::llm::Message::user(user)];
-        let (reply, _) = client.aux().chat(&req, &[]).await.ok()?;
+        let (reply, _) = client.role("classifier").chat(&req, &[]).await.ok()?;
         let text = reply.text();
         let v: Value = serde_json::from_str(crate::memory::extract_json(&text)?.trim()).ok()?;
         let why = v["reason"].as_str().unwrap_or("").trim().to_string();

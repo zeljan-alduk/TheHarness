@@ -226,7 +226,7 @@ async fn run_prompt(instruction: &str, input: &Value, client: Option<&crate::llm
     let system = format!(
 "You are a policy hook for an autonomous coding agent. Judge the event below against this instruction:\n\n{instruction}\n\nAnswer with JSON only: {{\"decision\": \"allow\"|\"block\"|\"ask\", \"reason\": \"<= 20 words\", \"context\": \"optional note for the agent\"}}. Use \"allow\" when the instruction does not apply. Be conservative: choose \"block\" only when the instruction clearly calls for it.");
     let user = format!("event JSON:\n{}", crate::llm::truncate_for_log(&serde_json::to_string_pretty(input).unwrap_or_default(), 4000));
-    match client.aux().chat(&[crate::llm::Message::system(system), crate::llm::Message::user(user)], &[]).await {
+    match client.role("hook").chat(&[crate::llm::Message::system(system), crate::llm::Message::user(user)], &[]).await {
         Ok((r, _)) => (0, r.text()),
         Err(e) => (1, format!("prompt hook failed: {e:#}")),
     }

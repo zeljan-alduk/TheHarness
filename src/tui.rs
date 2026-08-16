@@ -1082,7 +1082,7 @@ impl App {
                         let res: Result<(), String> = async {
                             let client = Client::new(&cfg.llm).map_err(|e| e.to_string())?;
                             let mut msgs = session.lock().await;
-                            let (n, summary, mb, ma) = harness::agent::compact_llm_with(&client.aux(), &mut msgs, 4, focus.as_deref(), Some(&sink)).await.map_err(|e| format!("{e:#}"))?;
+                            let (n, summary, mb, ma) = harness::agent::compact_llm_with(&client.role("compaction"), &mut msgs, 4, focus.as_deref(), Some(&sink)).await.map_err(|e| format!("{e:#}"))?;
                             sink.emit(&Event::Compacted { count: n, prompt_tokens: 0, summary, map_before: mb, map_after: ma });
                             Ok(())
                         }.await;
@@ -1417,6 +1417,31 @@ impl App {
                 self.save_session();
                 self.blocks.push(Block::System(format!("forked session {old} → {} — this branch is saved separately; the original is untouched (/resume {old} to go back)", self.session_meta.id)));
             }
+            "/arena" => {
+                if self.running.is_some() { self.set_status("finish or interrupt the current task first"); return; }
+                let (spec, task) = match arg.split_once("--") { Some((m, t)) => (m.trim().to_string(), t.trim().to_string()), None => (String::new(), arg.clone()) };
+                if task.is_empty() {
+                    self.blocks.push(Block::Banner(vec![
+                        "/arena <models> -- <task>   run the same task on several models in isolated worktrees, then judge".into(),
+                        "  /arena -- fix the failing test            three runs of the current model (best-of-3)".into(),
+                        "  /arena a,b -- add a --json flag           one run each on models a and b".into(),
+                        "  /arena qwen3.8-27b-mlx x3 -- <task>       three runs of one model".into(),
+                    ]));
+                    return;
+                }
+                let spec = if spec.is_empty() { format!("{} x3", self.model) } else { spec };
+                let models = harness::arena::parse_models(&spec, &self.model);
+                if models.len() < 2 { self.blocks.push(Block::Error("an arena needs at least two contenders".into())); return; }
+                self.blocks.push(Block::System(format!("arena: {} contenders ({}) — each in its own worktree; this takes a while", models.len(), models.join(", "))));
+                let (cfg, wd, tx) = (self.cfg.clone(), self.workdir.clone(), self.tx.clone());
+                tokio::spawn(async move {
+                    let sink: Arc<dyn Sink> = Arc::new(TuiSink(tx.clone()));
+                    match harness::arena::run(&cfg, &wd, &task, &models, sink, true).await {
+                        Ok(r) => { let _ = tx.send(Msg::Block(Block::Banner(harness::arena::render(&r)))); }
+                        Err(e) => { let _ = tx.send(Msg::Block(Block::Error(format!("arena: {e:#}")))); }
+                    }
+                });
+            }
             "/goal" => {
                 let a = arg.trim().to_string();
                 if a.is_empty() {
@@ -1668,7 +1693,7 @@ impl App {
             if first.trim().is_empty() { return; }
             let Ok(client) = Client::new(&cfg.llm) else { return };
             let req = vec![Message::system("Reply with a 3–6 word title for a coding session that starts with the following request. Title only, no quotes, no trailing period."), Message::user(truncate(&first, 600))];
-            if let Ok((r, _)) = client.aux().chat(&req, &[]).await { let t = r.text().lines().next().unwrap_or("").trim().trim_matches('"').to_string(); if (3..=80).contains(&t.len()) { let _ = tx.send(Msg::Title(t)); } }
+            if let Ok((r, _)) = client.role("title").chat(&req, &[]).await { let t = r.text().lines().next().unwrap_or("").trim().trim_matches('"').to_string(); if (3..=80).contains(&t.len()) { let _ = tx.send(Msg::Title(t)); } }
         });
     }
 
@@ -2095,6 +2120,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ("/vim", "toggle vim-style modal editing in the prompt"),
     ("/workflow", "run a workflow: /workflow <name> [args]  (list with /workflow)"),
     ("/queue", "queue a task instead of steering: /queue <text> · show the queue · /queue clear"),
+    ("/arena", "best-of-n: /arena [models] -- <task> runs it in parallel worktrees and judges the results"),
     ("/goal", "keep working until a condition holds: /goal <condition> · /goal off (checked by the aux model each turn)"),
     ("/next", "stop the current task and start the next queued one (ctrl+n)"),
     ("/status", "backend, context, session, permissions at a glance"),

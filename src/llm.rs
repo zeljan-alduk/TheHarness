@@ -126,6 +126,14 @@ pub struct Client {
     thinking_budget: Option<u32>,
     /// Tool-calling mode for servers/models without native function calling (see `shim`).
     shim: std::sync::Arc<std::sync::atomic::AtomicU8>,
+    /// Per-role model overrides ([llm.roles]) — aux, compaction, title, classifier, vision, subagent…
+    roles: std::sync::Arc<std::collections::HashMap<String, crate::config::RoleConfig>>,
+    /// Models to fall back to when this one is unreachable ([llm] fallback).
+    fallback: std::sync::Arc<Vec<String>>,
+    /// Which fallback is currently in use (shared, so one failure moves the whole session over).
+    fallback_at: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    /// Anthropic prompt caching (cache_control breakpoints on system + tools).
+    prompt_cache: bool,
 }
 
 /// Tool shim state: 0 = auto (native until the server complains), 1 = shim on, 2 = native only.
@@ -154,13 +162,54 @@ impl Client {
             provider,
             thinking_budget: cfg.thinking_budget,
             shim: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(match cfg.tool_shim.as_deref() { Some("on") | Some("always") | Some("true") => SHIM_ON, Some("off") | Some("never") | Some("false") => SHIM_OFF, _ => SHIM_AUTO })),
+            roles: std::sync::Arc::new(cfg.roles.clone()),
+            fallback: std::sync::Arc::new(cfg.fallback.clone()),
+            fallback_at: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            prompt_cache: cfg.prompt_cache,
         })
     }
     pub fn provider(&self) -> Provider { self.provider }
     /// True when a separate (usually smaller/faster) aux model is configured.
-    pub fn has_aux(&self) -> bool { self.aux_model.is_some() }
+    pub fn has_aux(&self) -> bool { self.aux_model.is_some() || self.roles.contains_key("aux") }
     /// Client for auxiliary calls (reflection, compaction): the configured aux model, or this one.
-    pub fn aux(&self) -> Client { match &self.aux_model { Some(m) => self.with_model(m), None => self.clone() } }
+    pub fn aux(&self) -> Client { self.role("aux") }
+
+    /// A client for one role ("aux", "compaction", "title", "classifier", "vision", "subagent", …).
+    /// Falls back to [llm.roles].aux, then llm.aux_model, then this client. A role may also point at
+    /// a different server (`{ model = …, base_url = …, api_key = … }`).
+    pub fn role(&self, role: &str) -> Client {
+        let entry = self.roles.get(role).or_else(|| if role == "aux" { None } else { self.roles.get("aux") });
+        match entry {
+            Some(crate::config::RoleConfig::Model(m)) => self.with_model(m),
+            Some(crate::config::RoleConfig::Full { model, base_url, api_key, temperature }) => {
+                let mut c = self.clone();
+                if let Some(m) = model { c.model = m.clone(); }
+                if let Some(b) = base_url {
+                    c.base_url = b.trim_end_matches('/').to_string();
+                    c.provider = if b.contains("anthropic.com") { Provider::Anthropic } else { Provider::OpenAi };
+                    c.shim = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(SHIM_AUTO));
+                }
+                if api_key.is_some() { c.api_key = api_key.clone(); }
+                if let Some(t) = temperature { c.temperature = *t; }
+                c
+            }
+            None => match &self.aux_model { Some(m) => self.with_model(m), None => self.clone() },
+        }
+    }
+
+    /// The model to use right now: the configured one, or a fallback if this session already moved on.
+    fn active_model(&self) -> String {
+        let at = self.fallback_at.load(std::sync::atomic::Ordering::Relaxed);
+        if at == 0 || self.fallback.is_empty() { return self.model.clone(); }
+        self.fallback.get(at - 1).cloned().unwrap_or_else(|| self.model.clone())
+    }
+    /// Move to the next fallback model after an unreachable server. Returns the new model, if any.
+    fn next_fallback(&self) -> Option<String> {
+        let at = self.fallback_at.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        let m = self.fallback.get(at - 1).cloned();
+        if m.is_none() { self.fallback_at.store(self.fallback.len(), std::sync::atomic::Ordering::Relaxed); }
+        m
+    }
 
     pub fn model(&self) -> &str { &self.model }
     /// Same server/settings, different model (auxiliary calls).
@@ -212,7 +261,7 @@ impl Client {
         let shimmed;
         let msgs: &[Message] = if shim { shimmed = shim_messages(messages, tools); &shimmed } else { messages };
         let mut body = json!({
-            "model": self.model,
+            "model": self.active_model(),
             "messages": msgs,
             "temperature": self.temperature,
             "max_tokens": self.max_tokens,
@@ -266,7 +315,7 @@ impl Client {
         let shimmed;
         let msgs: &[Message] = if shim { shimmed = shim_messages(messages, tools); &shimmed } else { messages };
         let mut body = json!({
-            "model": self.model,
+            "model": self.active_model(),
             "messages": msgs,
             "temperature": self.temperature,
             "max_tokens": self.max_tokens,
@@ -276,12 +325,28 @@ impl Client {
         if !tools.is_empty() && !shim { body["tools"] = json!(tools); body["tool_choice"] = json!("auto"); }
         let mut req = self.http.post(format!("{}/chat/completions", self.base_url)).json(&body);
         if let Some(k) = &self.api_key { req = req.bearer_auth(k); }
-        let resp = req.send().await.context("LLM request failed (is the server running?)")?;
+        let resp = match req.send().await {
+            Ok(r) => r,
+            Err(e) => {
+                // the server is unreachable: move the session to the next fallback model and retry once
+                if let Some(next) = self.next_fallback() {
+                    eprintln!("· model {} unreachable ({e}); falling back to {next}", self.active_model());
+                    return Box::pin(self.chat_stream(messages, tools, on_delta)).await;
+                }
+                return Err(e).context("LLM request failed (is the server running?)");
+            }
+        };
         let status = resp.status();
         if !status.is_success() {
             let text = resp.text().await.unwrap_or_default();
             if !shim && !tools.is_empty() && error_is_about_tools(&text) && self.enable_shim() {
                 return Box::pin(self.chat_stream(messages, tools, on_delta)).await;
+            }
+            if status.is_server_error() || status.as_u16() == 404 {
+                if let Some(next) = self.next_fallback() {
+                    eprintln!("· model {} returned {}; falling back to {next}", self.active_model(), status);
+                    return Box::pin(self.chat_stream(messages, tools, on_delta)).await;
+                }
             }
             bail!("LLM server returned {}: {}", status, truncate_for_log(&text, 800));
         }
@@ -378,10 +443,19 @@ impl Client {
     async fn anthropic_stream(&self, messages: &[Message], tools: &[ToolDef], on_delta: &mut impl FnMut(Delta)) -> Result<(Message, Usage)> {
         let (system, msgs) = to_anthropic_messages(messages);
         let a_tools: Vec<Value> = tools.iter().map(|t| json!({"name": t.function.name, "description": t.function.description, "input_schema": t.function.parameters})).collect();
-        let mut body = json!({"model": self.model, "max_tokens": self.max_tokens, "messages": msgs, "stream": true, "temperature": self.temperature});
+        let mut body = json!({"model": self.active_model(), "max_tokens": self.max_tokens, "messages": msgs, "stream": true, "temperature": self.temperature});
         if let Some(b) = self.thinking_budget { if b > 0 { body["thinking"] = json!({"type": "enabled", "budget_tokens": b.max(1024)}); body.as_object_mut().unwrap().remove("temperature"); if self.max_tokens <= b { body["max_tokens"] = json!(b + 4096); } } }
-        if !system.is_empty() { body["system"] = json!(system); }
-        if !a_tools.is_empty() { body["tools"] = json!(a_tools); }
+        // prompt caching: the system prompt and tool catalogue are identical across a session, so mark
+        // the end of that prefix as a cache breakpoint (Anthropic charges ~10% for cache reads)
+        let cache = self.prompt_cache;
+        if !system.is_empty() {
+            body["system"] = if cache { json!([{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}]) } else { json!(system) };
+        }
+        if !a_tools.is_empty() {
+            let mut t = a_tools.clone();
+            if cache { if let Some(last) = t.last_mut() { last["cache_control"] = json!({"type": "ephemeral"}); } }
+            body["tools"] = json!(t);
+        }
         let url = format!("{}/v1/messages", self.base_url.trim_end_matches("/v1"));
         let mut req = self.http.post(&url).header("anthropic-version", "2023-06-01").header("content-type", "application/json").json(&body);
         if let Some(k) = &self.api_key { req = req.header("x-api-key", k); } else { bail!("Anthropic provider needs an API key (llm.api_key or ANTHROPIC_API_KEY)"); }
@@ -597,6 +671,35 @@ mod tests {
         assert_eq!(out[2]["content"].as_array().unwrap().len(), 2, "consecutive tool results merge into one user turn");
         assert_eq!(out[2]["content"][1]["tool_use_id"], "t2");
     }
+    fn client_from(v: serde_json::Value) -> Client { Client::new(&serde_json::from_value(v).unwrap()).unwrap() }
+
+    #[test]
+    fn role_models_and_fallback() {
+        let c = client_from(json!({
+            "base_url": "http://127.0.0.1:1/v1", "model": "big",
+            "aux_model": "small",
+            "roles": {"compaction": "tiny", "vision": {"model": "vl", "base_url": "http://other:9/v1"}},
+            "fallback": ["backup-1", "backup-2"]
+        }));
+        assert_eq!(c.role("compaction").model(), "tiny", "explicit role wins");
+        assert_eq!(c.role("title").model(), "small", "unset role falls back to aux_model");
+        assert_eq!(c.aux().model(), "small");
+        let v = c.role("vision");
+        assert_eq!(v.model(), "vl");
+        assert!(v.base_url.starts_with("http://other:9"), "a role may point at another server");
+        assert_eq!(c.model(), "big", "the main client is untouched");
+
+        // fallbacks advance once per failure and stay switched for the session
+        assert_eq!(c.active_model(), "big");
+        assert_eq!(c.next_fallback().as_deref(), Some("backup-1"));
+        assert_eq!(c.active_model(), "backup-1");
+        assert_eq!(c.next_fallback().as_deref(), Some("backup-2"));
+        assert_eq!(c.next_fallback(), None, "exhausted");
+        let plain = client_from(json!({"base_url": "http://127.0.0.1:1/v1", "model": "only"}));
+        assert_eq!(plain.role("compaction").model(), "only", "no roles, no aux → the same client");
+        assert_eq!(plain.next_fallback(), None);
+    }
+
     #[test]
     fn shim_roundtrip() {
         let tools = vec![ToolDef::new("read_file", "Read a file", json!({"type":"object","properties":{"path":{"type":"string"}}}))];

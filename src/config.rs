@@ -141,6 +141,24 @@ pub struct LlmConfig {
     /// switch to the text protocol when the server rejects tools), "on" (always shim), "off".
     #[serde(default)]
     pub tool_shim: Option<String>,
+    /// Per-role models: aux · compaction · title · classifier · goal · vision · subagent.
+    /// `role = "model-name"`, or a table `{ model, base_url, api_key, temperature }` for another server.
+    #[serde(default)]
+    pub roles: std::collections::HashMap<String, RoleConfig>,
+    /// Models to fall back to, in order, when the configured one is unreachable or 5xx.
+    #[serde(default)]
+    pub fallback: Vec<String>,
+    /// Anthropic prompt caching: mark the system prompt + tool catalogue as cacheable.
+    #[serde(default = "d_true")]
+    pub prompt_cache: bool,
+}
+
+/// One entry of `[llm.roles]`: just a model name, or a full endpoint.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum RoleConfig {
+    Model(String),
+    Full { #[serde(default)] model: Option<String>, #[serde(default)] base_url: Option<String>, #[serde(default)] api_key: Option<String>, #[serde(default)] temperature: Option<f32> },
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

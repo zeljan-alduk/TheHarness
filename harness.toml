@@ -24,6 +24,12 @@ compact_at_fraction = 0.75
 # context_budget_tokens = 60000
 # Optional smaller model for reflection/compaction (must be loaded on the same server):
 # aux_model = "qwen/qwen3.6-35b-a3b"
+# Models to fall back to, in order, when the configured one is unreachable or 5xx:
+# fallback = ["qwen/qwen3.6-35b-a3b", "gemma-4-12b-coder"]
+# Anthropic prompt caching (cache_control on the system prompt + tool catalogue):
+prompt_cache = true
+# Tool calling for servers/models without a function-calling API: "auto" (default) | "on" | "off":
+# tool_shim = "auto"
 
 [agent]
 max_turns = 40
@@ -47,6 +53,18 @@ max_fetch_bytes = 2000000
 # download_file: parallel range segments and per-call wall-clock cap (auto-resumes on the next call)
 download_segments = 4
 download_timeout_secs = 3600
+
+# Per-role models: use a small/fast local model for the auxiliary calls and keep the big one for coding.
+# A role may be just a model name, or a table pointing at another server entirely.
+# [llm.roles]
+# aux = "qwen3.6-8b"              # default for every auxiliary role below
+# compaction = "qwen3.6-8b"       # writing the handoff note
+# title = "qwen3.6-8b"            # session titles
+# classifier = "qwen3.6-8b"       # [permissions.auto] approvals
+# goal = "qwen3.6-8b"             # /goal checks
+# memory = "qwen3.6-8b"           # reflection into BRAIN.md
+# hook = "qwen3.6-8b"             # { prompt = … } hooks
+# vision = { model = "qwen2.5-vl-7b", base_url = "http://localhost:1234/v1" }
 
 [permissions]
 # bypass | auto | ask | plan.  auto: reads free, writes inside the workdir free, risky shell commands
