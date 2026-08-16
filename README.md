@@ -52,7 +52,7 @@ src/
   agent.rs     the loop: model → tool calls → results → model; budgets; context compaction
   events.rs    structured Event stream + Sink trait (StderrSink, JsonlSink) — core never prints
   sandbox.rs   local process supervision: timeout, process-group kill, env scrub, output caps
-  tools/       bash, read_file, write_file, edit_file, list_dir, view_image, web_fetch, web_search, download_file
+  tools/       bash, read_file, write_file, edit_file, list_dir, view_image, read_pdf, extract_archive, web_fetch, web_search, download_file
   eval.rs      the fitness function: runs evals/tasks/* in fresh git-initialised workdirs
   lib.rs       exposes all of the above as the `harness` library
 evals/tasks/<name>/task.toml  (+ fixture/)  — prompt + `check` shell command (exit 0 = pass)

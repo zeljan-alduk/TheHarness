@@ -1,3 +1,4 @@
+pub mod archive;
 pub mod bash;
 pub mod download;
 pub mod fs;
@@ -77,6 +78,8 @@ impl Registry {
             Box::new(fs::EditFile),
             Box::new(fs::ListDir),
             Box::new(image::ViewImage),
+            Box::new(archive::ReadPdf),
+            Box::new(archive::ExtractArchive),
         ];
         if net_enabled {
             tools.push(Box::new(web::WebFetch));
