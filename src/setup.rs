@@ -27,6 +27,7 @@ pub const TOOLS: &[ExtTool] = &[
     ExtTool { name: "pyright",  bins: &["pyright-langserver"], purpose: "Python language server (lsp tool)",  brew: None,             cask: false, required: false, any_of: false, other_install: Some("npm install -g pyright") },
     ExtTool { name: "typescript-language-server", bins: &["typescript-language-server"], purpose: "TS/JS language server (lsp tool)", brew: None, cask: false, required: false, any_of: false, other_install: Some("npm install -g typescript-language-server typescript") },
     ExtTool { name: "gopls",    bins: &["gopls"],             purpose: "Go language server (lsp tool)",         brew: Some("gopls"),    cask: false, required: false, any_of: false, other_install: None },
+    ExtTool { name: "macmon",   bins: &["macmon"],            purpose: "CPU/GPU temperature & power in the dashboard", brew: Some("macmon"), cask: false, required: false, any_of: false, other_install: None },
     ExtTool { name: "kitty",    bins: &["kitty"],             purpose: "terminal with inline image previews",       brew: Some("kitty"),    cask: true,  required: false, any_of: false, other_install: None },
 ];
 

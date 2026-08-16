@@ -140,7 +140,7 @@ async fn clipboard_image(store: Option<harness::memory::MemoryStore>) -> Result<
 
 /// One system sample (1 Hz) from the background sampler.
 #[derive(Clone, Debug, Default)]
-struct SysSample { cpu: f32, mem_used: u64, mem_total: u64, gpu_util: Option<f32>, gpu_mem: Option<u64>, server_rss: u64, harness_rss: u64 }
+struct SysSample { cpu: f32, mem_used: u64, mem_total: u64, gpu_util: Option<f32>, gpu_mem: Option<u64>, server_rss: u64, harness_rss: u64, cpu_temp: Option<f32>, gpu_temp: Option<f32>, cpu_power: Option<f32>, gpu_power: Option<f32>, sys_power: Option<f32> }
 
 const HIST: usize = 120;
 
@@ -207,10 +207,23 @@ async fn sampler(tx: mpsc::UnboundedSender<Msg>) {
             if Some(*pid) == me { harness_rss = p.memory(); }
         }
         let (gpu_util, gpu_mem) = gpu_stats().await;
-        let s = SysSample { cpu: sys.global_cpu_usage(), mem_used: sys.used_memory(), mem_total: sys.total_memory(), gpu_util, gpu_mem, server_rss, harness_rss };
+        let (cpu_temp, gpu_temp, cpu_power, gpu_power, sys_power) = macmon_stats().await;
+        let s = SysSample { cpu: sys.global_cpu_usage(), mem_used: sys.used_memory(), mem_total: sys.total_memory(), gpu_util, gpu_mem, server_rss, harness_rss, cpu_temp, gpu_temp, cpu_power, gpu_power, sys_power };
         if tx.send(Msg::Sys(s)).is_err() { return; }
         tokio::time::sleep(Duration::from_millis(1000)).await;
     }
+}
+
+/// Temperatures and power via `macmon` (brew install macmon; reads SMC sensors without root). None if absent.
+async fn macmon_stats() -> (Option<f32>, Option<f32>, Option<f32>, Option<f32>, Option<f32>) {
+    static AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let avail = *AVAILABLE.get_or_init(|| { let p = std::env::var("PATH").unwrap_or_default(); std::env::split_paths(&p).chain([std::path::PathBuf::from("/opt/homebrew/bin"), std::path::PathBuf::from("/usr/local/bin")]).any(|d| d.join("macmon").is_file()) });
+    if !avail { return (None, None, None, None, None); }
+    let out = tokio::time::timeout(Duration::from_secs(3), tokio::process::Command::new("macmon").args(["pipe", "-s", "1", "-i", "600"]).env("PATH", format!("{}:/opt/homebrew/bin:/usr/local/bin", std::env::var("PATH").unwrap_or_default())).output()).await;
+    let Ok(Ok(o)) = out else { return (None, None, None, None, None) };
+    let Ok(v) = serde_json::from_slice::<serde_json::Value>(String::from_utf8_lossy(&o.stdout).lines().last().unwrap_or("").as_bytes()) else { return (None, None, None, None, None) };
+    let f = |x: &serde_json::Value| x.as_f64().map(|n| n as f32);
+    (f(&v["temp"]["cpu_temp_avg"]), f(&v["temp"]["gpu_temp_avg"]), f(&v["cpu_power"]), f(&v["gpu_power"]), f(&v["sys_power"]))
 }
 
 async fn gpu_stats() -> (Option<f32>, Option<u64>) {
@@ -1378,17 +1391,28 @@ fn draw_panel(f: &mut Frame, app: &App, area: Rect) {
     let sy = Layout::vertical([Constraint::Length(1), Constraint::Length(2), Constraint::Length(1), Constraint::Length(2), Constraint::Length(1), Constraint::Length(2)]).split(r_sys);
     let last = &m.last;
     let cpu = last.cpu;
-    f.render_widget(Paragraph::new(Line::from(vec![Span::styled("cpu ", dim), Span::styled(format!("{cpu:>5.1}%"), Style::default().fg(if cpu > 80.0 { pal().err } else { pal().fg })), Span::styled(format!("   harness rss {}", fmt_bytes(last.harness_rss)), dim)])), sy[0]);
+    let temp_col = |t: f32| if t >= 90.0 { pal().err } else if t >= 75.0 { pal().orange } else { pal().fg };
+    let mut cpu_line = vec![Span::styled("cpu ", dim), Span::styled(format!("{cpu:>5.1}%"), Style::default().fg(if cpu > 80.0 { pal().err } else { pal().fg }))];
+    match last.cpu_temp { Some(t) => { cpu_line.push(Span::styled(format!("  {t:.0}°C"), Style::default().fg(temp_col(t)))); if let Some(pw) = last.cpu_power { cpu_line.push(Span::styled(format!(" {pw:.1}W"), dim)); } }
+                          None => cpu_line.push(Span::styled("  (temp: brew install macmon)", dim)) }
+    cpu_line.push(Span::styled(format!("   rss {}", fmt_bytes(last.harness_rss)), dim));
+    f.render_widget(Paragraph::new(Line::from(cpu_line)), sy[0]);
     f.render_widget(Sparkline::default().data(&m.cpu.iter().cloned().collect::<Vec<_>>()).max(100).style(Style::default().fg(pal().blue)), sy[1]);
     match (last.gpu_util, last.gpu_mem) {
         (Some(g), gm) => {
-            f.render_widget(Paragraph::new(Line::from(vec![Span::styled("gpu ", dim), Span::styled(format!("{g:>5.0}%"), Style::default().fg(if g > 80.0 { pal().orange } else { pal().fg })), Span::styled(format!("   gpu mem {}", gm.map(fmt_bytes).unwrap_or_else(|| "?".into())), dim)])), sy[2]);
+            let mut gl = vec![Span::styled("gpu ", dim), Span::styled(format!("{g:>5.0}%"), Style::default().fg(if g > 80.0 { pal().orange } else { pal().fg }))];
+            if let Some(t) = last.gpu_temp { gl.push(Span::styled(format!("  {t:.0}°C"), Style::default().fg(temp_col(t)))); }
+            if let Some(pw) = last.gpu_power { gl.push(Span::styled(format!(" {pw:.1}W"), dim)); }
+            gl.push(Span::styled(format!("   gpu mem {}", gm.map(fmt_bytes).unwrap_or_else(|| "?".into())), dim));
+            f.render_widget(Paragraph::new(Line::from(gl)), sy[2]);
             f.render_widget(Sparkline::default().data(&m.gpu.iter().cloned().collect::<Vec<_>>()).max(100).style(Style::default().fg(pal().think)), sy[3]);
         }
         _ => { f.render_widget(Paragraph::new(Span::styled("gpu  n/a on this platform", dim)), sy[2]); }
     }
     let mr = if last.mem_total > 0 { last.mem_used as f64 / last.mem_total as f64 } else { 0.0 };
-    f.render_widget(Paragraph::new(Line::from(vec![Span::styled("ram ", dim), Span::raw(format!("{} / {}", fmt_bytes(last.mem_used), fmt_bytes(last.mem_total))), Span::styled(format!("   server rss {}", fmt_bytes(last.server_rss)), dim)])), sy[4]);
+    let mut rl = vec![Span::styled("ram ", dim), Span::raw(format!("{} / {}", fmt_bytes(last.mem_used), fmt_bytes(last.mem_total))), Span::styled(format!("   server rss {}", fmt_bytes(last.server_rss)), dim)];
+    if let Some(sp) = last.sys_power { rl.push(Span::styled(format!("   sys {sp:.0}W"), dim)); }
+    f.render_widget(Paragraph::new(Line::from(rl)), sy[4]);
     f.render_widget(Gauge::default().gauge_style(Style::default().fg(if mr > 0.9 { pal().err } else { pal().blue }).bg(pal().panel_bg)).ratio(mr.clamp(0.0, 1.0)).label(format!("{:.0}%", mr * 100.0)), Rect { height: 1, ..sy[5] });
 }
 
