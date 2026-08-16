@@ -1,6 +1,7 @@
 //! TheHarness core library: agent loop, tools, sandbox, LLM client, evals.
 //! The CLI (`src/main.rs`) and the Tauri UI (`ui/src-tauri`) are thin frontends over this.
 
+pub mod acp;
 pub mod agent;
 pub mod agentdefs;
 pub mod arbiter;

@@ -21,6 +21,8 @@ use std::path::{Path, PathBuf};
 pub enum Mode { Bypass, #[default] Auto, Ask, Plan }
 impl Mode {
     pub fn parse(s: &str) -> Option<Mode> { match s.trim().to_lowercase().as_str() { "bypass" | "yolo" => Some(Mode::Bypass), "auto" | "default" => Some(Mode::Auto), "ask" | "strict" => Some(Mode::Ask), "plan" | "readonly" | "read-only" => Some(Mode::Plan), _ => None } }
+    /// Stable id used in protocols (ACP session modes, settings files).
+    pub fn id(&self) -> &'static str { match self { Mode::Bypass => "bypass", Mode::Auto => "auto", Mode::Ask => "ask", Mode::Plan => "plan" } }
     pub fn label(&self) -> &'static str { match self { Mode::Bypass => "bypass permissions on", Mode::Auto => "auto permissions", Mode::Ask => "ask before changes", Mode::Plan => "plan mode (read-only)" } }
 }
 
@@ -103,6 +105,11 @@ const SHELL_TOOLS: &[&str] = &["bash", "monitor", "run_workflow"];
 
 pub struct Policy { pub cfg: PermissionsConfig, pub workdir: PathBuf, session_allow: std::sync::Mutex<Vec<String>>, mode: std::sync::Mutex<Mode>, /// parent policy (sub-agents): if the parent is in bypass, so are we
     pub parent: Option<std::sync::Arc<Policy>> }
+
+impl PermissionsConfig {
+    /// The current mode's protocol id (ACP `session/new` → modes.currentModeId).
+    pub fn mode_id(&self) -> &'static str { self.mode.id() }
+}
 
 impl Policy {
     pub fn new(cfg: PermissionsConfig, workdir: &Path) -> Self {

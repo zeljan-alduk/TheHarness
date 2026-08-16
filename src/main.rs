@@ -134,6 +134,8 @@ enum Cmd {
         #[arg(long)]
         merge: bool,
     },
+    /// Run as an ACP agent on stdio (Zed, JetBrains, Neovim, Emacs and other Agent Client Protocol editors)
+    Acp,
     /// Serve the web UI (same UI as the desktop app) on localhost
     Serve {
         /// address to bind, e.g. 127.0.0.1:7878 (use 0.0.0.0:7878 to reach it from other devices — no auth!)
@@ -232,6 +234,7 @@ async fn main() -> Result<()> {
             println!("{}", serde_json::to_string(&serde_json::json!({"branch": v.branch, "green": v.green, "tests_ok": v.tests_ok, "reasons": v.reasons}))?);
             if !v.green { std::process::exit(1); }
         }
+        Cmd::Acp => { harness::acp::serve(cfg).await?; }
         Cmd::Serve { bind } => { harness::serve::serve(cfg, &bind).await?; }
         Cmd::Improve { hint, no_install, skip_arbiter } => {
             // the loop rebuilds/installs the harness: never run it from the binary being replaced
