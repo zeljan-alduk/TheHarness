@@ -11,5 +11,6 @@ pub mod memory;
 pub mod permissions;
 pub mod plugins;
 pub mod sandbox;
+pub mod sessions;
 pub mod setup;
 pub mod tools;

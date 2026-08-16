@@ -279,6 +279,7 @@ struct App {
     think_scroll: usize,
     toolset: Option<Arc<Toolset>>,
     perm_mode: harness::permissions::Mode,
+    session_meta: harness::sessions::Meta,
     pending_ask: Option<(harness::permissions::ApprovalRequest, tokio::sync::oneshot::Sender<harness::permissions::Approval>)>,
     video: Option<VideoPicker>,
     strip_rects: Vec<(Rect, usize)>,
@@ -287,7 +288,7 @@ struct App {
     line_map: Vec<(usize, usize, usize)>, // (first line, last line exclusive, block index)
 }
 
-pub async fn run(cfg: Config) -> Result<()> {
+pub async fn run(cfg: Config, resume: Option<String>) -> Result<()> {
     let workdir = std::env::current_dir()?;
     // Detect the terminal's graphics protocol (kitty / iterm2 / sixel) and cell size; fall back to half-blocks.
     // Only query terminals known to answer — a plain pty or Terminal.app would block forever on the query.
@@ -302,11 +303,12 @@ pub async fn run(cfg: Config) -> Result<()> {
         quit: false, tick: 0, word: 0, models: vec![],
         metrics: Metrics::new(0), panel: None, attachments: vec![], tool_previews: Default::default(),
         picker, images: Default::default(), img_seq: 0,
-        think_scroll: 0, toolset: None, perm_mode: harness::permissions::Mode::Auto, pending_ask: None, video: None, strip_rects: vec![], tr_rect: Rect::default(), panel_rect: Rect::default(), tr_start: 0, line_map: vec![],
+        think_scroll: 0, toolset: None, perm_mode: harness::permissions::Mode::Auto, session_meta: harness::sessions::Meta::default(), pending_ask: None, video: None, strip_rects: vec![], tr_rect: Rect::default(), panel_rect: Rect::default(), tr_start: 0, line_map: vec![],
     };
     app.metrics.ctx_len = app.cfg.llm.context_budget_tokens.unwrap_or(0);
     app.perm_mode = app.cfg.permissions.mode;
     app.banner();
+    if let Some(r) = resume { app.resume_session(&r); }
     app.reload_toolset();
     tokio::spawn(sampler(tx.clone()));
     tokio::spawn(fetch_ctx_len(app.cfg.llm.base_url.clone(), app.cfg.llm.model.clone(), tx.clone()));
@@ -582,7 +584,15 @@ impl App {
                 lines.push("Images: ctrl+v pastes from the clipboard; typing or dragging an image path attaches it. Previews render as a color mosaic; the model sees the full image.".into());
                 self.blocks.push(Block::Banner(lines));
             }
+            "/sessions" => {
+                match harness::sessions::SessionStore::open() {
+                    Ok(store) => { let list = store.list(None); let mut lines = vec![format!("Sessions ({}) — /resume <n|id|last>   · current: {}", list.len(), if self.session_meta.id.is_empty() { "(unsaved)" } else { &self.session_meta.id })]; for (i, m) in list.iter().take(25).enumerate() { lines.push(format!("  {:>2}. {}  {:<50} {:<28} {} turns · {}", i + 1, m.id, truncate(&m.title, 50), short_path(std::path::Path::new(&m.workdir)), m.turns, harness::sessions::fmt_age(m.updated))); } self.blocks.push(Block::Banner(lines)); }
+                    Err(e) => self.blocks.push(Block::Error(e.to_string())),
+                }
+            }
+            "/resume" => { if self.running.is_some() { self.set_status("finish or interrupt the current task first"); } else { self.resume_session(&arg); } }
             "/clear" | "/new" => {
+                self.session_meta = harness::sessions::Meta::default();
                 let s = self.session.clone(); tokio::spawn(async move { s.lock().await.clear(); });
                 self.blocks.clear(); self.total_prompt = 0; self.total_completion = 0; self.last_prompt_tokens = 0; self.banner();
                 self.blocks.push(Block::System("new session".into()));
@@ -879,9 +889,58 @@ impl App {
         else { self.set_status("no queued task"); }
     }
 
+    /// Persist the transcript (called after every turn and on interrupt).
+    fn save_session(&mut self) {
+        if self.session_meta.id.is_empty() { self.session_meta.id = harness::sessions::SessionStore::new_id(); }
+        self.session_meta.workdir = self.workdir.display().to_string();
+        self.session_meta.model = self.model.clone();
+        let session = self.session.clone(); let mut meta = self.session_meta.clone(); let tx = self.tx.clone();
+        tokio::spawn(async move {
+            let msgs = session.lock().await.clone();
+            if msgs.len() < 2 { return; }
+            if let Ok(store) = harness::sessions::SessionStore::open() { if let Err(e) = store.save(&mut meta, &msgs) { let _ = tx.send(Msg::Notice(format!("session save failed: {e:#}"))); } }
+        });
+    }
+
+    fn resume_session(&mut self, which: &str) {
+        let Ok(store) = harness::sessions::SessionStore::open() else { return };
+        let id = if which == "last" || which == "latest" || which.is_empty() { match store.latest_for(&self.workdir.display().to_string()).or_else(|| store.list(None).into_iter().next()) { Some(m) => m.id, None => { self.blocks.push(Block::Error("no saved sessions".into())); return; } } }
+            else if let Ok(n) = which.parse::<usize>() { match store.list(None).get(n.saturating_sub(1)) { Some(m) => m.id.clone(), None => { self.blocks.push(Block::Error(format!("no session #{n}"))); return; } } }
+            else { which.to_string() };
+        match store.load(&id) {
+            Ok((meta, msgs)) => {
+                self.blocks.clear(); self.banner();
+                self.blocks.push(Block::System(format!("resumed session {} — {} · {} · {} turns", meta.id, meta.title, short_path(std::path::Path::new(&meta.workdir)), meta.turns)));
+                self.replay(&msgs);
+                if std::path::Path::new(&meta.workdir).is_dir() { self.workdir = PathBuf::from(&meta.workdir); let _ = std::env::set_current_dir(&self.workdir); }
+                if !meta.model.is_empty() { self.model = meta.model.clone(); }
+                self.session_meta = meta;
+                let s = self.session.clone(); tokio::spawn(async move { *s.lock().await = msgs; });
+                self.reload_toolset();
+            }
+            Err(e) => self.blocks.push(Block::Error(format!("resume: {e:#}"))),
+        }
+    }
+
+    /// Rebuild transcript blocks from saved messages.
+    fn replay(&mut self, msgs: &[Message]) {
+        for m in msgs {
+            match m.role.as_str() {
+                "user" => { let t = m.text(); if !t.starts_with("[harness]") { self.blocks.push(Block::User(t, vec![])); } }
+                "assistant" => {
+                    let t = m.text(); if !t.trim().is_empty() { self.blocks.push(Block::Assistant { text: t, streaming: false, folded: true }); }
+                    if let Some(calls) = &m.tool_calls { for c in calls { self.blocks.push(Block::Tool { id: c.id.clone(), name: c.function.name.clone(), args: c.function.arguments.clone(), result: None, secs: 0.0, images: 0, interrupted: false, fold: Some(true) }); } }
+                }
+                "tool" => { if let Some(id) = &m.tool_call_id { let t = m.text(); if let Some(Block::Tool { result, .. }) = self.blocks.iter_mut().rev().find(|b| matches!(b, Block::Tool { id: i, .. } if i == id)) { *result = Some(t); } } }
+                _ => {}
+            }
+        }
+    }
+
     fn interrupt(&mut self) {
         if let Some(h) = self.running.take() {
             h.abort();
+            self.save_session();
             for b in self.blocks.iter_mut().rev() {
                 match b {
                     Block::Tool { result: None, interrupted, .. } => { *interrupted = true; }
@@ -914,6 +973,11 @@ impl App {
             Msg::Pasted(Err(e)) => self.set_status(e),
             Msg::Done(res) => {
                 self.running = None;
+                match &res {
+                    Ok((_, stats)) => { self.session_meta.prompt_tokens += stats.prompt_tokens; self.session_meta.completion_tokens += stats.completion_tokens; }
+                    Err(_) => {}
+                }
+                self.save_session();
                 match res {
                     Ok((_, stats)) => { self.spawn_reflection(&stats); }
                     Err(e) => { if !e.contains("interrupted") { self.blocks.push(Block::Error(e)); } }
@@ -1009,6 +1073,8 @@ impl App {
 const COMMANDS: &[(&str, &str)] = &[
     ("/help", "show commands and keys"),
     ("/clear", "start a new session (forget the transcript)"),
+    ("/sessions", "list saved sessions"),
+    ("/resume", "resume a saved session: /resume <n|id|last>"),
     ("/model", "show or switch the model: /model <name>"),
     ("/cd", "change working directory"),
     ("/pwd", "print working directory"),

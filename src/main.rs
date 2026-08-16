@@ -26,6 +26,12 @@ struct Cli {
     /// Permission mode override: bypass | auto | ask | plan
     #[arg(long, global = true)]
     permissions: Option<String>,
+    /// Resume a saved session in the TUI (id, number from /sessions, or "last")
+    #[arg(short = 'r', long)]
+    resume: Option<String>,
+    /// Continue the most recent session for this directory
+    #[arg(short = 'c', long)]
+    r#continue: bool,
     /// No subcommand → interactive terminal UI
     #[command(subcommand)]
     cmd: Option<Cmd>,
@@ -89,6 +95,8 @@ enum Cmd {
         #[arg(short = 'C', long)]
         dir: Option<PathBuf>,
     },
+    /// List saved sessions
+    Sessions,
     /// List models on the configured server
     Models,
     /// Print the effective configuration
@@ -115,7 +123,12 @@ async fn main() -> Result<()> {
 
     match cli.cmd.unwrap_or(Cmd::Chat) {
         Cmd::Chat => {
-            tui::run(cfg).await?;
+            let resume = cli.resume.clone().or(if cli.r#continue { Some("last".into()) } else { None });
+            tui::run(cfg, resume).await?;
+        }
+        Cmd::Sessions => {
+            let store = harness::sessions::SessionStore::open()?;
+            for (i, m) in store.list(None).iter().take(40).enumerate() { println!("{:>2}. {}  {:<50} {:<30} {} turns · {}", i + 1, m.id, llm::truncate_for_log(&m.title, 50), m.workdir, m.turns, harness::sessions::fmt_age(m.updated)); }
         }
         Cmd::Tool { dir, name, args } => {
             let workdir = dir.unwrap_or(std::env::current_dir()?).canonicalize().context("workdir does not exist")?;
@@ -254,7 +267,15 @@ async fn run_agent(cfg: &config::Config, client: &llm::Client, workdir: &std::pa
     let ctx = tools::ToolCtx { subagent: Some(std::sync::Arc::new(agent::SubAgentEnv::new(client.clone(), registry.clone(), policy.clone(), approver.clone(), sink.clone(), budget, true))), ..ctx };
     let a = agent::Agent { client, registry, ctx: &ctx, max_turns: cfg.agent.max_turns, context_budget: budget, sink: sink.as_ref(), stream: true, policy: &policy, approver: approver.as_ref() };
     let mut msgs = Vec::new();
-    let out = a.run_turn(&mut msgs, &system, task).await?;
+    let out = a.run_turn(&mut msgs, &system, task).await;
+    // always persist the transcript (also on error) — it is the run log
+    if let Ok(store_s) = harness::sessions::SessionStore::open() {
+        let mut meta = harness::sessions::Meta { id: harness::sessions::SessionStore::new_id(), workdir: workdir.display().to_string(), model: client.model().to_string(), ..Default::default() };
+        if let Ok((_, st)) = &out { meta.prompt_tokens = st.prompt_tokens; meta.completion_tokens = st.completion_tokens; }
+        let _ = store_s.save(&mut meta, &msgs);
+        if !json { eprintln!("· session saved: {} (harness --resume {})", meta.id, meta.id); }
+    }
+    let out = out?;
     if let Some(m) = &store { agent::reflect_after_run(client, m, &msgs, &out.1, sink.as_ref()).await; }
     Ok(out)
 }
