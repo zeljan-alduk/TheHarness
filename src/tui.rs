@@ -700,6 +700,14 @@ impl App {
                 self.blocks.push(Block::Banner(lines));
             }
             "/reload" => { self.reload_toolset(); self.blocks.push(Block::System("reloading tools, MCP servers and plugins…".into())); }
+            "/compact" if self.cfg.llm.provider.as_deref() == Some("claude-code") => {
+                if self.running.is_some() { self.set_status("wait for the current turn to finish"); }
+                else if let Some(cc) = self.cc.clone() {
+                    let tx = self.tx.clone(); let focus = if arg.is_empty() { None } else { Some(arg.clone()) };
+                    self.blocks.push(Block::System("asking Claude Code to compact its context…".into()));
+                    tokio::spawn(async move { let sink = TuiSink(tx.clone()); match cc.compact(focus.as_deref(), &sink).await { Ok((pre, post)) => { let _ = tx.send(Msg::Notice(format!("Claude Code compacted: {} → {} tokens", fmt_k(pre), fmt_k(post)))); } Err(e) => { sink.emit(&Event::Error { message: format!("compact: {e:#}") }); } } });
+                } else { self.blocks.push(Block::System("no Claude session yet — nothing to compact".into())); }
+            }
             "/compact" => {
                 if self.running.is_some() { self.set_status("wait for the current turn to finish"); }
                 else {
@@ -1227,7 +1235,9 @@ impl App {
                 self.compact_progress = None;
                 let (tb, ta): (u64, u64) = (map_before.iter().map(|x| x.1).sum(), map_after.iter().map(|x| x.1).sum());
                 let pct = if tb > 0 { 100.0 - (ta as f64) * 100.0 / (tb as f64) } else { 0.0 };
-                self.blocks.push(Block::System(format!("⟲ context compacted: {count} messages → handoff note · ~{} → ~{} tokens ({}{:.0}%){}", fmt_k(tb), fmt_k(ta), if pct >= 0.0 { "−" } else { "+" }, pct.abs(), if prompt_tokens > 0 { format!(" · measured prompt was {}", fmt_k(prompt_tokens)) } else { String::new() })));
+                if count == 0 { self.blocks.push(Block::System(format!("⟲ Claude Code compacted its context · {} → {} tokens ({}{:.0}%)", fmt_k(tb), fmt_k(ta), if pct >= 0.0 { "−" } else { "+" }, pct.abs()))); }
+                else { self.blocks.push(Block::System(format!("⟲ context compacted: {count} messages → handoff note · ~{} → ~{} tokens ({}{:.0}%){}", fmt_k(tb), fmt_k(ta), if pct >= 0.0 { "−" } else { "+" }, pct.abs(), if prompt_tokens > 0 { format!(" · measured prompt was {}", fmt_k(prompt_tokens)) } else { String::new() }))); }
+                if count == 0 { self.last_prompt_tokens = ta; }
                 self.blocks.push(Block::CompactMap { before: map_before, after: map_after });
                 if !summary.is_empty() { self.blocks.push(Block::Assistant { text: format!("Handoff note (context compaction)\n{summary}"), streaming: false, folded: true }); }
             }
@@ -1713,7 +1723,7 @@ fn render_block(b: &Block, app: &App, width: usize, out: &mut Vec<Line<'static>>
             out.push(Line::raw(""));
         }
         Block::CompactMap { before, after } => {
-            let colors = |label: &str| match label { "system" => pal().blue, "handoff note" => pal().orange, "user" => pal().fg, "assistant" => pal().ok, "tool results" => pal().dim, "images" => pal().think, _ => pal().dim };
+            let colors = |label: &str| match label { "system" => pal().blue, "handoff note" | "claude context (summary)" => pal().orange, "user" => pal().fg, "assistant" => pal().ok, "tool results" => pal().dim, "images" => pal().think, "claude context" => pal().blue, _ => pal().dim };
             let tb: u64 = before.iter().map(|x| x.1).sum::<u64>().max(1);
             let barw = w.saturating_sub(24).clamp(20, 90) as u64;
             for (title, map) in [("before", before), ("after ", after)] {

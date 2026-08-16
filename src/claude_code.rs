@@ -71,6 +71,12 @@ impl ClaudeCodeSession {
         loop {
             let Some(ev) = rx.recv().await else { bail!("claude process ended unexpectedly{}", drain_stderr()) };
             match ev["type"].as_str().unwrap_or("") {
+                "system" if ev["subtype"] == "thinking_tokens" => { if let Some(n) = ev["estimated_tokens"].as_u64() { think_est = think_est.max(n); thinking_hidden = true; sink.emit(&Event::ThinkingStatus { est_tokens: n, done: false }); } }
+                "system" if ev["subtype"] == "status" => { if ev["status"] == "compacting" { sink.emit(&Event::CompactProgress { fraction: 0.15, phase: "Claude Code is compacting its context…".into() }); } else if ev["compact_result"].is_string() { sink.emit(&Event::CompactProgress { fraction: 1.0, phase: "done".into() }); } }
+                "system" if ev["subtype"] == "compact_boundary" => {
+                    let m = &ev["compact_metadata"]; let pre = m["pre_tokens"].as_u64().unwrap_or(0); let post = m["post_tokens"].as_u64().unwrap_or(0);
+                    sink.emit(&Event::Compacted { count: 0, prompt_tokens: pre, summary: String::new(), map_before: vec![("claude context".into(), pre)], map_after: vec![("claude context (summary)".into(), post)] });
+                }
                 "system" => { if ev["subtype"] == "init" { if let Some(id) = ev["session_id"].as_str() { *self.session_id.lock().await = Some(id.to_string()); } sink.emit(&Event::RunStarted { model: ev["model"].as_str().unwrap_or("claude").to_string(), workdir: ev["cwd"].as_str().unwrap_or("").to_string(), tools: ev["tools"].as_array().map(|a| a.iter().filter_map(|t| t.as_str().map(String::from)).collect()).unwrap_or_default() }); } }
                 "stream_event" => {
                     let e = &ev["event"];
@@ -114,6 +120,30 @@ impl ClaudeCodeSession {
                     sink.emit(&Event::RunFinished { stop_reason: stats.stop_reason.clone(), turns: stats.turns.max(1), tool_calls: stats.tool_calls, prompt_tokens: stats.prompt_tokens, completion_tokens: stats.completion_tokens, wall_secs: secs });
                     if !ok { bail!("claude: {}{}", ev["result"].as_str().unwrap_or("error"), drain_stderr()); }
                     return Ok((final_text, stats));
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Ask Claude Code to compact its own context (built-in /compact); progress/boundary events are emitted.
+    pub async fn compact(&self, focus: Option<&str>, sink: &dyn Sink) -> Result<(u64, u64)> {
+        let cmd = match focus { Some(f) if !f.trim().is_empty() => format!("/compact {f}"), _ => "/compact".to_string() };
+        let msg = json!({"type": "user", "message": {"role": "user", "content": [{"type": "text", "text": cmd}]}});
+        { let mut w = self.stdin.lock().await; w.write_all(format!("{}\n", msg).as_bytes()).await?; w.flush().await?; }
+        sink.emit(&Event::CompactProgress { fraction: 0.05, phase: "asking Claude Code to compact…".into() });
+        let start = std::time::Instant::now();
+        let mut rx = self.events.lock().await;
+        let (mut pre, mut post) = (0u64, 0u64);
+        loop {
+            let ev = match tokio::time::timeout(std::time::Duration::from_secs(300), rx.recv()).await { Ok(Some(e)) => e, Ok(None) => bail!("claude process ended"), Err(_) => bail!("compaction timed out") };
+            match (ev["type"].as_str().unwrap_or(""), ev["subtype"].as_str().unwrap_or("")) {
+                ("system", "status") => { if ev["status"] == "compacting" { let f = 0.15 + 0.7 * (1.0 - (-(start.elapsed().as_secs_f64()) / 20.0).exp()); sink.emit(&Event::CompactProgress { fraction: f, phase: format!("Claude Code is compacting… {}s", start.elapsed().as_secs()) }); } }
+                ("system", "compact_boundary") => { let m = &ev["compact_metadata"]; pre = m["pre_tokens"].as_u64().unwrap_or(0); post = m["post_tokens"].as_u64().unwrap_or(0); }
+                ("result", _) => {
+                    sink.emit(&Event::CompactProgress { fraction: 1.0, phase: "done".into() });
+                    if pre > 0 { sink.emit(&Event::Compacted { count: 0, prompt_tokens: pre, summary: String::new(), map_before: vec![("claude context".into(), pre)], map_after: vec![("claude context (summary)".into(), post)] }); }
+                    return Ok((pre, post));
                 }
                 _ => {}
             }
