@@ -86,20 +86,22 @@ pub async fn run_task(cfg: &Config, client: &Client, task_dir: &Path, spec: &Tas
     }.await;
     if let Err(e) = prep { result.error = Some(format!("prep: {e:#}")); return result; }
 
-    let ctx = ToolCtx {
+    let mut ctx = ToolCtx {
         workdir: workdir.canonicalize().unwrap_or(workdir.clone()),
         timeout: Duration::from_secs(cfg.agent.tool_timeout_secs),
         max_output: cfg.agent.max_tool_output_chars,
         net: cfg.net.clone(),
         // evals get a throwaway memory store so the fitness function never depends on (or pollutes) the user's memory
         memory: crate::memory::MemoryStore::scratch(&workdir.join(".harness-memory"), &cfg.memory).ok(),
+        subagent: None,
     };
     let registry = Registry::defaults(cfg.net.enabled);
-    let sink = crate::events::StderrSink { verbose };
+    let sink: std::sync::Arc<dyn crate::events::Sink> = std::sync::Arc::new(crate::events::StderrSink { verbose });
     let budget = cfg.llm.effective_budget(crate::llm::detect_context_length(&cfg.llm.base_url, &cfg.llm.model).await.map(|d| d.0));
-    let policy = crate::permissions::Policy::new(crate::permissions::PermissionsConfig { mode: crate::permissions::Mode::Bypass, ..Default::default() }, &ctx.workdir);
-    let approver = crate::permissions::AutoApprover { yes: true };
-    let agent = Agent { client, registry: &registry, ctx: &ctx, max_turns: spec.max_turns.unwrap_or(cfg.agent.max_turns), context_budget: budget, sink: &sink, stream: true, policy: &policy, approver: &approver };
+    let policy = std::sync::Arc::new(crate::permissions::Policy::new(crate::permissions::PermissionsConfig { mode: crate::permissions::Mode::Bypass, ..Default::default() }, &ctx.workdir));
+    let approver: std::sync::Arc<dyn crate::permissions::Approver> = std::sync::Arc::new(crate::permissions::AutoApprover { yes: true });
+    ctx.subagent = Some(std::sync::Arc::new(crate::agent::SubAgentEnv::new(client.clone(), registry.clone(), policy.clone(), approver.clone(), sink.clone(), budget, true)));
+    let agent = Agent { client, registry: &registry, ctx: &ctx, max_turns: spec.max_turns.unwrap_or(cfg.agent.max_turns), context_budget: budget, sink: sink.as_ref(), stream: true, policy: &policy, approver: approver.as_ref() };
     let system = crate::agent::system_prompt(&ctx.workdir.display().to_string(), &registry.names(), None);
     let timeout = Duration::from_secs(spec.timeout_secs.unwrap_or(cfg.eval.task_timeout_secs));
 

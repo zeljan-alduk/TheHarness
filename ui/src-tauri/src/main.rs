@@ -63,15 +63,16 @@ async fn start_run(app: AppHandle, state: State<'_, RunState>, task: String, wor
             let client = Client::new(&cfg.llm).map_err(|e| e.to_string())?;
             let store = if cfg.memory.enabled { harness::memory::MemoryStore::open(&cfg.memory).ok() } else { None };
             if let Some(m) = &store { let _ = m.touch_project(&workdir); }
-            let ctx = ToolCtx { workdir: workdir.clone(), timeout: Duration::from_secs(cfg.agent.tool_timeout_secs), max_output: cfg.agent.max_tool_output_chars, net: cfg.net.clone(), memory: store.clone() };
             let registry = Registry::defaults(cfg.net.enabled);
             let system = harness::agent::system_prompt_with_memory(&workdir.display().to_string(), &registry.names(), None, store.as_ref());
-            let sink = TauriSink { app: app2.clone() };
+            let sink: std::sync::Arc<dyn Sink> = std::sync::Arc::new(TauriSink { app: app2.clone() });
             let budget = cfg.llm.effective_budget(harness::llm::detect_context_length(&cfg.llm.base_url, &cfg.llm.model).await.map(|d| d.0));
             let mut pcfg = cfg.permissions.clone(); pcfg.allow.extend(harness::permissions::persisted_rules());
-            let policy = harness::permissions::Policy::new(pcfg, &workdir);
-            let approver = harness::permissions::AutoApprover { yes: true }; // desktop UI: approvals coming in a later iteration; auto-approve
-            let agent = Agent { client: &client, registry: &registry, ctx: &ctx, max_turns: cfg.agent.max_turns, context_budget: budget, sink: &sink, stream: true, policy: &policy, approver: &approver };
+            let policy = std::sync::Arc::new(harness::permissions::Policy::new(pcfg, &workdir));
+            let approver: std::sync::Arc<dyn harness::permissions::Approver> = std::sync::Arc::new(harness::permissions::AutoApprover { yes: true }); // desktop UI: approvals coming in a later iteration; auto-approve
+            let env = std::sync::Arc::new(harness::agent::SubAgentEnv::new(client.clone(), registry.clone(), policy.clone(), approver.clone(), sink.clone(), budget, true));
+            let ctx = ToolCtx { workdir: workdir.clone(), timeout: Duration::from_secs(cfg.agent.tool_timeout_secs), max_output: cfg.agent.max_tool_output_chars, net: cfg.net.clone(), memory: store.clone(), subagent: Some(env) };
+            let agent = Agent { client: &client, registry: &registry, ctx: &ctx, max_turns: cfg.agent.max_turns, context_budget: budget, sink: sink.as_ref(), stream: true, policy: &policy, approver: approver.as_ref() };
             agent.run(&system, &task).await.map(|(t, _)| t).map_err(|e| format!("{e:#}"))
         }.await;
         let payload = match result {

@@ -831,14 +831,15 @@ impl App {
             let res: Result<(String, harness::agent::RunStats), String> = async {
                 let client = Client::new(&cfg.llm).map_err(|e| e.to_string())?;
                 let store = if cfg.memory.enabled { harness::memory::MemoryStore::open(&cfg.memory).ok() } else { None };
-                let ctx = ToolCtx { workdir: workdir.clone(), timeout: Duration::from_secs(cfg.agent.tool_timeout_secs), max_output: cfg.agent.max_tool_output_chars, net: cfg.net.clone(), memory: store.clone() };
                 let fallback = Registry::defaults(cfg.net.enabled);
                 let (registry, extra_prompt): (&Registry, String) = match &toolset { Some(ts) => (&ts.registry, ts.prompt_extra.clone()), None => (&fallback, String::new()) };
-                let sink = TuiSink(tx.clone());
+                let sink: Arc<dyn Sink> = Arc::new(TuiSink(tx.clone()));
                 let mut pcfg = cfg.permissions.clone(); pcfg.mode = perm_mode; pcfg.allow.extend(harness::permissions::persisted_rules());
-                let policy = harness::permissions::Policy::new(pcfg, &workdir);
-                let approver = TuiApprover(tx.clone());
-                let agent = Agent { client: &client, registry, ctx: &ctx, max_turns: cfg.agent.max_turns, context_budget: budget, sink: &sink, stream: true, policy: &policy, approver: &approver };
+                let policy = Arc::new(harness::permissions::Policy::new(pcfg, &workdir));
+                let approver: Arc<dyn harness::permissions::Approver> = Arc::new(TuiApprover(tx.clone()));
+                let env = Arc::new(harness::agent::SubAgentEnv::new(client.clone(), registry.clone(), policy.clone(), approver.clone(), sink.clone(), budget, true));
+                let ctx = ToolCtx { workdir: workdir.clone(), timeout: Duration::from_secs(cfg.agent.tool_timeout_secs), max_output: cfg.agent.max_tool_output_chars, net: cfg.net.clone(), memory: store.clone(), subagent: Some(env) };
+                let agent = Agent { client: &client, registry, ctx: &ctx, max_turns: cfg.agent.max_turns, context_budget: budget, sink: sink.as_ref(), stream: true, policy: &policy, approver: approver.as_ref() };
                 let extra = format!("You are in an interactive session: the user can see everything and will reply; keep final answers concise.{extra_prompt}");
                 let system = harness::agent::system_prompt_with_memory(&workdir.display().to_string(), &registry.names(), Some(&extra), store.as_ref());
                 let mut msgs = session.lock().await;

@@ -134,6 +134,39 @@ Rules:
     s
 }
 
+/// Shared, owned environment that lets a tool (spawn_agent) start nested agents.
+pub struct SubAgentEnv {
+    pub client: Client,
+    pub registry: crate::tools::Registry,
+    pub policy: std::sync::Arc<crate::permissions::Policy>,
+    pub approver: std::sync::Arc<dyn crate::permissions::Approver>,
+    pub sink: std::sync::Arc<dyn Sink>,
+    pub context_budget: u64,
+    pub stream: bool,
+    counter: std::sync::atomic::AtomicUsize,
+}
+impl SubAgentEnv {
+    pub fn new(client: Client, registry: crate::tools::Registry, policy: std::sync::Arc<crate::permissions::Policy>, approver: std::sync::Arc<dyn crate::permissions::Approver>, sink: std::sync::Arc<dyn Sink>, context_budget: u64, stream: bool) -> Self {
+        Self { client, registry, policy, approver, sink, context_budget, stream, counter: std::sync::atomic::AtomicUsize::new(0) }
+    }
+    pub fn next_label(&self) -> String { format!("{}", self.counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1) }
+}
+
+/// Forwards a sub-agent's events to the parent sink with tool names prefixed (e.g. "↳1 bash").
+pub struct PrefixSink { pub inner: std::sync::Arc<dyn Sink>, pub prefix: String }
+impl Sink for PrefixSink {
+    fn emit(&self, e: &Event) {
+        match e {
+            Event::ToolCall { id, name, args } => self.inner.emit(&Event::ToolCall { id: format!("{}{id}", self.prefix), name: format!("{}{name}", self.prefix), args: args.clone() }),
+            Event::ToolResult { id, name, result, secs, images } => self.inner.emit(&Event::ToolResult { id: format!("{}{id}", self.prefix), name: format!("{}{name}", self.prefix), result: result.clone(), secs: *secs, images: images.clone() }),
+            Event::Assistant { text } => self.inner.emit(&Event::ToolResult { id: format!("{}final", self.prefix), name: format!("{}report", self.prefix), result: text.clone(), secs: 0.0, images: vec![] }),
+            Event::Error { message } => self.inner.emit(&Event::Error { message: format!("{}{message}", self.prefix) }),
+            Event::Permission { .. } | Event::Memory { .. } | Event::ModelResponse { .. } => self.inner.emit(e),
+            _ => {} // reasoning/deltas/turns of sub-agents stay quiet
+        }
+    }
+}
+
 /// If a run was interrupted after the model asked for tools but before results were appended,
 /// the transcript is invalid for the next request. Patch it with stub results.
 pub fn repair_dangling(msgs: &mut Vec<Message>) {
@@ -275,7 +308,7 @@ impl<'a> Agent<'a> {
             // loop detection: identical call repeated back-to-back
             let sig: Vec<String> = calls.iter().map(|c| format!("{}:{}", c.function.name, c.function.arguments)).collect();
             if sig == last_sig { repeats += 1; } else { repeats = 0; last_sig = sig; }
-            let all_read_only = calls.iter().all(|c| self.registry.is_read_only(&c.function.name));
+            let all_read_only = calls.iter().all(|c| self.registry.is_parallel_safe(&c.function.name));
             let mut prepared: Vec<(String, String, String)> = Vec::new(); // (id, name, args)
             for call in &calls {
                 stats.tool_calls += 1;

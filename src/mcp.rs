@@ -170,8 +170,8 @@ impl crate::tools::Tool for McpTool {
 }
 
 /// Start all discovered servers; return the tools (and any startup errors, as strings).
-pub async fn start_all(workdir: &Path, extra_files: &[PathBuf]) -> (Vec<Box<dyn crate::tools::Tool>>, Vec<String>, Vec<Arc<Mutex<McpServer>>>) {
-    let mut tools: Vec<Box<dyn crate::tools::Tool>> = Vec::new();
+pub async fn start_all(workdir: &Path, extra_files: &[PathBuf]) -> (Vec<Arc<dyn crate::tools::Tool>>, Vec<String>, Vec<Arc<Mutex<McpServer>>>) {
+    let mut tools: Vec<Arc<dyn crate::tools::Tool>> = Vec::new();
     let mut errors = Vec::new();
     let mut servers = Vec::new();
     for (name, cfg, _file) in discover(workdir, extra_files) {
@@ -182,7 +182,7 @@ pub async fn start_all(workdir: &Path, extra_files: &[PathBuf]) -> (Vec<Box<dyn 
                 for info in infos {
                     let full = format!("mcp__{}__{}", sanitize(&name), sanitize(&info.name));
                     let desc = format!("[MCP {name}] {}", info.description);
-                    tools.push(Box::new(McpTool { server: shared.clone(), server_name: name.clone(), full_name: full, description: desc, info }));
+                    tools.push(Arc::new(McpTool { server: shared.clone(), server_name: name.clone(), full_name: full, description: desc, info }));
                 }
                 servers.push(shared);
             }

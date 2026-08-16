@@ -4,7 +4,10 @@ pub mod download;
 pub mod fs;
 pub mod image;
 pub mod memory;
+pub mod patch;
+pub mod search;
 pub mod skill;
+pub mod subagent;
 pub mod web;
 
 use crate::llm::ToolDef;
@@ -21,6 +24,8 @@ pub struct ToolCtx {
     pub net: crate::config::NetConfig,
     /// Persistent memory store (None = memory tool disabled, e.g. in evals).
     pub memory: Option<crate::memory::MemoryStore>,
+    /// Environment for spawning sub-agents (None = spawn_agent unavailable / nested).
+    pub subagent: Option<std::sync::Arc<crate::agent::SubAgentEnv>>,
 }
 
 impl ToolCtx {
@@ -68,37 +73,48 @@ pub trait Tool: Send + Sync {
     fn parameters(&self) -> Value;
     /// True if the tool never mutates state; read-only calls in one turn are executed in parallel.
     fn read_only(&self) -> bool { false }
+    /// True if several calls in one turn may run concurrently (default: read-only tools only).
+    fn parallel_safe(&self) -> bool { self.read_only() }
     async fn call(&self, args: Value, ctx: &ToolCtx) -> Result<ToolOutput>;
 }
 
+#[derive(Clone)]
 pub struct Registry {
-    tools: Vec<Box<dyn Tool>>,
+    tools: Vec<std::sync::Arc<dyn Tool>>,
 }
 
 impl Registry {
     pub fn defaults(net_enabled: bool) -> Self {
-        let mut tools: Vec<Box<dyn Tool>> = vec![
-            Box::new(bash::Bash),
-            Box::new(fs::ReadFile),
-            Box::new(fs::WriteFile),
-            Box::new(fs::EditFile),
-            Box::new(fs::ListDir),
-            Box::new(image::ViewImage),
-            Box::new(memory::MemoryTool),
-            Box::new(skill::LoadSkill),
-            Box::new(archive::ReadPdf),
-            Box::new(archive::ExtractArchive),
+        use std::sync::Arc;
+        let mut tools: Vec<Arc<dyn Tool>> = vec![
+            Arc::new(bash::Bash),
+            Arc::new(fs::ReadFile),
+            Arc::new(fs::WriteFile),
+            Arc::new(fs::EditFile),
+            Arc::new(patch::ApplyPatch),
+            Arc::new(fs::ListDir),
+            Arc::new(search::Grep),
+            Arc::new(search::Glob),
+            Arc::new(image::ViewImage),
+            Arc::new(memory::MemoryTool),
+            Arc::new(skill::LoadSkill),
+            Arc::new(archive::ReadPdf),
+            Arc::new(archive::ExtractArchive),
+            Arc::new(subagent::SpawnAgent),
         ];
         if net_enabled {
-            tools.push(Box::new(web::WebFetch));
-            tools.push(Box::new(web::WebSearch));
-            tools.push(Box::new(download::DownloadFile));
+            tools.push(Arc::new(web::WebFetch));
+            tools.push(Arc::new(web::WebSearch));
+            tools.push(Arc::new(download::DownloadFile));
         }
         Self { tools }
     }
+    /// A copy without the named tool (used for sub-agents).
+    pub fn without(&self, name: &str) -> Registry { Registry { tools: self.tools.iter().filter(|t| t.name() != name).cloned().collect() } }
+    pub fn is_parallel_safe(&self, name: &str) -> bool { self.tools.iter().find(|t| t.name() == name).map(|t| t.parallel_safe()).unwrap_or(false) }
 
     /// Add tools at runtime (MCP servers, plugins).
-    pub fn extend(&mut self, extra: Vec<Box<dyn Tool>>) { self.tools.extend(extra); }
+    pub fn extend(&mut self, extra: Vec<std::sync::Arc<dyn Tool>>) { self.tools.extend(extra); }
     pub fn len(&self) -> usize { self.tools.len() }
     pub fn is_empty(&self) -> bool { self.tools.is_empty() }
 
@@ -162,7 +178,7 @@ mod tests {
     fn ctx() -> ToolCtx {
         let d = std::env::temp_dir().join(format!("harness-test-{}", std::process::id()));
         std::fs::create_dir_all(&d).unwrap();
-        ToolCtx { workdir: d, timeout: Duration::from_secs(5), max_output: 1000, net: crate::config::NetConfig::default(), memory: None }
+        ToolCtx { workdir: d, timeout: Duration::from_secs(5), max_output: 1000, net: crate::config::NetConfig::default(), memory: None, subagent: None }
     }
     #[test]
     fn resolve_rejects_escape() {

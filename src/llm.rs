@@ -110,6 +110,7 @@ pub struct Usage {
     pub total_tokens: u64,
 }
 
+#[derive(Clone)]
 pub struct Client {
     http: reqwest::Client,
     base_url: String,

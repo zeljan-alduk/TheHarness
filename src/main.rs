@@ -120,7 +120,7 @@ async fn main() -> Result<()> {
         Cmd::Tool { dir, name, args } => {
             let workdir = dir.unwrap_or(std::env::current_dir()?).canonicalize().context("workdir does not exist")?;
             let store = if cfg.memory.enabled { harness::memory::MemoryStore::open(&cfg.memory).ok() } else { None };
-            let ctx = tools::ToolCtx { workdir: workdir.clone(), timeout: Duration::from_secs(cfg.agent.tool_timeout_secs), max_output: cfg.agent.max_tool_output_chars, net: cfg.net.clone(), memory: store };
+            let ctx = tools::ToolCtx { workdir: workdir.clone(), timeout: Duration::from_secs(cfg.agent.tool_timeout_secs), max_output: cfg.agent.max_tool_output_chars, net: cfg.net.clone(), memory: store, subagent: None };
             let ts = tools::build_toolset(cfg.net.enabled, &workdir, name.starts_with("mcp__")).await;
             let out = ts.registry.call(&name, args.as_deref().unwrap_or("{}"), &ctx).await;
             println!("{}", out.text);
@@ -226,13 +226,14 @@ Ground rules:
 }
 
 async fn run_agent(cfg: &config::Config, client: &llm::Client, workdir: &std::path::Path, task: &str, extra: Option<&str>, verbose: bool, json: bool, yes: bool) -> Result<(String, agent::RunStats)> {
-    let sink: Box<dyn events::Sink> = if json { Box::new(events::JsonlSink) } else { Box::new(events::StderrSink { verbose }) };
+    let sink: std::sync::Arc<dyn events::Sink> = if json { std::sync::Arc::new(events::JsonlSink) } else { std::sync::Arc::new(events::StderrSink { verbose }) };
     let ctx = tools::ToolCtx {
         workdir: workdir.to_path_buf(),
         timeout: Duration::from_secs(cfg.agent.tool_timeout_secs),
         max_output: cfg.agent.max_tool_output_chars,
         net: cfg.net.clone(),
         memory: None,
+        subagent: None,
     };
     let store = if cfg.memory.enabled { harness::memory::MemoryStore::open(&cfg.memory).ok() } else { None };
     if let Some(m) = &store { let _ = m.touch_project(workdir); }
@@ -247,10 +248,11 @@ async fn run_agent(cfg: &config::Config, client: &llm::Client, workdir: &std::pa
     if let Some((n, src)) = detected { eprintln!("· context {} tokens ({src}) · auto-compact at {}", n, budget); } else { eprintln!("· context length unknown · auto-compact at {budget}"); }
     let mut pcfg = cfg.permissions.clone();
     pcfg.allow.extend(harness::permissions::persisted_rules());
-    let policy = harness::permissions::Policy::new(pcfg, workdir);
-    let approver = harness::permissions::AutoApprover { yes };
+    let policy = std::sync::Arc::new(harness::permissions::Policy::new(pcfg, workdir));
+    let approver: std::sync::Arc<dyn harness::permissions::Approver> = std::sync::Arc::new(harness::permissions::AutoApprover { yes });
     if !yes && policy.mode() != harness::permissions::Mode::Bypass { eprintln!("· permissions: {} (non-interactive: prompts are denied; pass -y to approve, or --permissions bypass)", policy.mode().label()); }
-    let a = agent::Agent { client, registry, ctx: &ctx, max_turns: cfg.agent.max_turns, context_budget: budget, sink: sink.as_ref(), stream: true, policy: &policy, approver: &approver };
+    let ctx = tools::ToolCtx { subagent: Some(std::sync::Arc::new(agent::SubAgentEnv::new(client.clone(), registry.clone(), policy.clone(), approver.clone(), sink.clone(), budget, true))), ..ctx };
+    let a = agent::Agent { client, registry, ctx: &ctx, max_turns: cfg.agent.max_turns, context_budget: budget, sink: sink.as_ref(), stream: true, policy: &policy, approver: approver.as_ref() };
     let mut msgs = Vec::new();
     let out = a.run_turn(&mut msgs, &system, task).await?;
     if let Some(m) = &store { agent::reflect_after_run(client, m, &msgs, &out.1, sink.as_ref()).await; }
