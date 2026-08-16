@@ -16,8 +16,11 @@ pub enum Event {
     ToolCall { id: String, name: String, args: String },
     /// `images` are data: URLs (only for tools that return images, e.g. view_image).
     ToolResult { id: String, name: String, result: String, secs: f64, images: Vec<String> },
+    /// Compaction in progress: fraction 0..1 and a short phase label.
+    CompactProgress { fraction: f64, phase: String },
     /// Context was compacted. `summary` is the handoff summary that replaced older messages ("" for the cheap fallback).
-    Compacted { count: usize, prompt_tokens: u64, summary: String },
+    /// `map_before` / `map_after`: context composition as (label, est. tokens) segments.
+    Compacted { count: usize, prompt_tokens: u64, summary: String, map_before: Vec<(String, u64)>, map_after: Vec<(String, u64)> },
     /// One model call finished: exact token counts and timing (ttft = time to first streamed token).
     ModelResponse { prompt_tokens: u64, completion_tokens: u64, ttft_secs: f64, secs: f64, tool_calls: usize },
     RunFinished { stop_reason: String, turns: usize, tool_calls: usize, prompt_tokens: u64, completion_tokens: u64, wall_secs: f64 },
@@ -49,7 +52,8 @@ impl Sink for StderrSink {
             Event::Assistant { text } => if self.verbose { eprintln!("🗣 {}", t(text.trim(), 800)) },
             Event::ToolCall { name, args, .. } => eprintln!("▶ {name} {}", t(&args.replace('\n', "\\n"), 300)),
             Event::ToolResult { name, result, secs, .. } => if self.verbose { eprintln!("◀ {name} ({secs:.1}s) {}", t(&result.replace('\n', "⏎"), 300)) },
-            Event::Compacted { count, prompt_tokens, summary } => eprintln!("⟲ compacted {count} messages (prompt was {prompt_tokens} tokens){}", if summary.is_empty() { String::new() } else { format!(" — summary {} chars", summary.chars().count()) }),
+            Event::CompactProgress { .. } => {}
+            Event::Compacted { count, prompt_tokens, summary, map_before, map_after } => eprintln!("⟲ compacted {count} messages (prompt was {prompt_tokens} tokens){} · ~{} → ~{} tokens", if summary.is_empty() { String::new() } else { format!(" — summary {} chars", summary.chars().count()) }, map_before.iter().map(|x| x.1).sum::<u64>(), map_after.iter().map(|x| x.1).sum::<u64>()),
             Event::RunFinished { stop_reason, turns, tool_calls, prompt_tokens, completion_tokens, wall_secs } =>
                 eprintln!("— {turns} turns, {tool_calls} tool calls, {prompt_tokens}+{completion_tokens} tokens, {wall_secs:.0}s, stop={stop_reason}"),
             Event::Error { message } => eprintln!("✖ {message}"),

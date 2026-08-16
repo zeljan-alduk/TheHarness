@@ -33,8 +33,34 @@ pub struct Agent<'a> {
 /// Precise LLM compaction: summarize everything but the last `keep_last` messages into a dense,
 /// exact handoff note (paths, commands, results, decisions, next steps) and replace them with it.
 /// Returns (messages removed, summary). Falls back to Err if the model call fails.
+/// Context composition as (label, estimated tokens ≈ chars/4) — for the before/after map.
+pub fn context_map(msgs: &[Message]) -> Vec<(String, u64)> {
+    let (mut sys, mut user, mut asst, mut tool, mut img, mut note) = (0u64, 0u64, 0u64, 0u64, 0u64, 0u64);
+    for m in msgs {
+        let t = m.text(); let n = (t.chars().count() as u64) / 4;
+        match m.role.as_str() {
+            "system" => sys += n,
+            "user" => { if t.starts_with("[Context compacted") { note += n } else { user += n } if let Some(Content::Parts(p)) = &m.content { img += p.iter().filter(|x| x["type"] == "image_url").count() as u64 * 1200; } }
+            "assistant" => { asst += n; if let Some(c) = &m.tool_calls { asst += c.iter().map(|c| c.function.arguments.chars().count() as u64 / 4).sum::<u64>(); } }
+            "tool" => tool += n,
+            _ => {}
+        }
+    }
+    let mut v = vec![("system".to_string(), sys), ("handoff note".to_string(), note), ("user".to_string(), user), ("assistant".to_string(), asst), ("tool results".to_string(), tool), ("images".to_string(), img)];
+    v.retain(|x| x.1 > 0);
+    v
+}
+
 pub async fn compact_llm(client: &Client, msgs: &mut Vec<Message>, keep_last: usize, focus: Option<&str>) -> Result<(usize, String)> {
+    compact_llm_with(client, msgs, keep_last, focus, None).await.map(|(n, s, _, _)| (n, s))
+}
+
+/// Compaction with progress + maps. Returns (removed, summary, map_before, map_after).
+pub async fn compact_llm_with(client: &Client, msgs: &mut Vec<Message>, keep_last: usize, focus: Option<&str>, sink: Option<&dyn Sink>) -> Result<(usize, String, Vec<(String, u64)>, Vec<(String, u64)>)> {
     if msgs.len() < 6 { bail!("nothing to compact"); }
+    let map_before = context_map(msgs);
+    let prog = |f: f64, phase: &str| { if let Some(s) = sink { s.emit(&Event::CompactProgress { fraction: f, phase: phase.to_string() }); } };
+    prog(0.02, "selecting messages to keep");
     // choose the cut so the kept tail starts at a user message (never splits tool_calls from results)
     let mut cut = msgs.len().saturating_sub(keep_last).max(1);
     while cut > 1 && msgs[cut].role != "user" { cut -= 1; }
@@ -56,18 +82,23 @@ Max ~900 words. Output only the note.";
     if let Some(f) = focus { user.push_str(&format!("
 
 Focus especially on: {f}")); }
-    let (reply, _) = client.chat(&[Message::system(system), Message::user(user)], &[]).await?;
+    prog(0.08, &format!("summarizing {} messages (~{} tokens)", old.len(), transcript.chars().count() / 4));
+    // stream the note so progress is real: expected length ≈ 900 words ≈ 5500 chars
+    let mut got = 0usize;
+    let expected = 5500.0f64;
+    let (reply, _) = client.chat_stream(&[Message::system(system), Message::user(user)], &[], |d| {
+        if let Delta::Content(t) = d { got += t.chars().count(); let f = 0.08 + 0.9 * (got as f64 / expected).min(1.0); prog(f, "writing handoff note"); }
+        else if let Delta::Reasoning(_) = d { prog(0.08 + 0.02 * ((got as f64) / 400.0).min(1.0), "thinking about what to keep"); }
+    }).await?;
     let summary = reply.text().trim().to_string();
     if summary.chars().count() < 80 { bail!("compaction summary too short"); }
-    let mut new_msgs = vec![msgs[0].clone(), Message::user(format!("[Context compacted — handoff note replacing {} earlier messages]
-
-{summary}
-
-[Continue from the state above; the most recent messages follow verbatim.]", old.len()))];
+    let mut new_msgs = vec![msgs[0].clone(), Message::user(format!("[Context compacted — handoff note replacing {} earlier messages]\n\n{summary}\n\n[Continue from the state above; the most recent messages follow verbatim.]", old.len()))];
     new_msgs.extend_from_slice(&msgs[cut..]);
     let removed = old.len();
     *msgs = new_msgs;
-    Ok((removed, summary))
+    let map_after = context_map(msgs);
+    prog(1.0, "done");
+    Ok((removed, summary, map_before, map_after))
 }
 
 fn render_for_summary(msgs: &[Message], max_chars: usize) -> String {
@@ -245,9 +276,9 @@ impl<'a> Agent<'a> {
             }
             if last_usage.prompt_tokens > self.context_budget {
                 let before = last_usage.prompt_tokens;
-                match compact_llm(&self.client.aux(), msgs, 8, None).await {
-                    Ok((n, summary)) => { stats.compactions += 1; self.sink.emit(&Event::Compacted { count: n, prompt_tokens: before, summary }); }
-                    Err(_) => { let n = compact(msgs, 6); if n > 0 { stats.compactions += 1; self.sink.emit(&Event::Compacted { count: n, prompt_tokens: before, summary: String::new() }); } }
+                match compact_llm_with(&self.client.aux(), msgs, 8, None, Some(self.sink)).await {
+                    Ok((n, summary, mb, ma)) => { stats.compactions += 1; self.sink.emit(&Event::Compacted { count: n, prompt_tokens: before, summary, map_before: mb, map_after: ma }); }
+                    Err(_) => { let mb = context_map(msgs); let n = compact(msgs, 6); if n > 0 { stats.compactions += 1; self.sink.emit(&Event::Compacted { count: n, prompt_tokens: before, summary: String::new(), map_before: mb, map_after: context_map(msgs) }); } }
                 }
                 last_usage = Usage::default(); // re-measured on the next call
             }

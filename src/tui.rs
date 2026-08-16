@@ -277,6 +277,8 @@ enum Block {
     Error(String),
     Finished(String),
     Memory(String),
+    /// Context map before/after compaction: (label, tokens) segments.
+    CompactMap { before: Vec<(String, u64)>, after: Vec<(String, u64)> },
 }
 
 struct App {
@@ -318,6 +320,7 @@ struct App {
     think_scroll: usize,
     toolset: Option<Arc<Toolset>>,
     perm_mode: harness::permissions::Mode,
+    compact_progress: Option<(f64, String, Instant)>,
     session_meta: harness::sessions::Meta,
     todos: Arc<std::sync::Mutex<Vec<harness::tools::todo::TodoItem>>>,
     event_log: Option<std::fs::File>,
@@ -344,7 +347,7 @@ pub async fn run(cfg: Config, resume: Option<String>) -> Result<()> {
         quit: false, tick: 0, word: 0, models: vec![],
         metrics: Metrics::new(0), panel: None, attachments: vec![], tool_previews: Default::default(),
         picker, images: Default::default(), img_seq: 0,
-        think_scroll: 0, toolset: None, perm_mode: harness::permissions::Mode::Auto, session_meta: harness::sessions::Meta::default(), todos: Default::default(), event_log: None, pending_ask: None, video: None, strip_rects: vec![], tr_rect: Rect::default(), panel_rect: Rect::default(), tr_start: 0, line_map: vec![],
+        think_scroll: 0, toolset: None, perm_mode: harness::permissions::Mode::Auto, compact_progress: None, session_meta: harness::sessions::Meta::default(), todos: Default::default(), event_log: None, pending_ask: None, video: None, strip_rects: vec![], tr_rect: Rect::default(), panel_rect: Rect::default(), tr_start: 0, line_map: vec![],
     };
     app.metrics.ctx_len = app.cfg.llm.context_budget_tokens.unwrap_or(0);
     app.perm_mode = app.cfg.permissions.mode;
@@ -689,8 +692,8 @@ impl App {
                         let res: Result<(), String> = async {
                             let client = Client::new(&cfg.llm).map_err(|e| e.to_string())?;
                             let mut msgs = session.lock().await;
-                            let (n, summary) = harness::agent::compact_llm(&client.aux(), &mut msgs, 4, focus.as_deref()).await.map_err(|e| format!("{e:#}"))?;
-                            sink.emit(&Event::Compacted { count: n, prompt_tokens: 0, summary });
+                            let (n, summary, mb, ma) = harness::agent::compact_llm_with(&client.aux(), &mut msgs, 4, focus.as_deref(), Some(&sink)).await.map_err(|e| format!("{e:#}"))?;
+                            sink.emit(&Event::Compacted { count: n, prompt_tokens: 0, summary, map_before: mb, map_after: ma });
                             Ok(())
                         }.await;
                         if let Err(e) = res { sink.emit(&Event::Error { message: format!("compact: {e}") }); }
@@ -1084,8 +1087,12 @@ impl App {
                 }
                 if let Some(Block::Tool { result: r, secs: s, images: im, .. }) = self.blocks.iter_mut().rev().find(|b| matches!(b, Block::Tool { id: i, .. } if *i == id)) { *r = Some(result); *s = secs; *im = images.len(); }
             }
-            Event::Compacted { count, prompt_tokens, summary } => {
-                self.blocks.push(Block::System(format!("⟲ context compacted: {count} messages → handoff note (context was {} tokens)", fmt_k(prompt_tokens))));
+            Event::CompactProgress { fraction, phase } => { self.compact_progress = if fraction >= 1.0 { None } else { Some((fraction, phase, Instant::now())) }; }
+            Event::Compacted { count, prompt_tokens, summary, map_before, map_after } => {
+                self.compact_progress = None;
+                let (tb, ta): (u64, u64) = (map_before.iter().map(|x| x.1).sum(), map_after.iter().map(|x| x.1).sum());
+                self.blocks.push(Block::System(format!("⟲ context compacted: {count} messages → handoff note · ~{} → ~{} tokens ({}% smaller){}", fmt_k(tb), fmt_k(ta), if tb > 0 { 100 - ta * 100 / tb } else { 0 }, if prompt_tokens > 0 { format!(" · measured prompt was {}", fmt_k(prompt_tokens)) } else { String::new() })));
+                self.blocks.push(Block::CompactMap { before: map_before, after: map_after });
                 if !summary.is_empty() { self.blocks.push(Block::Assistant { text: format!("Handoff note (context compaction)\n{summary}"), streaming: false, folded: true }); }
             }
             Event::RunFinished { stop_reason, turns, tool_calls, prompt_tokens, completion_tokens, wall_secs } => {
@@ -1187,6 +1194,9 @@ fn draw(f: &mut Frame, app: &mut App) {
         Some(vec![Span::styled(" 🔒 ", Style::default().fg(Color::Black).bg(pal().orange)), Span::styled(format!(" {}({}) ", req.tool, truncate(&req.summary, width.saturating_sub(70))), Style::default().fg(Color::Black).bg(pal().orange).bold()),
                   Span::styled(format!("  {} · ", req.reason), Style::default().fg(pal().orange)),
                   Span::styled("[y] allow once  ", Style::default().fg(pal().ok).bold()), Span::styled(format!("[a] always ({})  ", req.suggested_rule), Style::default().fg(pal().cyan)), Span::styled("[n] deny", Style::default().fg(pal().err).bold())])
+    } else if let Some((f, phase, _)) = &app.compact_progress {
+        let barw = 30usize; let filled = ((f * barw as f64) as usize).min(barw);
+        Some(vec![Span::styled("⟲ compacting context ", Style::default().fg(pal().orange)), Span::styled("█".repeat(filled), Style::default().fg(pal().orange)), Span::styled("░".repeat(barw - filled), Style::default().fg(pal().dim)), Span::styled(format!(" {:>3.0}%  {phase}", f * 100.0), Style::default().fg(pal().dim))])
     } else if app.running.is_some() {
         let sp = SPINNER[(app.tick as usize / 2) % SPINNER.len()];
         let el = app.run_started.elapsed().as_secs();
@@ -1534,6 +1544,23 @@ fn render_block(b: &Block, app: &App, width: usize, out: &mut Vec<Line<'static>>
             }
         }
         Block::System(t) => { push_wrapped(out, vec![Span::styled("· ", Style::default().fg(pal().dim)), Span::styled(t.clone(), Style::default().fg(pal().dim))], w, 2); }
+        Block::CompactMap { before, after } => {
+            let colors = |label: &str| match label { "system" => pal().blue, "handoff note" => pal().orange, "user" => pal().fg, "assistant" => pal().ok, "tool results" => pal().dim, "images" => pal().think, _ => pal().dim };
+            let tb: u64 = before.iter().map(|x| x.1).sum::<u64>().max(1);
+            let barw = w.saturating_sub(24).clamp(20, 90) as u64;
+            for (title, map) in [("before", before), ("after ", after)] {
+                let total: u64 = map.iter().map(|x| x.1).sum();
+                let mut spans = vec![Span::styled(format!("  {title} "), Style::default().fg(pal().dim)), Span::styled(format!("{:>6} ", fmt_k(total)), Style::default().bold())];
+                let mut used = 0u64;
+                for (label, n) in map { let cells = ((n * barw) / tb).max(if *n > 0 { 1 } else { 0 }); used += cells; spans.push(Span::styled("█".repeat(cells as usize), Style::default().fg(colors(label)))); }
+                if used < barw { spans.push(Span::styled("░".repeat((barw - used) as usize), Style::default().fg(pal().panel_bg))); }
+                out.push(Line::from(spans));
+            }
+            let mut legend = vec![Span::raw("         ")];
+            for (label, n) in before.iter().chain(after.iter()).fold(Vec::<(String, u64)>::new(), |mut acc, (l, n)| { if !acc.iter().any(|(x, _)| x == l) { acc.push((l.clone(), *n)); } acc }) { let _ = n; legend.push(Span::styled("■ ", Style::default().fg(colors(&label)))); legend.push(Span::styled(format!("{label}  "), Style::default().fg(pal().dim))); }
+            out.push(Line::from(legend));
+            out.push(Line::raw(""));
+        }
         Block::Memory(t) => { push_wrapped(out, vec![Span::styled("🧠 ", Style::default()), Span::styled(t.clone(), Style::default().fg(pal().ok))], w, 3); }
         Block::Error(t) => { for (i, l) in t.lines().enumerate() { push_wrapped(out, vec![Span::styled(if i == 0 { "✗ " } else { "  " }, Style::default().fg(pal().err)), Span::styled(l.to_string(), Style::default().fg(pal().err))], w, 2); } out.push(Line::raw("")); }
         Block::Finished(t) => { push_wrapped(out, vec![Span::styled("  ✓ ", Style::default().fg(pal().ok)), Span::styled(t.clone(), Style::default().fg(pal().dim))], w, 4); }
