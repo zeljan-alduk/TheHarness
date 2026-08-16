@@ -1,5 +1,6 @@
 name = "rs_fix_bug"
 tags = ["rust", "edit", "medium"]
 prompt = "This Rust crate has a failing test. Run `cargo test`, find the bug in src/lib.rs, fix it (do not modify the tests), and make sure `cargo test` passes."
-check = "cargo test -q 2>&1 | tail -3 | grep -q 'test result: ok' && git diff --quiet HEAD -- src/lib.rs; test $? -eq 1 && ! git diff HEAD --stat -- tests | grep -q ."
+# all 4 tests pass, none fail, and tests/ is unchanged relative to the fixture's root commit
+check = "out=$(cargo test 2>&1); echo \"$out\" | grep -q '4 passed' && ! echo \"$out\" | grep -q FAILED && ! git diff $(git rev-list --max-parents=0 HEAD) -- tests | grep -q ."
 max_turns = 20
