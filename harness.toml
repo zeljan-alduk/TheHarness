@@ -18,5 +18,6 @@ max_tool_output_chars = 16000
 
 [eval]
 tasks_dir = "evals/tasks"
-runs_dir = "target/eval-runs"
+# Where eval workdirs are created. Keep this OUTSIDE any Cargo workspace (default: $TMPDIR/harness-eval-runs).
+# runs_dir = "/tmp/harness-eval-runs"
 task_timeout_secs = 900

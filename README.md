@@ -16,10 +16,21 @@ never by the agent's own opinion.
 cargo build --release
 ./target/release/harness models                       # sanity check the server
 ./target/release/harness run -C /path/to/project "Add a --json flag to the CLI and tests"
-./target/release/harness eval                          # run the benchmark, JSON report → target/eval-runs/report.json
+./target/release/harness eval                          # run the benchmark, JSON report → $TMPDIR/harness-eval-runs/report.json
 ./target/release/harness self "Make the bash tool return the cwd in its result"   # agent edits itself on a proposal/* branch
 ./target/release/harness --json run "..."              # JSONL event stream on stdout (for UIs)
 ```
+
+## Desktop UI (Tauri)
+
+```sh
+cargo run -p harness-ui            # dev; or: cd ui && npx @tauri-apps/cli@2 build   (bundles TheHarness.app)
+```
+`ui/src-tauri` links the core as a library and runs the agent **in-process**; every `Event`
+is forwarded to the webview (`agent-event`). The frontend (`ui/dist`, vanilla HTML/JS — no
+Node build step) shows the live timeline (reasoning folds, tool calls with args/results,
+inline images from `view_image`), a file browser of the workdir with **image / audio / video /
+PDF / text previews**, and a git log/status panel. Model picker is populated from the server.
 
 ## Architecture
 
@@ -31,9 +42,11 @@ src/
   agent.rs     the loop: model → tool calls → results → model; budgets; context compaction
   events.rs    structured Event stream + Sink trait (StderrSink, JsonlSink) — core never prints
   sandbox.rs   local process supervision: timeout, process-group kill, env scrub, output caps
-  tools/       bash, read_file, write_file, edit_file, list_dir, web_fetch, web_search
+  tools/       bash, read_file, write_file, edit_file, list_dir, view_image, web_fetch, web_search
   eval.rs      the fitness function: runs evals/tasks/* in fresh git-initialised workdirs
+  lib.rs       exposes all of the above as the `harness` library
 evals/tasks/<name>/task.toml  (+ fixture/)  — prompt + `check` shell command (exit 0 = pass)
+ui/src-tauri   Tauri 2 desktop app (Rust) · ui/dist  vanilla web frontend
 ```
 
 ### Layers and who may change them
@@ -62,6 +75,8 @@ and for every eval workdir.
   isolate. Run the harness inside a container/VM if the model is untrusted.
 - **Path jail** for file tools (no escaping the workdir, symlink-aware). `bash` is not jailed —
   it can't be without a container; the system prompt + git history are the guardrail.
+- **Vision**: Qwen3.8 is a VLM; `view_image` attaches a file as an `image_url` part in a follow-up
+  user turn (tool results are text-only in the OpenAI protocol). Old image payloads are dropped on compaction.
 - **Internet**: `web_fetch` (HTML→text, size cap) and `web_search` (DuckDuckGo HTML, no API
   key). Toggle with `[net] enabled` or `HARNESS_NET=0` / `--no-net`.
 - **Context**: when the prompt exceeds `context_budget_tokens`, old tool results are compacted
@@ -71,7 +86,8 @@ and for every eval workdir.
 
 ## Roadmap
 - [ ] `harness serve`: HTTP + WebSocket/SSE server exposing runs and the event stream
-- [ ] Web UI (later Tauri desktop shell) with rich previews (images, audio, diffs, terminal)
+- [x] Tauri desktop UI with rich previews (images, audio, video, text)
+- [ ] UI: eval runner view, `self` mode, streaming tokens, diff viewer, run history
 - [ ] Streaming responses (token-level events)
 - [ ] Arbiter: automated `main..proposal/*` evaluation with N-run averaging + regression gate
 - [ ] More tools: `grep`/`glob` (ripgrep-backed), `apply_patch`, LSP diagnostics, image input for VL models

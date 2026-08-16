@@ -1,0 +1,159 @@
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
+use base64::Engine;
+use harness::agent::{system_prompt, Agent};
+use harness::config::Config;
+use harness::events::{Event, Sink};
+use harness::llm::Client;
+use harness::tools::{Registry, ToolCtx};
+use serde::Serialize;
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::time::Duration;
+use tauri::{AppHandle, Emitter, State};
+
+/// Bridges core events to the webview.
+struct TauriSink { app: AppHandle }
+impl Sink for TauriSink {
+    fn emit(&self, e: &Event) { let _ = self.app.emit("agent-event", e); }
+}
+
+#[derive(Default)]
+struct RunState { handle: Mutex<Option<tauri::async_runtime::JoinHandle<()>>> }
+
+#[derive(Serialize)]
+struct RunFinished { ok: bool, text: String, error: Option<String> }
+
+fn load_config() -> Result<Config, String> {
+    let explicit = std::env::var("HARNESS_CONFIG").ok().map(PathBuf::from);
+    Config::load(explicit.as_deref()).map_err(|e| format!("{e:#}"))
+}
+
+#[tauri::command]
+fn get_config() -> Result<serde_json::Value, String> {
+    let cfg = load_config()?;
+    let mut v = serde_json::to_value(&cfg).map_err(|e| e.to_string())?;
+    v["cwd"] = serde_json::json!(std::env::current_dir().map(|p| p.display().to_string()).unwrap_or_default());
+    v["home"] = serde_json::json!(std::env::var("HOME").unwrap_or_default());
+    Ok(v)
+}
+
+#[tauri::command]
+async fn list_models() -> Result<Vec<String>, String> {
+    let cfg = load_config()?;
+    let client = Client::new(&cfg.llm).map_err(|e| e.to_string())?;
+    client.list_models().await.map_err(|e| format!("{e:#}"))
+}
+
+#[tauri::command]
+async fn start_run(app: AppHandle, state: State<'_, RunState>, task: String, workdir: String, model: Option<String>, max_turns: Option<usize>, net: Option<bool>) -> Result<(), String> {
+    let mut cfg = load_config()?;
+    if let Some(m) = model { if !m.is_empty() { cfg.llm.model = m; } }
+    if let Some(n) = max_turns { cfg.agent.max_turns = n; }
+    if let Some(n) = net { cfg.net.enabled = n; }
+    let workdir = PathBuf::from(&workdir).canonicalize().map_err(|e| format!("workdir: {e}"))?;
+    if !workdir.is_dir() { return Err("workdir is not a directory".into()); }
+    {
+        let guard = state.handle.lock().unwrap();
+        if let Some(h) = guard.as_ref() { if !h.inner().is_finished() { return Err("a run is already in progress".into()); } }
+    }
+    let app2 = app.clone();
+    let handle = tauri::async_runtime::spawn(async move {
+        let result: Result<String, String> = async {
+            let client = Client::new(&cfg.llm).map_err(|e| e.to_string())?;
+            let ctx = ToolCtx { workdir: workdir.clone(), timeout: Duration::from_secs(cfg.agent.tool_timeout_secs), max_output: cfg.agent.max_tool_output_chars, net: cfg.net.clone() };
+            let registry = Registry::defaults(cfg.net.enabled);
+            let system = system_prompt(&workdir.display().to_string(), &registry.names(), None);
+            let sink = TauriSink { app: app2.clone() };
+            let agent = Agent { client: &client, registry: &registry, ctx: &ctx, max_turns: cfg.agent.max_turns, context_budget: cfg.llm.context_budget_tokens, sink: &sink };
+            agent.run(&system, &task).await.map(|(t, _)| t).map_err(|e| format!("{e:#}"))
+        }.await;
+        let payload = match result {
+            Ok(text) => RunFinished { ok: true, text, error: None },
+            Err(e) => RunFinished { ok: false, text: String::new(), error: Some(e) },
+        };
+        let _ = app2.emit("run-finished", &payload);
+    });
+    *state.handle.lock().unwrap() = Some(handle);
+    Ok(())
+}
+
+#[tauri::command]
+fn stop_run(app: AppHandle, state: State<'_, RunState>) -> Result<bool, String> {
+    let mut guard = state.handle.lock().unwrap();
+    if let Some(h) = guard.take() {
+        h.abort();
+        let _ = app.emit("run-finished", &RunFinished { ok: false, text: String::new(), error: Some("stopped by user".into()) });
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+#[derive(Serialize)]
+struct DirEntry { name: String, path: String, is_dir: bool, size: u64 }
+
+#[tauri::command]
+fn list_dir(path: String) -> Result<Vec<DirEntry>, String> {
+    let mut out = Vec::new();
+    for e in std::fs::read_dir(&path).map_err(|e| e.to_string())? {
+        let e = e.map_err(|e| e.to_string())?;
+        let md = e.metadata().map_err(|e| e.to_string())?;
+        let name = e.file_name().to_string_lossy().to_string();
+        if name == ".git" || name == "target" || name == "node_modules" { continue; }
+        out.push(DirEntry { name, path: e.path().display().to_string(), is_dir: md.is_dir(), size: md.len() });
+    }
+    out.sort_by(|a, b| b.is_dir.cmp(&a.is_dir).then(a.name.to_lowercase().cmp(&b.name.to_lowercase())));
+    Ok(out)
+}
+
+#[derive(Serialize)]
+struct FilePreview { kind: String, mime: String, size: u64, text: Option<String>, data_url: Option<String> }
+
+fn mime_of(p: &Path) -> (&'static str, &'static str) {
+    let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+    match ext.as_str() {
+        "png" => ("image", "image/png"), "jpg" | "jpeg" => ("image", "image/jpeg"), "gif" => ("image", "image/gif"),
+        "webp" => ("image", "image/webp"), "svg" => ("image", "image/svg+xml"), "bmp" => ("image", "image/bmp"),
+        "mp3" => ("audio", "audio/mpeg"), "wav" => ("audio", "audio/wav"), "ogg" => ("audio", "audio/ogg"),
+        "m4a" => ("audio", "audio/mp4"), "flac" => ("audio", "audio/flac"), "aac" => ("audio", "audio/aac"),
+        "mp4" => ("video", "video/mp4"), "webm" => ("video", "video/webm"), "mov" => ("video", "video/quicktime"),
+        "pdf" => ("pdf", "application/pdf"),
+        _ => ("text", "text/plain"),
+    }
+}
+
+#[tauri::command]
+fn read_file(path: String) -> Result<FilePreview, String> {
+    let p = Path::new(&path);
+    let md = std::fs::metadata(p).map_err(|e| e.to_string())?;
+    let (kind, mime) = mime_of(p);
+    const MAX_MEDIA: u64 = 64 * 1024 * 1024;
+    const MAX_TEXT: u64 = 2 * 1024 * 1024;
+    if kind == "text" {
+        if md.len() > MAX_TEXT { return Ok(FilePreview { kind: "binary".into(), mime: mime.into(), size: md.len(), text: None, data_url: None }); }
+        let bytes = std::fs::read(p).map_err(|e| e.to_string())?;
+        if bytes.iter().take(8000).any(|b| *b == 0) {
+            return Ok(FilePreview { kind: "binary".into(), mime: "application/octet-stream".into(), size: md.len(), text: None, data_url: None });
+        }
+        return Ok(FilePreview { kind: "text".into(), mime: mime.into(), size: md.len(), text: Some(String::from_utf8_lossy(&bytes).to_string()), data_url: None });
+    }
+    if md.len() > MAX_MEDIA { return Ok(FilePreview { kind: "binary".into(), mime: mime.into(), size: md.len(), text: None, data_url: None }); }
+    let bytes = std::fs::read(p).map_err(|e| e.to_string())?;
+    let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+    Ok(FilePreview { kind: kind.into(), mime: mime.into(), size: md.len(), text: None, data_url: Some(format!("data:{mime};base64,{b64}")) })
+}
+
+#[tauri::command]
+async fn git_log(workdir: String) -> Result<String, String> {
+    let o = harness::sandbox::run_shell("git log --oneline --decorate -20 2>&1; echo; git status --short 2>&1 | head -40", Path::new(&workdir), Duration::from_secs(10), 8000).await.map_err(|e| e.to_string())?;
+    Ok(o.stdout)
+}
+
+fn main() {
+    tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
+        .manage(RunState::default())
+        .invoke_handler(tauri::generate_handler![get_config, list_models, start_run, stop_run, list_dir, read_file, git_log])
+        .run(tauri::generate_context!())
+        .expect("error while running TheHarness UI");
+}

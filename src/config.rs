@@ -1,8 +1,8 @@
 use anyhow::{Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Config {
     pub llm: LlmConfig,
     pub agent: AgentConfig,
@@ -12,7 +12,7 @@ pub struct Config {
     pub net: NetConfig,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct LlmConfig {
     pub base_url: String,
     pub model: String,
@@ -26,7 +26,7 @@ pub struct LlmConfig {
     pub context_budget_tokens: u64,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AgentConfig {
     #[serde(default = "d_max_turns")]
     pub max_turns: usize,
@@ -36,7 +36,7 @@ pub struct AgentConfig {
     pub max_tool_output_chars: usize,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct EvalConfig {
     #[serde(default = "d_tasks_dir")]
     pub tasks_dir: String,
@@ -46,7 +46,7 @@ pub struct EvalConfig {
     pub task_timeout_secs: u64,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct NetConfig {
     /// Expose web_fetch / web_search tools to the model.
     #[serde(default = "d_true")]
@@ -67,7 +67,7 @@ fn d_max_turns() -> usize { 40 }
 fn d_tool_timeout() -> u64 { 120 }
 fn d_max_out() -> usize { 16000 }
 fn d_tasks_dir() -> String { "evals/tasks".into() }
-fn d_runs_dir() -> String { "target/eval-runs".into() }
+fn d_runs_dir() -> String { std::env::temp_dir().join("harness-eval-runs").display().to_string() }
 fn d_task_timeout() -> u64 { 900 }
 fn d_true() -> bool { true }
 fn d_fetch_timeout() -> u64 { 30 }

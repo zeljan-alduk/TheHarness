@@ -11,7 +11,8 @@ pub enum Event {
     Reasoning { text: String },
     Assistant { text: String },
     ToolCall { id: String, name: String, args: String },
-    ToolResult { id: String, name: String, result: String, secs: f64 },
+    /// `images` are data: URLs (only for tools that return images, e.g. view_image).
+    ToolResult { id: String, name: String, result: String, secs: f64, images: Vec<String> },
     Compacted { count: usize, prompt_tokens: u64 },
     RunFinished { stop_reason: String, turns: usize, tool_calls: usize, prompt_tokens: u64, completion_tokens: u64, wall_secs: f64 },
     Error { message: String },

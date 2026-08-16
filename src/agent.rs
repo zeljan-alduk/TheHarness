@@ -101,7 +101,8 @@ impl<'a> Agent<'a> {
                 self.sink.emit(&Event::ToolCall { id: id.clone(), name: name.clone(), args: args.clone() });
                 let t0 = Instant::now();
                 let out = self.registry.call(&name, &args, self.ctx).await;
-                self.sink.emit(&Event::ToolResult { id: id.clone(), name: name.clone(), result: out.text.clone(), secs: t0.elapsed().as_secs_f64() });
+                self.sink.emit(&Event::ToolResult { id: id.clone(), name: name.clone(), result: out.text.clone(), secs: t0.elapsed().as_secs_f64(),
+                    images: out.images.iter().map(|(m, b)| format!("data:{m};base64,{b}")).collect() });
                 msgs.push(Message::tool(id, name.clone(), out.text));
                 if !out.images.is_empty() { pending_images.push((name, out.images)); }
             }

@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>TheHarness</title>
+<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<div id="app">
+  <aside id="left">
+    <header>
+      <div class="logo">⟨H⟩</div>
+      <div><div class="title">TheHarness</div><div class="sub" id="serverInfo">connecting…</div></div>
+    </header>
+
+    <label>Model
+      <select id="model"></select>
+    </label>
+    <label>Working directory
+      <div class="row">
+        <input id="workdir" spellcheck="false" />
+        <button id="pickDir" title="Choose folder">…</button>
+      </div>
+    </label>
+    <label>Task
+      <textarea id="task" rows="7" placeholder="Describe what the agent should do…"></textarea>
+    </label>
+    <div class="row opts">
+      <label class="inline"><input type="checkbox" id="net" checked /> internet</label>
+      <label class="inline">max turns <input type="number" id="maxTurns" value="40" min="1" max="500" /></label>
+    </div>
+    <div class="row">
+      <button id="run" class="primary">▶ Run</button>
+      <button id="stop" disabled>■ Stop</button>
+    </div>
+    <div id="stats" class="stats"></div>
+
+    <section class="git">
+      <div class="sechead">git <button id="gitRefresh" class="ghost">↻</button></div>
+      <pre id="gitLog">—</pre>
+    </section>
+  </aside>
+
+  <main id="center">
+    <div id="timeline"></div>
+    <div id="composerHint">Idle. Enter a task and press Run (⌘↩).</div>
+  </main>
+
+  <aside id="right">
+    <div class="sechead">files <span id="fileRoot" class="dim"></span> <button id="filesRefresh" class="ghost">↻</button></div>
+    <div id="files"></div>
+    <div id="preview"><div class="dim center">Select a file to preview — images, audio, video, text.</div></div>
+  </aside>
+</div>
+<script src="app.js"></script>
+</body>
+</html>

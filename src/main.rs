@@ -1,10 +1,4 @@
-mod agent;
-mod config;
-mod eval;
-mod events;
-mod llm;
-mod sandbox;
-mod tools;
+use harness::{agent, config, eval, events, llm, sandbox, tools};
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
