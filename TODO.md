@@ -8,22 +8,22 @@ Status: ☐ open · ◐ partial · ☑ done.
 
 - ☑ **`ask_user`** (Claude Code `AskUserQuestion`) — multiple-choice / free-text clarification prompt shown in the
   TUI (and desktop/web UIs) with an optional auto-continue timeout; headless runs answer "no user present".
-- ☐ **`monitor`** (`Monitor`) — run a command in the background and stream each output line (or matching lines)
-  back into the conversation so the model can react to logs / polled status. Today `process tail` is polling only.
+- ☑ **`monitor`** (`Monitor`) — `monitor {start {cmd, filter?, timeout_secs?, max_lines?}|stop|list}`: background
+  command whose (regex-filtered) output lines arrive as inbox events (coalesced ~1/s) plus an exit note.
 - ☑ **`worktree`** (`EnterWorktree` / `ExitWorktree`) — `worktree {create|enter|exit|list|remove}` under
   `.harness/worktrees/<name>` (excluded via `.git/info/exclude`); `enter` switches every tool's working directory until
   `exit` (`ToolCtx::effective`, TUI mode line shows it); `spawn_agent {isolation:"worktree"}` gets a fresh worktree.
-- ☐ **MCP resources** (`ListMcpResourcesTool` / `ReadMcpResourceTool`) — the harness bridges MCP *tools* only;
-  expose `mcp_resources {list|read, server, uri}`.
+- ☑ **MCP resources** (`ListMcpResourcesTool` / `ReadMcpResourceTool`) — `mcp_resources {list|read|templates, server?, uri?}`
+  (image blobs returned as images; servers registered globally in `mcp.rs`).
 
 ## P1
 
-- ☐ **`notify`** (`PushNotification`) — desktop notification when a long task finishes / needs input
-  (`osascript` / `notify-send` / PowerShell toast).
+- ☑ **`notify`** (`PushNotification`) — `notify {message, title?, subtitle?, sound?}` via `osascript` / `notify-send` /
+  PowerShell toast; `HARNESS_NO_NOTIFY` suppresses.
 - ☐ **`schedule`** (`CronCreate/List/Delete`, `ScheduleWakeup`) — session-scoped one-shot / recurring prompts
   ("in 10 min re-run the tests and report"), restored on resume.
-- ☐ **`report_findings`** (`ReportFindings`) — structured code-review findings (file, line, summary, severity,
-  failure scenario) rendered as a list in the UI and saved as JSON.
+- ◐ **`report_findings`** (`ReportFindings`) — `report_findings {findings:[{file,line?,severity,title,summary,...}], summary?}`
+  validated, sorted, saved to `.harness/findings/<ts>.json` + `latest.json`; rendered as text (no dedicated UI panel yet).
 - ☐ **Task graph** (`TaskCreate/Get/List/Update`) — `todo` items with dependencies (`blocked_by`), owner and
   details; `process kill` already covers `TaskStop`.
 - ☐ **Model-driven plan mode** (`EnterPlanMode` / `ExitPlanMode`) — the model may enter plan mode and present a
