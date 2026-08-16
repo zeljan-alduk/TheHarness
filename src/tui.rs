@@ -123,7 +123,7 @@ fn pal() -> Pal {
 const SPINNER: [&str; 10] = ["✻", "✼", "✽", "✾", "✿", "❀", "✿", "✾", "✽", "✼"];
 const WORDS: [&str; 12] = ["Thinking", "Pondering", "Working", "Reasoning", "Cooking", "Tinkering", "Brewing", "Mulling", "Crunching", "Percolating", "Noodling", "Computing"];
 
-enum Msg { Toast(String), Title(String), Question(harness::permissions::Question, tokio::sync::oneshot::Sender<harness::permissions::Answer>), SubEnv(Arc<harness::agent::SubAgentEnv>), Policy(Arc<harness::permissions::Policy>), CcSession(Arc<harness::claude_code::ClaudeCodeSession>), CcSid(String), Block(Block), Ask(harness::permissions::ApprovalRequest, tokio::sync::oneshot::Sender<harness::permissions::Approval>), Ev(Event), Done(Result<(String, harness::agent::RunStats), String>), Sys(SysSample), CtxLen(u64), Pasted(Result<PathBuf, String>), Frames(Result<(PathBuf, f64, Vec<(f64, PathBuf)>), String>), Toolset(Arc<Toolset>), Catalog(Result<harness::plugins::Catalog, String>), Notice(String), Improve(harness::selfimprove::Stage), GoalCheck(bool, String), Review(String) }
+enum Msg { Toast(String), Title(String), Question(harness::permissions::Question, tokio::sync::oneshot::Sender<harness::permissions::Answer>), SubEnv(Arc<harness::agent::SubAgentEnv>), Policy(Arc<harness::permissions::Policy>), CcSession(Arc<harness::claude_code::ClaudeCodeSession>), CcSid(String), Block(Block), Ask(harness::permissions::ApprovalRequest, tokio::sync::oneshot::Sender<harness::permissions::Approval>), Ev(Event), Done(Result<(String, harness::agent::RunStats), String>), Sys(SysSample), CtxLen(u64), Pasted(Result<PathBuf, String>), Frames(Result<(PathBuf, f64, Vec<(f64, PathBuf)>), String>), Toolset(Arc<Toolset>), Catalog(Result<harness::plugins::Catalog, String>), Notice(String), Improve(harness::selfimprove::Stage), GoalCheck(bool, String), Review(String), AcpSession(Arc<harness::acp_client::AcpSession>) }
 
 /// One hunk of the working-tree diff, as `/review-diff` shows it.
 #[derive(Clone, Debug)]
@@ -454,6 +454,8 @@ struct App {
     edit_external: bool,
     /// `/review-diff`: per-hunk accept/revert/comment over the working tree.
     review: Option<DiffReview>,
+    /// External ACP agent driving this session (provider = "acp:…").
+    acp: Option<Arc<harness::acp_client::AcpSession>>,
     expand_tools: bool,
     show_thinking: bool,
     session: Arc<tokio::sync::Mutex<Vec<Message>>>,
@@ -528,7 +530,7 @@ pub async fn run(cfg: Config, resume: Option<String>) -> Result<()> {
     let mut app = App {
         model: cfg.llm.model.clone(), net: cfg.net.enabled, cfg, workdir,
         blocks: vec![], input: String::new(), cursor: 0, history: vec![], hist_idx: None, hist_draft: String::new(),
-        scroll_up: 0, running: None, run_started: Instant::now(), queued: vec![], goal: None, goal_rounds: 0, hist_search: None, edit_external: false, review: None, expand_tools: false, show_thinking: false,
+        scroll_up: 0, running: None, run_started: Instant::now(), queued: vec![], goal: None, goal_rounds: 0, hist_search: None, edit_external: false, review: None, acp: None, expand_tools: false, show_thinking: false,
         session: Arc::new(tokio::sync::Mutex::new(Vec::new())), tx: tx.clone(),
         total_prompt: 0, total_completion: 0, last_prompt_tokens: 0, turn_tokens: 0, last_ctrl_c: None, status_msg: None,
         quit: false, restart: false, improve: None, improve_cancel: Default::default(), restart_at: None, tick: 0, word: 0, models: vec![],
@@ -1775,9 +1777,20 @@ impl App {
             "/backend" | "/provider" => {
                 let mut it = arg.split_whitespace(); let which = it.next().unwrap_or("").to_string(); let model = it.next().map(String::from); let effort = it.next().map(|e| e.to_lowercase());
                 match which.as_str() {
-                    "" => { self.blocks.push(Block::Banner(vec![format!("backend: {} · model {}", self.cfg.llm.provider.clone().unwrap_or("openai (local/compatible server)".into()), self.model), "switch: /backend local [model]  ·  /backend claude [model] [effort]   (claude = official Claude Code CLI on your subscription, default claude-fable-5; effort low|medium|high|max, also /effort)".into(), "        /backend anthropic <model>  (Anthropic API key from ANTHROPIC_API_KEY)".into()])); }
+                    "" => { self.blocks.push(Block::Banner(vec![format!("backend: {} · model {}", self.cfg.llm.provider.clone().unwrap_or("openai (local/compatible server)".into()), self.model), "switch: /backend local [model]  ·  /backend claude [model] [effort]   (claude = official Claude Code CLI on your subscription, default claude-fable-5; effort low|medium|high|max, also /effort)".into(), "        /backend anthropic <model>  (Anthropic API key from ANTHROPIC_API_KEY)".into(),
+                        "        /backend acp <gemini|codex|opencode|copilot|goose|\"<command>\">  (drive another ACP agent)".into()])); }
                     "local" | "lmstudio" => { self.cfg.llm.provider = None; if let Some(m) = model { self.cfg.llm.model = m; } self.model = self.cfg.llm.model.clone(); if let Some(cc) = self.cc.take() { tokio::spawn(async move { cc.stop().await; }); } self.cc_last_session = None; self.blocks.push(Block::System(format!("backend → local server {} · model {}", self.cfg.llm.base_url, self.model))); tokio::spawn(fetch_ctx_len(self.cfg.llm.base_url.clone(), self.model.clone(), self.tx.clone())); }
                     "claude" | "claude-code" | "cc" => { self.cfg.llm.provider = Some("claude-code".into()); self.cfg.llm.model = model.unwrap_or("claude-fable-5".into()); if let Some(e) = effort { if matches!(e.as_str(), "low" | "medium" | "high" | "xhigh" | "max") { self.cfg.llm.effort = Some(e); } } if self.cfg.llm.effort.is_none() { self.cfg.llm.effort = Some("medium".into()); } self.model = self.cfg.llm.model.clone(); if let Some(cc) = self.cc.take() { tokio::spawn(async move { cc.stop().await; }); } self.cc_last_session = None; self.metrics.ctx_len = 0; self.blocks.push(Block::System(format!("backend → Claude Code (subscription) · model {} · tools bridged over MCP · context window reported after the first turn", self.model))); }
+                    "acp" => {
+                        let spec = arg.split_whitespace().skip(1).collect::<Vec<_>>().join(" ");
+                        if spec.is_empty() { self.blocks.push(Block::Banner(vec!["/backend acp <agent>  — drive another Agent Client Protocol agent from this UI".into(), "  known shortcuts: gemini · codex · opencode · copilot · goose · harness".into(), "  or a full command: /backend acp my-agent --acp".into()])); return; }
+                        self.cfg.llm.provider = Some(format!("acp:{spec}"));
+                        self.model = harness::acp_client::expand_command(&spec);
+                        if let Some(a) = self.acp.take() { tokio::spawn(async move { a.stop().await; }); }
+                        if let Some(cc) = self.cc.take() { tokio::spawn(async move { cc.stop().await; }); }
+                        self.metrics.ctx_len = 0;
+                        self.blocks.push(Block::System(format!("backend → ACP agent `{}` — it brings its own tools; permissions and file writes still come through this UI", self.model)));
+                    }
                     "gemini" | "openai" | "openrouter" | "groq" | "mistral" | "deepseek" | "xai" | "together" => {
                         let (url, env, default_model) = match which.as_str() { "gemini" => ("https://generativelanguage.googleapis.com/v1beta/openai", "GEMINI_API_KEY", "gemini-2.5-pro"), "openai" => ("https://api.openai.com/v1", "OPENAI_API_KEY", "gpt-5"), "openrouter" => ("https://openrouter.ai/api/v1", "OPENROUTER_API_KEY", "anthropic/claude-sonnet-4.5"), "groq" => ("https://api.groq.com/openai/v1", "GROQ_API_KEY", "llama-3.3-70b-versatile"), "mistral" => ("https://api.mistral.ai/v1", "MISTRAL_API_KEY", "mistral-large-latest"), "deepseek" => ("https://api.deepseek.com/v1", "DEEPSEEK_API_KEY", "deepseek-chat"), "xai" => ("https://api.x.ai/v1", "XAI_API_KEY", "grok-4"), _ => ("https://api.together.xyz/v1", "TOGETHER_API_KEY", "meta-llama/Llama-3.3-70B-Instruct-Turbo") };
                         self.cfg.llm.provider = Some("openai".into()); self.cfg.llm.base_url = url.into(); self.cfg.llm.model = model.unwrap_or(default_model.into()); self.model = self.cfg.llm.model.clone();
@@ -1938,6 +1951,7 @@ impl App {
         let cwd = self.wt_cwd.clone();
         let perm_mode = self.perm_mode;
         let cc_existing = self.cc.clone(); let cc_resume = self.cc_last_session.clone();
+        let acp_existing = self.acp.clone();
         let cc_images: Vec<(String, String)> = atts.iter().map(|a| (a.mime.clone(), a.b64.clone())).collect();
         let user_text = text.clone();
         let budget = self.cfg.llm.effective_budget(if self.metrics.ctx_len > 0 { Some(self.metrics.ctx_len) } else { None });
@@ -1959,6 +1973,23 @@ impl App {
                 let agent = Agent { client: &client, registry, ctx: &ctx, max_turns: cfg.agent.max_turns, context_budget: budget, sink: sink.as_ref(), stream: true, policy: &policy, approver: approver.as_ref() };
                 let extra = format!("You are in an interactive session: the user can see everything and will reply; keep final answers concise.{extra_prompt}");
                 let system = harness::agent::system_prompt_with_memory(&workdir.display().to_string(), &registry.names(), Some(&extra), store.as_ref());
+                // provider = "acp:<cmd>": another agent runs the turn; we stream its updates
+                if let Some(cmd) = client.acp_command() {
+                    let mut msgs = session.lock().await;
+                    if msgs.is_empty() { msgs.push(Message::system(&system)); }
+                    msgs.push(user_msg);
+                    let session_acp = match acp_existing {
+                        Some(a) => a,
+                        None => {
+                            let a = harness::acp_client::AcpSession::start(&cmd, &workdir, policy.clone(), approver.clone()).await.map_err(|e| format!("{e:#}"))?;
+                            let _ = tx.send(Msg::AcpSession(a.clone())); a
+                        }
+                    };
+                    let (t, st) = session_acp.run_turn(&user_text, sink.clone()).await.map_err(|e| format!("{e:#}"))?;
+                    sink.emit(&Event::Assistant { text: t.clone() });
+                    msgs.push(Message { role: "assistant".into(), content: Some(Content::Text(t.clone())), ..Default::default() });
+                    return Ok((t, st));
+                }
                 let mut msgs = session.lock().await;
                 // turn boundary checkpoint: anchors /rewind (code + conversation) to "before this prompt"
                 {
@@ -2191,6 +2222,7 @@ impl App {
             Msg::Frames(Err(e)) => { if let Some(v) = &mut self.video { v.loading = false; v.error = Some(e); } }
             Msg::Pasted(Err(e)) => self.set_status(e),
             Msg::Review(diff) => self.open_review(diff),
+            Msg::AcpSession(s) => self.acp = Some(s),
             Msg::GoalCheck(met, reason) => {
                 let Some(goal) = self.goal.clone() else { return };
                 if met {

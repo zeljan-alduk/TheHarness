@@ -98,6 +98,22 @@ impl Tool for SpawnAgent {
                     tokio::spawn(async move { let _ = crate::hooks::run_event(&h, "subagent_stop", &l, json!({"label": l, "status": st}), &wd).await; });
                 }
             };
+            // ACP backend: the sub-agent is another session of the external agent
+            if let Some(cmd) = client.acp_command() {
+                let session = match crate::acp_client::AcpSession::start(&cmd, &workdir2, policy.clone(), approver.clone()).await {
+                    Ok(s) => s, Err(e) => { finish("failed to start", None); return Err(e); }
+                };
+                let r = session.run_turn(&task, sink.clone()).await;
+                session.stop().await;
+                return match r {
+                    Ok((text, stats)) => {
+                        let report = format!("[sub-agent (acp {cmd}) finished: {} tool calls, {:.0}s, stop={}]{wt_note}\n{}", stats.tool_calls, stats.wall_secs, stats.stop_reason, text);
+                        finish(&format!("done ({} tool calls, {:.0}s)", stats.tool_calls, stats.wall_secs), Some(&report));
+                        Ok(report)
+                    }
+                    Err(e) => { finish("error", None); Err(e) }
+                };
+            }
             // Claude Code backend: the sub-agent is another headless claude session with its own tool bridge
             if client.provider() == crate::llm::Provider::ClaudeCode {
                 let host = std::sync::Arc::new(crate::mcp_bridge::BridgeHost { registry: registry.clone(), ctx: sub_ctx.clone(), policy: policy.clone(), approver: approver.clone(), sink: sink.clone() });

@@ -111,7 +111,7 @@ pub struct Usage {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Provider { OpenAi, Anthropic, ClaudeCode }
+pub enum Provider { OpenAi, Anthropic, ClaudeCode, Acp }
 
 #[derive(Clone)]
 pub struct Client {
@@ -134,6 +134,8 @@ pub struct Client {
     fallback_at: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     /// Anthropic prompt caching (cache_control breakpoints on system + tools).
     prompt_cache: bool,
+    /// `provider = "acp:<command>"`: the external ACP agent that drives this session.
+    acp_command: Option<String>,
 }
 
 /// Tool shim state: 0 = auto (native until the server complains), 1 = shim on, 2 = native only.
@@ -149,8 +151,14 @@ impl Client {
             .connect_timeout(std::time::Duration::from_secs(30))
             .read_timeout(std::time::Duration::from_secs(300))
             .build()?;
-        let provider = match cfg.provider.as_deref() { Some("anthropic") => Provider::Anthropic, Some("claude-code") | Some("claude_code") | Some("claude") => Provider::ClaudeCode, Some(_) => Provider::OpenAi, None => if cfg.base_url.contains("anthropic.com") { Provider::Anthropic } else { Provider::OpenAi } };
-        let api_key = cfg.api_key.clone().or_else(|| match provider { Provider::Anthropic => std::env::var("ANTHROPIC_API_KEY").ok(), Provider::OpenAi => std::env::var("OPENAI_API_KEY").ok(), Provider::ClaudeCode => None });
+        let provider = match cfg.provider.as_deref() {
+            Some("anthropic") => Provider::Anthropic,
+            Some("claude-code") | Some("claude_code") | Some("claude") => Provider::ClaudeCode,
+            Some(p) if p == "acp" || p.starts_with("acp:") => Provider::Acp,
+            Some(_) => Provider::OpenAi,
+            None => if cfg.base_url.contains("anthropic.com") { Provider::Anthropic } else { Provider::OpenAi },
+        };
+        let api_key = cfg.api_key.clone().or_else(|| match provider { Provider::Anthropic => std::env::var("ANTHROPIC_API_KEY").ok(), Provider::OpenAi => std::env::var("OPENAI_API_KEY").ok(), Provider::ClaudeCode | Provider::Acp => None });
         Ok(Self {
             http,
             base_url: cfg.base_url.trim_end_matches('/').to_string(),
@@ -166,9 +174,12 @@ impl Client {
             fallback: std::sync::Arc::new(cfg.fallback.clone()),
             fallback_at: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             prompt_cache: cfg.prompt_cache,
+            acp_command: cfg.provider.as_deref().and_then(|p| p.strip_prefix("acp:")).map(|c| c.trim().to_string()).filter(|c| !c.is_empty()),
         })
     }
     pub fn provider(&self) -> Provider { self.provider }
+    /// The ACP agent command for `provider = "acp:<command>"` (the model name is used when bare "acp").
+    pub fn acp_command(&self) -> Option<String> { (self.provider == Provider::Acp).then(|| self.acp_command.clone().unwrap_or_else(|| self.model.clone())) }
     /// True when a separate (usually smaller/faster) aux model is configured.
     pub fn has_aux(&self) -> bool { self.aux_model.is_some() || self.roles.contains_key("aux") }
     /// Client for auxiliary calls (reflection, compaction): the configured aux model, or this one.
@@ -242,6 +253,7 @@ impl Client {
 
     pub async fn list_models(&self) -> Result<Vec<String>> {
         if self.provider == Provider::ClaudeCode { return Ok(vec!["sonnet".into(), "opus".into(), "haiku".into(), "claude-sonnet-5".into(), "claude-opus-5".into()]); }
+        if self.provider == Provider::Acp { return Ok(vec![self.acp_command().unwrap_or_default()]); }
         if self.provider == Provider::Anthropic {
             let mut req = self.http.get(format!("{}/v1/models?limit=100", self.base_url.trim_end_matches("/v1"))).header("anthropic-version", "2023-06-01");
             if let Some(k) = &self.api_key { req = req.header("x-api-key", k); }
@@ -256,6 +268,7 @@ impl Client {
 
     pub async fn chat(&self, messages: &[Message], tools: &[ToolDef]) -> Result<(Message, Usage)> {
         if self.provider == Provider::ClaudeCode { bail!("provider claude-code: model calls go through the claude CLI session, not the HTTP client"); }
+        if self.provider == Provider::Acp { bail!("provider acp: model calls go through the external ACP agent, not the HTTP client"); }
         if self.provider == Provider::Anthropic { return self.chat_stream(messages, tools, |_| {}).await; }
         let shim = self.shim_active();
         let shimmed;
@@ -310,6 +323,7 @@ impl Client {
     /// tool-call fragments are assembled internally and returned in the final message.
     pub async fn chat_stream(&self, messages: &[Message], tools: &[ToolDef], mut on_delta: impl FnMut(Delta)) -> Result<(Message, Usage)> {
         if self.provider == Provider::ClaudeCode { bail!("provider claude-code: model calls go through the claude CLI session, not the HTTP client"); }
+        if self.provider == Provider::Acp { bail!("provider acp: model calls go through the external ACP agent, not the HTTP client"); }
         if self.provider == Provider::Anthropic { return self.anthropic_stream(messages, tools, &mut on_delta).await; }
         let shim = self.shim_active();
         let shimmed;

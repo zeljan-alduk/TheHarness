@@ -179,7 +179,7 @@ pub async fn run(mut cfg: Config, workdir: PathBuf, task: Option<String>, opts: 
 
         let turn_started = std::time::Instant::now();
         let agent = prepared.agent();
-        let res = if prepared.client.provider() == crate::llm::Provider::ClaudeCode {
+        let res = if prepared.external_backend() {
             prepared.run_once(&prompt, &workdir).await
         } else {
             agent.run_turn(&mut msgs, &prepared.system, &prompt).await

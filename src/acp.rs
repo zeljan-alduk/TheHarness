@@ -246,7 +246,7 @@ async fn prompt(conn: &Arc<Conn>, sessions: &Arc<tokio::sync::Mutex<HashMap<Stri
         Message::user_parts(parts)
     };
     let mut msgs = { s.msgs.lock().unwrap().clone() };
-    let out = if s.prepared.client.provider() == crate::llm::Provider::ClaudeCode {
+    let out = if s.prepared.external_backend() {
         s.prepared.run_once(&text, &s.workdir).await.map(|(t, st)| { msgs.push(Message::user(text.clone())); msgs.push(Message { role: "assistant".into(), content: Some(Content::Text(t.clone())), ..Default::default() }); (t, st) })
     } else {
         s.prepared.agent().run_turn_message(&mut msgs, &s.prepared.system, user).await
@@ -254,7 +254,7 @@ async fn prompt(conn: &Arc<Conn>, sessions: &Arc<tokio::sync::Mutex<HashMap<Stri
     let stop = match &out {
         Ok((answer, stats)) => {
             // the final answer is streamed as deltas; send it once more only if nothing was streamed
-            if !s.prepared.client.provider().eq(&crate::llm::Provider::ClaudeCode) && stats.turns == 0 {
+            if !s.prepared.external_backend() && stats.turns == 0 {
                 conn.notify("session/update", json!({"sessionId": sid, "update": {"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":answer}}}));
             }
             match stats.stop_reason.as_str() { "cancelled" => "cancelled", "max_turns" => "max_turn_requests", _ => "end_turn" }

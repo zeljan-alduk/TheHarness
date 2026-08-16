@@ -45,6 +45,8 @@ impl RunSetup {
 /// A fully wired run: borrow an `Agent` via `agent()` and drive it (`run`, `run_turn_message`, …).
 pub struct Prepared {
     pub client: Client,
+    /// External ACP agent (provider = "acp:…"), started on first use and reused across turns.
+    pub acp: tokio::sync::Mutex<Option<Arc<crate::acp_client::AcpSession>>>,
     pub toolset: Arc<Toolset>,
     pub store: Option<crate::memory::MemoryStore>,
     pub policy: Arc<Policy>,
@@ -59,6 +61,10 @@ pub struct Prepared {
 
 impl Prepared {
     pub fn registry(&self) -> &Registry { &self.toolset.registry }
+    /// True when another program runs the loop (Claude Code, or an external ACP agent) instead of us.
+    pub fn external_backend(&self) -> bool {
+        self.client.provider() == crate::llm::Provider::ClaudeCode || self.client.acp_command().is_some()
+    }
     pub fn agent(&self) -> Agent<'_> {
         Agent { client: &self.client, registry: &self.toolset.registry, ctx: &self.ctx, max_turns: self.max_turns, context_budget: self.budget, sink: self.sink.as_ref(), stream: true, policy: &self.policy, approver: self.approver.as_ref() }
     }
@@ -84,13 +90,23 @@ pub async fn prepare(setup: RunSetup) -> Result<Prepared> {
     let ctx = ToolCtx { workdir: workdir.clone(), timeout: Duration::from_secs(cfg.agent.tool_timeout_secs), max_output: cfg.agent.max_tool_output_chars, net: cfg.net.clone(), memory: store.clone(), subagent: Some(env.clone()), redact_secrets: cfg.security.redact_secrets, hooks: cfg.hooks.clone(), todos, lsp_servers: cfg.lsp.servers.clone(), format: cfg.format.clone(), extra_roots, approver: Some(approver.clone()), inbox, cancel: None, cwd: Some(cwd.unwrap_or_else(crate::worktree::new_cell)), session_id };
     let extra = match prompt_extra { Some(e) => format!("{e}{}", toolset.prompt_extra), None => toolset.prompt_extra.clone() };
     let system = crate::agent::system_prompt_with_memory(&workdir.display().to_string(), &toolset.registry.names(), Some(&extra), store.as_ref());
-    Ok(Prepared { client, toolset, store, policy, approver, sink, env, ctx, system, budget, max_turns: cfg.agent.max_turns })
+    Ok(Prepared { client, acp: tokio::sync::Mutex::new(None), toolset, store, policy, approver, sink, env, ctx, system, budget, max_turns: cfg.agent.max_turns })
 }
 
 impl Prepared {
     /// Run one task to completion on whichever backend is configured (Claude Code drives its own loop
     /// with our tools bridged over MCP; everything else goes through `Agent`). Returns (final text, stats).
     pub async fn run_once(&self, prompt: &str, workdir: &std::path::Path) -> Result<(String, crate::agent::RunStats)> {
+        // provider = "acp:<command>": another agent does the work; we are its ACP client
+        if let Some(cmd) = self.client.acp_command() {
+            let mut slot = self.acp.lock().await;
+            if slot.is_none() {
+                *slot = Some(crate::acp_client::AcpSession::start(&cmd, workdir, self.policy.clone(), self.approver.clone()).await?);
+            }
+            let session = slot.clone().unwrap();
+            drop(slot);
+            return session.run_turn(prompt, self.sink.clone()).await;
+        }
         if self.client.provider() == crate::llm::Provider::ClaudeCode {
             let host = Arc::new(crate::mcp_bridge::BridgeHost { registry: self.toolset.registry.clone(), ctx: self.ctx.clone(), policy: self.policy.clone(), approver: self.approver.clone(), sink: self.sink.clone() });
             let session = crate::claude_code::ClaudeCodeSession::start_with(workdir, Some(self.client.model()), self.env.cc_effort.as_deref().or(Some("medium")), &self.system, host, None).await?;
