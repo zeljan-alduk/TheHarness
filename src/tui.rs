@@ -54,6 +54,7 @@ const SETTINGS: &[(&str, &str, &[&str], &str)] = &[
     ("ui.notify", "Notifications", &["on", "off"], "desktop notification when a long task finishes"),
     ("ui.fold_previous", "Auto-fold previous turn", &["on", "off"], "collapse the last turn's outputs when a new task starts"),
     ("ui.vim", "Vim mode", &["off", "on"], "modal editing in the prompt (/vim)"),
+    ("ui.steer", "Enter steers a running task", &["on", "off"], "on = messages typed while a task runs reach the agent at its next tool boundary; off = they queue"),
     ("permissions.mode", "Permission mode", &["auto", "ask", "plan", "bypass"], "default for new sessions (shift+tab cycles live)"),
     ("llm.effort", "Effort (Claude backend)", &["medium", "low", "high", "xhigh", "max"], "reasoning effort passed to Claude Code"),
     ("llm.compact_at_fraction", "Auto-compact at", &["0.75", "0.5", "0.6", "0.85", "0.9"], "fraction of the context window that triggers compaction (local/API backends)"),
@@ -122,7 +123,7 @@ fn pal() -> Pal {
 const SPINNER: [&str; 10] = ["✻", "✼", "✽", "✾", "✿", "❀", "✿", "✾", "✽", "✼"];
 const WORDS: [&str; 12] = ["Thinking", "Pondering", "Working", "Reasoning", "Cooking", "Tinkering", "Brewing", "Mulling", "Crunching", "Percolating", "Noodling", "Computing"];
 
-enum Msg { Toast(String), Title(String), Question(harness::permissions::Question, tokio::sync::oneshot::Sender<harness::permissions::Answer>), SubEnv(Arc<harness::agent::SubAgentEnv>), Policy(Arc<harness::permissions::Policy>), CcSession(Arc<harness::claude_code::ClaudeCodeSession>), CcSid(String), Block(Block), Ask(harness::permissions::ApprovalRequest, tokio::sync::oneshot::Sender<harness::permissions::Approval>), Ev(Event), Done(Result<(String, harness::agent::RunStats), String>), Sys(SysSample), CtxLen(u64), Pasted(Result<PathBuf, String>), Frames(Result<(PathBuf, f64, Vec<(f64, PathBuf)>), String>), Toolset(Arc<Toolset>), Catalog(Result<harness::plugins::Catalog, String>), Notice(String), Improve(harness::selfimprove::Stage) }
+enum Msg { Toast(String), Title(String), Question(harness::permissions::Question, tokio::sync::oneshot::Sender<harness::permissions::Answer>), SubEnv(Arc<harness::agent::SubAgentEnv>), Policy(Arc<harness::permissions::Policy>), CcSession(Arc<harness::claude_code::ClaudeCodeSession>), CcSid(String), Block(Block), Ask(harness::permissions::ApprovalRequest, tokio::sync::oneshot::Sender<harness::permissions::Approval>), Ev(Event), Done(Result<(String, harness::agent::RunStats), String>), Sys(SysSample), CtxLen(u64), Pasted(Result<PathBuf, String>), Frames(Result<(PathBuf, f64, Vec<(f64, PathBuf)>), String>), Toolset(Arc<Toolset>), Catalog(Result<harness::plugins::Catalog, String>), Notice(String), Improve(harness::selfimprove::Stage), GoalCheck(bool, String) }
 
 /// Video scrubber state (modal over the transcript).
 struct VideoPicker { path: PathBuf, duration: f64, frames: Vec<(f64, PathBuf, String)>, cur: usize, selected: std::collections::BTreeSet<usize>, loading: bool, error: Option<String> }
@@ -407,6 +408,9 @@ struct App {
     running: Option<tokio::task::JoinHandle<()>>,
     run_started: Instant,
     queued: Vec<String>,
+    /// `/goal`: keep working until an aux-model checker says this condition is met.
+    goal: Option<String>,
+    goal_rounds: usize,
     expand_tools: bool,
     show_thinking: bool,
     session: Arc<tokio::sync::Mutex<Vec<Message>>>,
@@ -481,7 +485,7 @@ pub async fn run(cfg: Config, resume: Option<String>) -> Result<()> {
     let mut app = App {
         model: cfg.llm.model.clone(), net: cfg.net.enabled, cfg, workdir,
         blocks: vec![], input: String::new(), cursor: 0, history: vec![], hist_idx: None, hist_draft: String::new(),
-        scroll_up: 0, running: None, run_started: Instant::now(), queued: vec![], expand_tools: false, show_thinking: false,
+        scroll_up: 0, running: None, run_started: Instant::now(), queued: vec![], goal: None, goal_rounds: 0, expand_tools: false, show_thinking: false,
         session: Arc::new(tokio::sync::Mutex::new(Vec::new())), tx: tx.clone(),
         total_prompt: 0, total_completion: 0, last_prompt_tokens: 0, turn_tokens: 0, last_ctrl_c: None, status_msg: None,
         quit: false, restart: false, improve: None, improve_cancel: Default::default(), restart_at: None, tick: 0, word: 0, models: vec![],
@@ -964,7 +968,18 @@ impl App {
                 self.set_status(format!("sub-agent #{id} is finished — /agents detach")); return;
             }
         }
-        if self.running.is_some() { self.queued.push(text); self.set_status(format!("queued ({} waiting) — will run after the current turn", self.queued.len())); return; }
+        if self.running.is_some() {
+            if self.cfg.ui.steer {
+                // steer: the running agent picks this up at its next tool boundary
+                self.blocks.push(Block::User(format!("[steering] {text}"), vec![]));
+                self.inbox.push("message from the user", text);
+                self.set_status("steering the running task (it sees this before its next model call) — /queue <text> to queue instead");
+            } else {
+                self.queued.push(text);
+                self.set_status(format!("queued ({} waiting) — will run after the current turn", self.queued.len()));
+            }
+            return;
+        }
         self.start_run(text);
     }
 
@@ -1402,6 +1417,22 @@ impl App {
                 self.save_session();
                 self.blocks.push(Block::System(format!("forked session {old} → {} — this branch is saved separately; the original is untouched (/resume {old} to go back)", self.session_meta.id)));
             }
+            "/goal" => {
+                let a = arg.trim().to_string();
+                if a.is_empty() {
+                    match &self.goal {
+                        Some(g) => self.blocks.push(Block::Banner(vec![format!("goal (round {}/12): {g}", self.goal_rounds), "the agent keeps working until a checker model says it is met · /goal off to stop".into()])),
+                        None => self.blocks.push(Block::System("no goal set — /goal <condition> works until that condition holds (checked by the aux model after every turn)".into())),
+                    }
+                } else if a == "off" || a == "clear" || a == "stop" {
+                    self.goal = None; self.goal_rounds = 0;
+                    self.blocks.push(Block::System("goal cleared".into()));
+                } else {
+                    self.goal = Some(a.clone()); self.goal_rounds = 0;
+                    self.blocks.push(Block::System(format!("goal set: {a} — working until it is met (max 12 rounds; /goal off stops)")));
+                    if self.running.is_none() { self.start_run(format!("Work until this is true: {a}\n\nStart now and keep going until it holds; verify it yourself before claiming success.")); }
+                }
+            }
             "/effort" => {
                 let lvl = arg.trim().to_lowercase();
                 if lvl.is_empty() { self.blocks.push(Block::System(format!("effort: {} (Claude Code backend) — /effort low|medium|high|xhigh|max", self.cfg.llm.effort.clone().unwrap_or("medium (default)".into())))); }
@@ -1430,6 +1461,7 @@ impl App {
                 }
             }
             "/queue" => {
+                if !arg.is_empty() && arg != "clear" { self.queued.push(arg.clone()); self.set_status(format!("queued ({} waiting)", self.queued.len())); return; }
                 if self.queued.is_empty() { self.blocks.push(Block::System("queue is empty".into())); }
                 else { let mut lines = vec![format!("Queued tasks ({}) — /next skips the current one, /queue clear empties the queue", self.queued.len())]; for (i, q) in self.queued.iter().enumerate() { lines.push(format!("  {}. {}", i + 1, truncate(q, 120))); } self.blocks.push(Block::Banner(lines)); }
                 if arg == "clear" { self.queued.clear(); self.blocks.push(Block::System("queue cleared".into())); }
@@ -1593,7 +1625,7 @@ impl App {
                 let policy = Arc::new(harness::permissions::Policy::new(pcfg, &workdir));
                 let _ = tx.send(Msg::Policy(policy.clone()));
                 let approver: Arc<dyn harness::permissions::Approver> = Arc::new(TuiApprover(tx.clone()));
-                let mut env_ = harness::agent::SubAgentEnv::new(client.clone(), registry.clone(), policy.clone(), approver.clone(), sink.clone(), budget, true); env_.cc_effort = cfg.llm.effort.clone(); let env = Arc::new(env_); let _ = tx.send(Msg::SubEnv(env.clone()));
+                let mut env_ = harness::agent::SubAgentEnv::new(client.clone(), registry.clone(), policy.clone(), approver.clone(), sink.clone(), budget, true); env_.cc_effort = cfg.llm.effort.clone(); env_.max_depth = cfg.agent.max_subagent_depth.max(1); let env = Arc::new(env_); let _ = tx.send(Msg::SubEnv(env.clone()));
                 let ctx = ToolCtx { workdir: workdir.clone(), timeout: Duration::from_secs(cfg.agent.tool_timeout_secs), max_output: cfg.agent.max_tool_output_chars, net: cfg.net.clone(), memory: store.clone(), subagent: Some(env), redact_secrets: cfg.security.redact_secrets, hooks: cfg.hooks.clone(), todos: todos.clone(), lsp_servers: cfg.lsp.servers.clone(), format: cfg.format.clone(), extra_roots: extra_roots.clone(), approver: Some(approver.clone()), inbox: inbox.clone(), cancel: None, cwd: Some(cwd.clone()), session_id: Some(session_id.clone()) };
                 let agent = Agent { client: &client, registry, ctx: &ctx, max_turns: cfg.agent.max_turns, context_budget: budget, sink: sink.as_ref(), stream: true, policy: &policy, approver: approver.as_ref() };
                 let extra = format!("You are in an interactive session: the user can see everything and will reply; keep final answers concise.{extra_prompt}");
@@ -1829,6 +1861,17 @@ impl App {
             }
             Msg::Frames(Err(e)) => { if let Some(v) = &mut self.video { v.loading = false; v.error = Some(e); } }
             Msg::Pasted(Err(e)) => self.set_status(e),
+            Msg::GoalCheck(met, reason) => {
+                let Some(goal) = self.goal.clone() else { return };
+                if met {
+                    self.goal = None; self.goal_rounds = 0;
+                    self.blocks.push(Block::System(format!("goal met: {goal}{}", if reason.is_empty() { String::new() } else { format!(" — {reason}") })));
+                } else if self.running.is_none() {
+                    self.goal_rounds += 1;
+                    self.blocks.push(Block::System(format!("goal not met yet ({}): {reason} — continuing (round {}/12, /goal off stops)", goal, self.goal_rounds)));
+                    self.start_run(format!("[goal] Not satisfied yet: {reason}\nKeep working until this is true, then verify it: {goal}"));
+                }
+            }
             Msg::Done(res) => {
                 self.running = None;
                 if let Some(cc) = self.cc.clone() { let tx = self.tx.clone(); tokio::spawn(async move { if let Some(id) = cc.session_id.lock().await.clone() { let _ = tx.send(Msg::CcSid(id)); } }); }
@@ -1853,6 +1896,20 @@ impl App {
                     self.set_status(format!("→ next task ({} left in queue)", self.queued.len()));
                     self.start_run(next);
                 } else if let Some(m) = self.inbox.take_message() { self.set_status("inbox event → waking the agent"); self.start_run(m); }
+                else if let Some(goal) = self.goal.clone() {
+                    if self.goal_rounds >= 12 { self.goal = None; self.blocks.push(Block::System("goal: giving up after 12 rounds — /goal <condition> to try again".into())); }
+                    else {
+                        self.set_status("checking whether the goal is met…");
+                        let (session, cfg, tx) = (self.session.clone(), self.cfg.clone(), self.tx.clone());
+                        let last = self.blocks.iter().rev().find_map(|b| if let Block::Assistant { text, .. } = b { Some(text.clone()) } else { None }).unwrap_or_default();
+                        tokio::spawn(async move {
+                            let msgs = session.lock().await.clone();
+                            let Ok(client) = Client::new(&cfg.llm) else { return };
+                            let (met, reason) = harness::agent::goal_check(&client, &goal, &last, &msgs).await;
+                            let _ = tx.send(Msg::GoalCheck(met, reason));
+                        });
+                    }
+                }
             }
         }
     }
@@ -2037,7 +2094,8 @@ const COMMANDS: &[(&str, &str)] = &[
     ("/theme", "switch theme: /theme light|dark"),
     ("/vim", "toggle vim-style modal editing in the prompt"),
     ("/workflow", "run a workflow: /workflow <name> [args]  (list with /workflow)"),
-    ("/queue", "show queued tasks (/queue clear)"),
+    ("/queue", "queue a task instead of steering: /queue <text> · show the queue · /queue clear"),
+    ("/goal", "keep working until a condition holds: /goal <condition> · /goal off (checked by the aux model each turn)"),
     ("/next", "stop the current task and start the next queued one (ctrl+n)"),
     ("/status", "backend, context, session, permissions at a glance"),
     ("/doctor", "check external tools, claude CLI, config paths"),

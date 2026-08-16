@@ -155,6 +155,41 @@ pub async fn reflect_after_run(client: &Client, store: &crate::memory::MemorySto
     if let Ok(done) = store.maybe_consolidate(&aux).await { for f in done { sink.emit(&Event::Memory { file: f, section: "consolidated".into(), text: "file was long; merged and de-duplicated".into() }); } }
 }
 
+/// `/goal`: ask a cheap model whether the user's success condition is now satisfied.
+/// Returns (met, reason). Errors and unparseable answers mean "not met" — the loop keeps working
+/// rather than declaring victory.
+pub async fn goal_check(client: &Client, goal: &str, last_answer: &str, transcript_tail: &[Message]) -> (bool, String) {
+    let system = "You check whether an autonomous coding agent has met the user's success condition. Judge only from evidence in the transcript (files written, commands run and their output, tests passing). Reply with JSON only: {\"met\": true|false, \"reason\": \"<= 20 words\"}. If the evidence is missing or ambiguous, answer false — the agent will keep working.";
+    let tail = crate::agent::render_tail(transcript_tail, 6000);
+    let user = format!("Success condition:\n{goal}\n\nThe agent's last answer:\n{}\n\nRecent activity:\n{tail}\n\nJSON:", crate::llm::truncate_for_log(last_answer, 3000));
+    let Ok((reply, _)) = client.aux().chat(&[Message::system(system), Message::user(user)], &[]).await else { return (false, "goal check failed (model unavailable)".into()) };
+    let text = reply.text();
+    let Some(json) = crate::memory::extract_json(&text) else { return (false, "goal check returned no JSON".into()) };
+    let v: serde_json::Value = serde_json::from_str(&json).unwrap_or_default();
+    let met = v["met"].as_bool().unwrap_or(false);
+    (met, v["reason"].as_str().unwrap_or("").trim().to_string())
+}
+
+/// Compact rendering of the last messages (for goal checks and other aux calls).
+pub fn render_tail(msgs: &[Message], max_chars: usize) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    for m in msgs.iter().rev().take(24) {
+        let line = match m.role.as_str() {
+            "tool" => format!("[tool {}] {}", m.name.clone().unwrap_or_default(), crate::llm::truncate_for_log(&m.text().replace('\n', " "), 300)),
+            "assistant" => {
+                let calls = m.tool_calls.as_ref().map(|c| c.iter().map(|c| format!("{}({})", c.function.name, crate::llm::truncate_for_log(&c.function.arguments, 120))).collect::<Vec<_>>().join(", ")).unwrap_or_default();
+                format!("[assistant] {} {}", crate::llm::truncate_for_log(&m.text().replace('\n', " "), 300), calls)
+            }
+            "user" => format!("[user] {}", crate::llm::truncate_for_log(&m.text().replace('\n', " "), 300)),
+            _ => continue,
+        };
+        parts.push(line);
+    }
+    parts.reverse();
+    let joined = parts.join("\n");
+    crate::sandbox::truncate_middle(&joined, max_chars)
+}
+
 pub fn system_prompt(workdir: &str, tools: &[&str], extra: Option<&str>) -> String {
     system_prompt_with_memory(workdir, tools, extra, None)
 }
@@ -212,6 +247,10 @@ pub struct SubAgentInfo {
     pub cc: std::sync::Mutex<Option<Arc<crate::claude_code::ClaudeCodeSession>>>,
     /// Messages pushed here (attach mode) reach the sub-agent before its next model call.
     pub inbox: Arc<crate::inbox::Inbox>,
+    /// Final report, once it has one (background agents are collected from here).
+    pub report: std::sync::Mutex<Option<String>>,
+    /// True when the parent did not wait for it.
+    pub background: std::sync::atomic::AtomicBool,
 }
 impl SubAgentInfo {
     pub fn kill(&self) { self.cancel.store(true, std::sync::atomic::Ordering::Relaxed); *self.status.lock().unwrap() = "cancelling".into(); if let Some(cc) = self.cc.lock().unwrap().clone() { tokio::spawn(async move { cc.stop().await; }); } }
@@ -231,16 +270,33 @@ pub struct SubAgentEnv {
     pub sink: std::sync::Arc<dyn Sink>,
     pub context_budget: u64,
     pub stream: bool,
+    /// How deep this env already is (0 = the main agent). Sub-agents may spawn until `max_depth`.
+    pub depth: usize,
+    pub max_depth: usize,
+    /// The parent's transcript, refreshed each turn — what `subagent_type: "fork"` inherits.
+    pub transcript: std::sync::Mutex<Vec<Message>>,
     counter: std::sync::atomic::AtomicUsize,
 }
 impl SubAgentEnv {
     pub fn new(client: Client, registry: crate::tools::Registry, policy: std::sync::Arc<crate::permissions::Policy>, approver: std::sync::Arc<dyn crate::permissions::Approver>, sink: std::sync::Arc<dyn Sink>, context_budget: u64, stream: bool) -> Self {
-        Self { agents: std::sync::Mutex::new(vec![]), cc_effort: None, client, registry, policy, approver, sink, context_budget, stream, counter: std::sync::atomic::AtomicUsize::new(0) }
+        Self { agents: std::sync::Mutex::new(vec![]), cc_effort: None, client, registry, policy, approver, sink, context_budget, stream, depth: 0, max_depth: 2, transcript: std::sync::Mutex::new(Vec::new()), counter: std::sync::atomic::AtomicUsize::new(0) }
     }
+    /// A nested environment for a sub-agent, so it can delegate further (up to `max_depth`).
+    pub fn child(&self, policy: std::sync::Arc<crate::permissions::Policy>, sink: std::sync::Arc<dyn Sink>) -> Option<Arc<SubAgentEnv>> {
+        if self.depth + 1 >= self.max_depth { return None; }
+        let mut e = SubAgentEnv::new(self.client.clone(), self.registry.clone(), policy, self.approver.clone(), sink, self.context_budget, self.stream);
+        e.cc_effort = self.cc_effort.clone();
+        e.depth = self.depth + 1;
+        e.max_depth = self.max_depth;
+        Some(Arc::new(e))
+    }
+    /// Remember the parent's transcript so a forked sub-agent can inherit the conversation.
+    pub fn snapshot(&self, msgs: &[Message]) { *self.transcript.lock().unwrap() = msgs.to_vec(); }
+    pub fn forked_transcript(&self) -> Vec<Message> { self.transcript.lock().unwrap().clone() }
     pub fn next_label(&self) -> String { format!("{}", self.counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1) }
     pub fn register(&self, label: String, task: String) -> Arc<SubAgentInfo> {
         let id = self.agents.lock().unwrap().len() + 1;
-        let info = Arc::new(SubAgentInfo { id, label, task, started: Instant::now(), finished: std::sync::Mutex::new(None), status: std::sync::Mutex::new("running".into()), tool_calls: std::sync::atomic::AtomicUsize::new(0), cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)), cc: std::sync::Mutex::new(None), inbox: Arc::new(crate::inbox::Inbox::new()) });
+        let info = Arc::new(SubAgentInfo { id, label, task, started: Instant::now(), finished: std::sync::Mutex::new(None), status: std::sync::Mutex::new("running".into()), tool_calls: std::sync::atomic::AtomicUsize::new(0), cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)), cc: std::sync::Mutex::new(None), inbox: Arc::new(crate::inbox::Inbox::new()), report: std::sync::Mutex::new(None), background: std::sync::atomic::AtomicBool::new(false) });
         self.agents.lock().unwrap().push(info.clone());
         info
     }
@@ -421,6 +477,8 @@ impl<'a> Agent<'a> {
             let sig: Vec<String> = calls.iter().map(|c| format!("{}:{}", c.function.name, c.function.arguments)).collect();
             if sig == last_sig { repeats += 1; } else { repeats = 0; last_sig = sig; }
             let all_read_only = calls.iter().all(|c| self.registry.is_parallel_safe(&c.function.name));
+            // sub-agents forked from here inherit the conversation as it stands now
+            if let Some(env) = &self.ctx.subagent { if calls.iter().any(|c| c.function.name == "spawn_agent") { env.snapshot(msgs); } }
             let mut prepared: Vec<(String, String, String)> = Vec::new(); // (id, name, args)
             for call in &calls {
                 stats.tool_calls += 1;

@@ -34,6 +34,8 @@ impl OutputFormat {
 
 pub struct Options {
     pub output: OutputFormat,
+    /// Keep working until an aux-model checker says this condition holds (max 12 rounds).
+    pub goal: Option<String>,
     /// Read user turns as stream-json objects from stdin instead of taking one task argument.
     pub input_stream: bool,
     /// Constrain the final answer to this JSON schema (also injected into the system prompt).
@@ -43,7 +45,7 @@ pub struct Options {
     pub max_turns: Option<usize>,
 }
 impl Default for Options {
-    fn default() -> Self { Self { output: OutputFormat::Text, input_stream: false, json_schema: None, verbose: false, yes: false, max_turns: None } }
+    fn default() -> Self { Self { output: OutputFormat::Text, goal: None, input_stream: false, json_schema: None, verbose: false, yes: false, max_turns: None } }
 }
 
 /// Claude-Code-compatible stream-json on stdout.
@@ -183,7 +185,23 @@ pub async fn run(mut cfg: Config, workdir: PathBuf, task: Option<String>, opts: 
             agent.run_turn(&mut msgs, &prepared.system, &prompt).await
         };
         match res {
-            Ok((mut text, stats)) => {
+            Ok((mut text, mut stats)) => {
+                // --goal: keep going until the checker is satisfied
+                if let Some(goal) = &opts.goal {
+                    let mut round = 0;
+                    loop {
+                        let (met, reason) = crate::agent::goal_check(&prepared.client, goal, &text, &msgs).await;
+                        if met { sink.emit(&Event::Assistant { text: format!("[goal met] {reason}") }); break; }
+                        round += 1;
+                        if round > 12 { sink.emit(&Event::Error { message: format!("goal not met after 12 rounds: {reason}") }); exit = 1; break; }
+                        sink.emit(&Event::Assistant { text: format!("[goal round {round}] not met: {reason} — continuing") });
+                        let cont = format!("[goal] Not satisfied yet: {reason}\nKeep working until this is true, then verify it: {goal}");
+                        match prepared.agent().run_turn(&mut msgs, &prepared.system, &cont).await {
+                            Ok((t, st)) => { text = t; stats.turns += st.turns; stats.tool_calls += st.tool_calls; stats.prompt_tokens += st.prompt_tokens; stats.completion_tokens += st.completion_tokens; }
+                            Err(e) => { sink.emit(&Event::Error { message: format!("{e:#}") }); exit = 1; break; }
+                        }
+                    }
+                }
                 total.turns += stats.turns; total.tool_calls += stats.tool_calls;
                 total.prompt_tokens += stats.prompt_tokens; total.completion_tokens += stats.completion_tokens;
                 let mut structured: Option<Value> = None;

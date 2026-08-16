@@ -53,12 +53,12 @@ pub async fn wait_for(targets: &[Arc<SubAgentInfo>], timeout: Duration) -> (bool
 #[async_trait]
 impl Tool for Agents {
     fn name(&self) -> &'static str { "agents" }
-    fn description(&self) -> &'static str { "Manage running sub-agents started with spawn_agent: list them, send a follow-up message to a running one (delivered before its next model call — use to steer, redirect or hand it new info instead of killing and re-spawning), kill one, or wait for one/all to finish (useful when several sub-agents run in parallel)." }
+    fn description(&self) -> &'static str { "Manage sub-agents started with spawn_agent: list them, send a follow-up message to a running one (delivered before its next model call — use to steer or redirect it instead of killing and re-spawning), kill one, wait for one/all to finish, or collect the report of a finished one (background agents)." }
     fn read_only(&self) -> bool { false }
     fn parallel_safe(&self) -> bool { true }
     fn parameters(&self) -> Value {
         json!({"type":"object","properties":{
-            "action":{"type":"string","enum":["list","send","kill","wait"]},
+            "action":{"type":"string","enum":["list","send","kill","wait","report"]},
             "id":{"type":"integer","description":"sub-agent number (from list); required for send/kill, optional for wait (default: all running)"},
             "message":{"type":"string","description":"send: the message to deliver to the running sub-agent"},
             "timeout_secs":{"type":"integer","description":"wait: give up after this many seconds (default 120)"}
@@ -92,9 +92,23 @@ impl Tool for Agents {
                 let targets: Vec<Arc<SubAgentInfo>> = if args.get("id").is_some() { vec![find(env, arg_id(&args)?)?] } else { env.list().into_iter().filter(|a| a.running()).collect() };
                 if targets.is_empty() { return Ok("no running sub-agents".into()); }
                 let (timed_out, lines) = wait_for(&targets, timeout).await;
-                Ok(if timed_out { format!("timed out after {}s; still running:\n{lines}", timeout.as_secs()) } else { format!("finished:\n{lines}") }.into())
+                let mut out = if timed_out { format!("timed out after {}s; still running:\n{lines}", timeout.as_secs()) } else { format!("finished:\n{lines}") };
+                // hand over the reports of the ones that finished, so a wait is enough to collect them
+                for t in &targets {
+                    if let Some(r) = t.report.lock().unwrap().clone() { out.push_str(&format!("\n\n── report of #{} ──\n{}", t.id, r)); }
+                }
+                Ok(out.into())
             }
-            other => bail!("unknown action '{other}' (list|send|kill|wait)"),
+            "report" => {
+                let info = find(env, arg_id(&args)?)?;
+                let report = info.report.lock().unwrap().clone();
+                match report {
+                    Some(r) => Ok(format!("── report of #{} {} ──\n{}", info.id, info.label, r).into()),
+                    None if info.running() => Ok(format!("#{} {} is still running ({}) — agents {{action:\"wait\", id:{}}} to block until it finishes", info.id, info.label, info.status.lock().unwrap(), info.id).into()),
+                    None => Ok(format!("#{} {} finished without a report ({})", info.id, info.label, info.status.lock().unwrap()).into()),
+                }
+            }
+            other => bail!("unknown action '{other}' (list|send|kill|wait|report)"),
         }
     }
 }

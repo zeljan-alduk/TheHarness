@@ -61,6 +61,9 @@ enum Cmd {
         /// Constrain the final answer to a JSON schema (inline JSON or a path to a .json file)
         #[arg(long)]
         json_schema: Option<String>,
+        /// Keep working until this condition holds (checked by the aux model after every turn)
+        #[arg(long)]
+        goal: Option<String>,
         /// The task, in natural language. Use '-' to read from stdin. Omit with --input-format stream-json.
         task: Option<String>,
     },
@@ -366,7 +369,7 @@ async fn main() -> Result<()> {
         Cmd::Config => {
             println!("{cfg:#?}");
         }
-        Cmd::Run { dir, max_turns, no_net, output_format, input_format, json_schema, task } => {
+        Cmd::Run { dir, max_turns, no_net, output_format, input_format, json_schema, goal, task } => {
             let input_stream = harness::headless::OutputFormat::parse(&input_format) == Some(harness::headless::OutputFormat::StreamJson);
             let task = match task {
                 Some(t) if t == "-" => { let mut s = String::new(); std::io::Read::read_to_string(&mut std::io::stdin(), &mut s)?; Some(s) }
@@ -379,7 +382,7 @@ async fn main() -> Result<()> {
             let mut output = harness::headless::OutputFormat::parse(&output_format).context("--output-format must be text|json|stream-json")?;
             if cli.json && output == harness::headless::OutputFormat::Text { output = harness::headless::OutputFormat::StreamJson; }
             let opts = harness::headless::Options {
-                output, input_stream,
+                output, input_stream, goal,
                 json_schema: json_schema.as_deref().map(harness::headless::load_schema).transpose()?,
                 verbose: cli.verbose, yes: cli.yes, max_turns,
             };
