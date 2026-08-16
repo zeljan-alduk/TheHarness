@@ -62,6 +62,7 @@ const SETTINGS: &[(&str, &str, &[&str], &str)] = &[
     ("net.enabled", "Internet tools", &["on", "off"], "web_fetch / web_search / download_file"),
     ("agent.max_task_secs", "Max task time", &["0", "300", "900", "1800", "3600"], "0 = unlimited; the queue continues afterwards"),
     ("ui.event_log", "Event log", &["on", "off"], "~/.config/harness/logs/<date>/"),
+    ("ui.font_size", "Font size (pt)", &["0", "11", "12", "13", "14", "15", "16", "18", "20"], "0 = leave the terminal alone · ctrl+= / ctrl+- / ctrl+0 (kitty, iTerm2, Terminal.app)"),
     ("sandbox.mode", "Sandbox", &["none", "seatbelt", "bwrap"], "confine shell writes (macOS seatbelt / Linux bubblewrap)"),
     ("llm.provider", "Backend", &[], "change with /backend"),
     ("llm.model", "Model", &[], "change with /model or /backend"),
@@ -76,7 +77,7 @@ struct Keymap { map: std::collections::HashMap<String, (KeyCode, KeyModifiers)> 
 impl Keymap {
     fn load() -> Self {
         let mut m = std::collections::HashMap::new();
-        let defaults = [("interrupt", "esc"), ("next_task", "ctrl+n"), ("toggle_panel", "ctrl+p"), ("toggle_thinking", "ctrl+t"), ("expand_tools", "ctrl+o"), ("paste", "ctrl+v"), ("cycle_permissions", "shift+tab"), ("newline", "ctrl+j"), ("quit", "ctrl+d"), ("scroll_up", "pageup"), ("scroll_down", "pagedown"), ("clear_line", "ctrl+u"), ("jump_bottom", "ctrl+l"), ("complete", "tab")];
+        let defaults = [("interrupt", "esc"), ("next_task", "ctrl+n"), ("toggle_panel", "ctrl+p"), ("toggle_thinking", "ctrl+t"), ("expand_tools", "ctrl+o"), ("paste", "ctrl+v"), ("cycle_permissions", "shift+tab"), ("newline", "ctrl+j"), ("quit", "ctrl+d"), ("scroll_up", "pageup"), ("scroll_down", "pagedown"), ("clear_line", "ctrl+u"), ("jump_bottom", "ctrl+l"), ("complete", "tab"), ("font_bigger", "ctrl+="), ("font_smaller", "ctrl+-"), ("font_reset", "ctrl+0")];
         for (a, k) in defaults { if let Some(v) = parse_key(k) { m.insert(a.to_string(), v); } }
         let p = harness::setup::config_dir().join("keybindings.toml");
         if let Ok(t) = std::fs::read_to_string(&p) { if let Ok(v) = t.parse::<toml::Value>() { if let Some(b) = v.get("bindings").and_then(|b| b.as_table()) { for (a, k) in b { if let Some(ks) = k.as_str() { if let Some(v) = parse_key(ks) { m.insert(a.clone(), v); } } } } } }
@@ -166,6 +167,32 @@ fn load_attachment(path: &std::path::Path) -> Result<Attachment, String> {
     use base64::Engine;
     Ok(Attachment { path: path.to_path_buf(), mime: mime.into(), b64: base64::engine::general_purpose::STANDARD.encode(&bytes), dims, img, label: None })
 }
+
+/// Drive the terminal's font size. Kitty via remote control (needs allow_remote_control; we set KITTY_LISTEN_ON when
+/// we launch it), iTerm2 and Terminal.app via AppleScript. Returns the terminal name on success.
+async fn set_terminal_font_size(pt: u32) -> Result<&'static str, String> {
+    if std::env::var_os("KITTY_WINDOW_ID").is_some() {
+        let mut c = tokio::process::Command::new(crate_kitten());
+        c.arg("@");
+        if let Ok(to) = std::env::var("KITTY_LISTEN_ON") { c.arg("--to").arg(to); }
+        let o = c.args(["set-font-size", &pt.to_string()]).output().await.map_err(|e| e.to_string())?;
+        return if o.status.success() { Ok("kitty") } else { Err(format!("kitty: {} (start kitty with allow_remote_control=yes)", String::from_utf8_lossy(&o.stderr).trim())) };
+    }
+    let prog = std::env::var("TERM_PROGRAM").unwrap_or_default();
+    if prog == "iTerm.app" {
+        let script = format!("tell application \"iTerm2\" to tell current session of current window to set font size to {pt}");
+        let o = tokio::process::Command::new("osascript").arg("-e").arg(script).output().await.map_err(|e| e.to_string())?;
+        return if o.status.success() { Ok("iTerm2") } else { Err(String::from_utf8_lossy(&o.stderr).trim().to_string()) };
+    }
+    if prog == "Apple_Terminal" {
+        let script = format!("tell application \"Terminal\" to set font size of front window to {pt}");
+        let o = tokio::process::Command::new("osascript").arg("-e").arg(script).output().await.map_err(|e| e.to_string())?;
+        return if o.status.success() { Ok("Terminal") } else { Err(String::from_utf8_lossy(&o.stderr).trim().to_string()) };
+    }
+    if prog == "WezTerm" { return Err("WezTerm: use its own ctrl+= / ctrl+- (no remote font control)".into()); }
+    Err("this terminal cannot be resized from the app (kitty, iTerm2, Terminal.app supported)".into())
+}
+fn crate_kitten() -> String { if let Ok(exe) = std::env::var("KITTY_INSTALLATION_DIR") { let p = std::path::Path::new(&exe).join("../MacOS/kitten"); if p.exists() { return p.display().to_string(); } } for c in ["/Applications/kitty.app/Contents/MacOS/kitten", "/opt/homebrew/bin/kitten", "/usr/local/bin/kitten"] { if std::path::Path::new(c).exists() { return c.into(); } } "kitten".into() }
 
 /// Terminals that implement an inline-image protocol (and answer capability queries).
 fn graphics_terminal() -> bool {
@@ -485,6 +512,9 @@ pub async fn run(cfg: Config, resume: Option<String>) -> Result<()> {
 
     let mut terminal = ratatui::init();
     let _ = crossterm::execute!(std::io::stdout(), crossterm::event::EnableBracketedPaste, crossterm::event::EnableMouseCapture);
+    let kbd_enh = crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false);
+    if kbd_enh { let _ = crossterm::execute!(std::io::stdout(), crossterm::event::PushKeyboardEnhancementFlags(crossterm::event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)); }
+    if app.cfg.ui.font_size > 0 { let sz = app.cfg.ui.font_size; tokio::spawn(async move { let _ = set_terminal_font_size(sz).await; }); }
     let mut events = EventStream::new();
     let mut ticker = tokio::time::interval(Duration::from_millis(80));
     let res: Result<()> = async {
@@ -509,6 +539,7 @@ pub async fn run(cfg: Config, resume: Option<String>) -> Result<()> {
         }
         Ok(())
     }.await;
+    if kbd_enh { let _ = crossterm::execute!(std::io::stdout(), crossterm::event::PopKeyboardEnhancementFlags); }
     let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableMouseCapture, crossterm::event::DisableBracketedPaste);
     ratatui::restore();
     if !app.session_meta.id.is_empty() { harness::mailbox::unregister(&app.session_meta.id); }
@@ -582,7 +613,7 @@ impl App {
             "ui.theme" => if LIGHT.load(std::sync::atomic::Ordering::Relaxed) { "light".into() } else { "dark".into() }, "ui.notify" => b(self.cfg.ui.notify), "ui.fold_previous" => b(self.cfg.ui.fold_previous), "ui.vim" => b(self.vim),
             "permissions.mode" => format!("{:?}", self.perm_mode).to_lowercase(), "llm.effort" => self.cfg.llm.effort.clone().unwrap_or("medium".into()), "llm.compact_at_fraction" => format!("{}", self.cfg.llm.compact_at_fraction),
             "memory.auto_reflect" => b(self.cfg.memory.auto_reflect), "security.redact_secrets" => b(self.cfg.security.redact_secrets), "net.enabled" => b(self.net), "agent.max_task_secs" => self.cfg.agent.max_task_secs.to_string(), "ui.event_log" => b(self.cfg.ui.event_log), "sandbox.mode" => if self.cfg.sandbox.mode.is_empty() { "none".into() } else { self.cfg.sandbox.mode.clone() },
-            "llm.provider" => self.cfg.llm.provider.clone().unwrap_or("local (OpenAI-compatible server)".into()), "llm.model" => self.model.clone(),
+            "llm.provider" => self.cfg.llm.provider.clone().unwrap_or("local (OpenAI-compatible server)".into()), "llm.model" => self.model.clone(), "ui.font_size" => self.cfg.ui.font_size.to_string(),
             _ => String::new(),
         }
     }
@@ -606,6 +637,7 @@ impl App {
             "permissions.mode" => { if let Some(m) = harness::permissions::Mode::parse(val) { self.set_perm_mode(m); } }
             "net.enabled" => { self.net = val == "on"; self.reload_toolset(); }
             "llm.effort" => { if let Some(cc) = self.cc.take() { tokio::spawn(async move { cc.stop().await; }); } }
+            "ui.font_size" => { if let Ok(n) = val.parse::<u32>() { if n > 0 { let tx = self.tx.clone(); tokio::spawn(async move { let _ = tx.send(Msg::Toast(match set_terminal_font_size(n).await { Ok(t) => format!("font size {n}pt ({t})"), Err(e) => e })); }); } } }
             _ => {}
         }
         match harness::config::Config::save_setting(key, val) { Ok(()) => self.set_status(format!("{key} = {val} (saved)")), Err(e) => self.set_status(format!("{key} = {val} (not saved: {e})")) }
@@ -733,6 +765,9 @@ impl App {
                 if km.is("jump_bottom", k.code, k.modifiers) { self.scroll_up = 0; return; }
                 if km.is("complete", k.code, k.modifiers) { self.complete_slash(); return; }
                 if km.is("interrupt", k.code, k.modifiers) && self.running.is_some() { self.interrupt(); return; }
+                if km.is("font_bigger", k.code, k.modifiers) || (k.code == KeyCode::Char('+') && ctrl) { self.adjust_font(1); return; }
+                if km.is("font_smaller", k.code, k.modifiers) || (k.code == KeyCode::Char('_') && ctrl) { self.adjust_font(-1); return; }
+                if km.is("font_reset", k.code, k.modifiers) { self.adjust_font(0); return; }
                 // 2) vim normal mode
                 if self.vim && self.vim_normal {
                     let n = self.input.chars().count();
@@ -1148,7 +1183,8 @@ impl App {
                     "  pgup / pgdn, ctrl+↑/↓, mouse wheel   scroll transcript (wheel over the panel scrolls thinking)".into(),
                     "  y / a / n        answer a permission prompt (once / always / deny)".into(),
                     "  video scrubber:  ←/→ frames · space select · a all · enter attach · esc cancel".into(),
-                    "  left-drag        select text in the transcript → copied to the clipboard (toast)".into(),
+                    "  left-drag        select text anywhere → copied to the clipboard (toast)".into(),
+                    "  ctrl+= / ctrl+-  bigger / smaller terminal font (kitty, iTerm2, Terminal.app) · ctrl+0 reset · remembered".into(),
                     "  text selection:  shift-drag (kitty/wezterm/iterm) or fn/option (Terminal.app) = terminal-native selection".into(),
                 ]));
             }
@@ -1780,6 +1816,16 @@ impl App {
             Event::Permission { tool, summary, decision } => { if decision.starts_with("denied") { self.blocks.push(Block::Error(format!("🔒 {tool}({}) {decision}", truncate(&summary, 80)))); } }
         }
     }
+    /// Change the terminal font size (kitty / iTerm2 / Terminal.app), persist it, toast it. delta 0 = reset to 13.
+    fn adjust_font(&mut self, delta: i32) {
+        let cur = if self.cfg.ui.font_size > 0 { self.cfg.ui.font_size as i32 } else { 13 };
+        let next = if delta == 0 { 13 } else { (cur + delta).clamp(6, 40) };
+        self.cfg.ui.font_size = next as u32;
+        let _ = harness::config::Config::save_setting("ui.font_size", &next.to_string());
+        let tx = self.tx.clone();
+        tokio::spawn(async move { let _ = tx.send(Msg::Toast(match set_terminal_font_size(next as u32).await { Ok(t) => format!("font size {next}pt ({t})"), Err(e) => format!("font size: {e}") })); });
+    }
+
     /// Extract the selected text from the visible transcript rows and put it on the clipboard.
     fn copy_selection(&mut self, a: (u16, u16), c: (u16, u16)) {
         let (mut p1, mut p2) = (a, c); if (p1.1, p1.0) > (p2.1, p2.0) { std::mem::swap(&mut p1, &mut p2); }

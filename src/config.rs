@@ -88,11 +88,13 @@ pub struct UiConfig {
     #[serde(default)] pub vim: bool,
     /// Auto-fold the previous turn's outputs when a new turn starts
     #[serde(default = "d_true")] pub fold_previous: bool,
+    /// Terminal font size (pt) applied at start when the terminal can be driven (kitty, iTerm2, Terminal.app); 0 = leave alone. ctrl+= / ctrl+- / ctrl+0.
+    #[serde(default)] pub font_size: u32,
 }
 fn d_theme() -> String { "dark".into() }
 fn d_tool_view() -> String { "summary".into() }
 fn d_panel() -> String { "auto".into() }
-impl Default for UiConfig { fn default() -> Self { Self { notify: true, theme: d_theme(), event_log: true, tool_view: d_tool_view(), show_thinking: false, panel: d_panel(), vim: false, fold_previous: true } } }
+impl Default for UiConfig { fn default() -> Self { Self { notify: true, theme: d_theme(), event_log: true, tool_view: d_tool_view(), show_thinking: false, panel: d_panel(), vim: false, fold_previous: true, font_size: 0 } } }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct SecurityConfig {
@@ -263,6 +265,7 @@ impl Config {
             "ui.panel" => self.ui.panel = val.into(),
             "ui.vim" => self.ui.vim = b(val),
             "ui.fold_previous" => self.ui.fold_previous = b(val),
+            "ui.font_size" => self.ui.font_size = val.parse().context("bad size")?,
             "permissions.mode" => self.permissions.mode = crate::permissions::Mode::parse(val).context("bad mode")?,
             "llm.compact_at_fraction" => self.llm.compact_at_fraction = val.parse().context("bad fraction")?,
             "llm.effort" => self.llm.effort = if val.is_empty() || val == "default" { None } else { Some(val.into()) },
