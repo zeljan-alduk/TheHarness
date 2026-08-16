@@ -205,9 +205,11 @@ impl Registry {
                 Err(e) => return format!("error: tool arguments are not valid JSON ({e}): {args_json}").into(),
             }
         };
-        let mut out = match tool.call(args, ctx).await {
-            Ok(s) => s,
-            Err(e) => format!("error: {e:#}").into(),
+        // a panicking tool must not take the session down: it becomes an error result the model can see
+        let mut out = match futures_util::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(tool.call(args, ctx))).await {
+            Ok(Ok(s)) => s,
+            Ok(Err(e)) => format!("error: {e:#}").into(),
+            Err(p) => { let msg = p.downcast_ref::<String>().cloned().or_else(|| p.downcast_ref::<&str>().map(|s| s.to_string())).unwrap_or_else(|| "unknown panic".into()); format!("error: tool panicked: {msg}").into() }
         };
         if ctx.redact_secrets { out.text = crate::security::redact(&out.text); }
         // todo hygiene reminder (like Claude Code's system reminders): appended to a tool result, at most every 6 calls
@@ -276,5 +278,32 @@ mod tests {
         assert!(c.resolve("/etc/passwd").is_err());
         assert!(c.resolve("sub/../ok.txt").is_ok());
         assert!(c.resolve("new/dir/file.txt").is_ok());
+    }
+    #[test]
+    fn resolve_rejects_symlink_escape() {
+        let c = ctx();
+        let link = c.workdir.join("escape-link");
+        let _ = std::fs::remove_file(&link);
+        #[cfg(unix)] {
+            std::os::unix::fs::symlink("/etc", &link).unwrap();
+            assert!(c.resolve("escape-link/passwd").is_err());
+            assert!(c.resolve("escape-link").is_err());
+            let _ = std::fs::remove_file(&link);
+        }
+    }
+    struct Boom;
+    #[async_trait]
+    impl Tool for Boom {
+        fn name(&self) -> &'static str { "boom" }
+        fn description(&self) -> &'static str { "" }
+        fn parameters(&self) -> Value { Value::Null }
+        async fn call(&self, _a: Value, _c: &ToolCtx) -> Result<ToolOutput> { panic!("kaboom") }
+    }
+    #[tokio::test]
+    async fn panicking_tool_becomes_error() {
+        let mut r = Registry { tools: vec![] };
+        r.extend(vec![std::sync::Arc::new(Boom)]);
+        let out = r.call("boom", "{}", &ctx()).await;
+        assert!(out.text.contains("tool panicked: kaboom"), "{}", out.text);
     }
 }

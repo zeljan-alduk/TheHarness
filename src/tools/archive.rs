@@ -3,7 +3,7 @@
 //! so nothing can escape the workdir.
 
 use super::{arg_str, Tool, ToolCtx, ToolOutput};
-use crate::sandbox;
+use crate::sandbox::{self, shq};
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use serde_json::{json, Value};
@@ -11,12 +11,17 @@ use serde_json::{json, Value};
 pub struct ReadPdf;
 pub struct ExtractArchive;
 
-/// Is `cmd` on the PATH? (run_shell scrubs secret env vars but keeps PATH)
-async fn has_cmd(ctx: &ToolCtx, cmd: &str) -> bool {
-    sandbox::run_shell(&format!("command -v {cmd} >/dev/null 2>&1"), &ctx.workdir, ctx.timeout, 64)
+/// Is `cmd` on the PATH? Probed once per process (run_shell scrubs secret env vars but keeps PATH).
+pub async fn has_cmd(ctx: &ToolCtx, cmd: &str) -> bool {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, bool>>> = std::sync::OnceLock::new();
+    let cache = CACHE.get_or_init(Default::default);
+    if let Some(&v) = cache.lock().unwrap().get(cmd) { return v; }
+    let v = sandbox::run_shell(&format!("command -v {} >/dev/null 2>&1", shq(cmd)), &ctx.workdir, ctx.timeout, 64)
         .await
         .map(|o| o.success())
-        .unwrap_or(false)
+        .unwrap_or(false);
+    if v { cache.lock().unwrap().insert(cmd.to_string(), true); } // only cache hits: a missing tool may get installed mid-session
+    v
 }
 
 /// Which CLI extracts this file? Returns the command prefix (no input/output args).
@@ -44,6 +49,7 @@ fn default_dest(file_name: &str) -> String {
 
 #[async_trait]
 impl Tool for ReadPdf {
+    fn read_only(&self) -> bool { true }
     fn name(&self) -> &'static str { "read_pdf" }
     fn description(&self) -> &'static str {
         "Extract text from a PDF file in the working directory (via pdftotext -layout). Use max_pages to read only the first N pages of a long document."
@@ -65,7 +71,7 @@ impl Tool for ReadPdf {
         let max_pages = args.get("max_pages").and_then(|v| v.as_u64()).filter(|&n| n > 0);
         let range = max_pages.map(|n| format!(" -f 1 -l {n}")).unwrap_or_default();
         let out = sandbox::run_shell(
-            &format!("pdftotext -layout {} '{}' -", range, path.display()),
+            &format!("pdftotext -layout {} {} -", range, shq(&path.display().to_string())),
             &ctx.workdir, ctx.timeout, ctx.max_output * 4,
         ).await.with_context(|| format!("running pdftotext on {}", path.display()))?;
         if out.timed_out { bail!("pdftotext timed out after {}s on {}", ctx.timeout.as_secs(), path.display()); }
@@ -107,7 +113,7 @@ impl Tool for ExtractArchive {
         let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("archive");
         let dest = match args.get("dest").and_then(|v| v.as_str()).filter(|s| !s.trim().is_empty()) {
             Some(d) => ctx.resolve(d)?,
-            None => ctx.workdir.join(default_dest(file_name)),
+            None => path.parent().unwrap_or(&ctx.workdir).join(default_dest(file_name)), // next to the archive
         };
 
         // .gz is a single-file format: gunzip -k decompresses in place next to the archive.
@@ -116,7 +122,7 @@ impl Tool for ExtractArchive {
         if ext.eq_ignore_ascii_case("gz") && !is_tarball {
             let out_name = path.with_extension(""); // foo.gz -> foo
             if out_name.exists() { bail!("refusing to overwrite existing {}", out_name.display()); }
-            let o = sandbox::run_shell(&format!("gunzip -k '{}'", path.display()), &ctx.workdir, ctx.timeout, 4096)
+            let o = sandbox::run_shell(&format!("gunzip -k {}", shq(&path.display().to_string())), &ctx.workdir, ctx.timeout, 4096)
                 .await.with_context(|| format!("gunzip {}", path.display()))?;
             if !o.success() { bail!("gunzip failed: {}", o.stderr.trim()); }
             return Ok(format!("decompressed {} -> {}\nentries:\n{}", path.display(), out_name.display(),
@@ -124,11 +130,12 @@ impl Tool for ExtractArchive {
         }
 
         tokio::fs::create_dir_all(&dest).await.with_context(|| format!("creating {}", dest.display()))?;
+        let (p, d) = (shq(&path.display().to_string()), shq(&dest.display().to_string()));
         let cmd = match ext.to_ascii_lowercase().as_str() {
-            "zip" => format!("unzip -o '{}' -d '{}'", path.display(), dest.display()),
-            "tar" => format!("tar -xf '{}' -C '{}'", path.display(), dest.display()),
-            "gz" | "tgz" => format!("tar -xzf '{}' -C '{}'", path.display(), dest.display()),
-            "7z" | "rar" => format!("7z x -y '{}' -o'{}'", path.display(), dest.display()),
+            "zip" => format!("unzip -o {p} -d {d}"),
+            "tar" => format!("tar -xf {p} -C {d}"),
+            "gz" | "tgz" => format!("tar -xzf {p} -C {d}"),
+            "7z" | "rar" => format!("7z x -y {p} -o{d}"),
             _ => unreachable!("checked by archive_cmd"),
         };
         let o = sandbox::run_shell(&cmd, &ctx.workdir, ctx.timeout, 8192)
@@ -137,7 +144,7 @@ impl Tool for ExtractArchive {
         if !o.success() { bail!("extraction failed for {}: {}", path.display(), o.stderr.trim()); }
 
         let l = sandbox::run_shell(
-            &format!("find {} -mindepth 1 -maxdepth 1 | LC_ALL=C sort", dest.display()),
+            &format!("find {d} -mindepth 1 -maxdepth 1 | LC_ALL=C sort"),
             &ctx.workdir, ctx.timeout, 8192,
         ).await.unwrap_or_else(|_| sandbox::ProcOutput { stdout: String::new(), stderr: "listing failed".into(), code: None, timed_out: false, elapsed: std::time::Duration::ZERO });
         let mut entries: Vec<String> = l.stdout.lines().map(|s| {
