@@ -52,8 +52,17 @@ enum Cmd {
         /// Disable web tools for this run
         #[arg(long)]
         no_net: bool,
-        /// The task, in natural language. Use '-' to read from stdin.
-        task: String,
+        /// text (default) | json | stream-json — see `harness run --help`
+        #[arg(long, default_value = "text")]
+        output_format: String,
+        /// text (default) | stream-json: read user turns as JSON objects on stdin (multi-turn)
+        #[arg(long, default_value = "text")]
+        input_format: String,
+        /// Constrain the final answer to a JSON schema (inline JSON or a path to a .json file)
+        #[arg(long)]
+        json_schema: Option<String>,
+        /// The task, in natural language. Use '-' to read from stdin. Omit with --input-format stream-json.
+        task: Option<String>,
     },
     /// Run the eval suite (the fitness function) and print a JSON report
     Eval {
@@ -354,13 +363,25 @@ async fn main() -> Result<()> {
         Cmd::Config => {
             println!("{cfg:#?}");
         }
-        Cmd::Run { dir, max_turns, no_net, task } => {
-            let task = if task == "-" { let mut s = String::new(); std::io::Read::read_to_string(&mut std::io::stdin(), &mut s)?; s } else { task };
-            if let Some(n) = max_turns { cfg.agent.max_turns = n; }
+        Cmd::Run { dir, max_turns, no_net, output_format, input_format, json_schema, task } => {
+            let input_stream = harness::headless::OutputFormat::parse(&input_format) == Some(harness::headless::OutputFormat::StreamJson);
+            let task = match task {
+                Some(t) if t == "-" => { let mut s = String::new(); std::io::Read::read_to_string(&mut std::io::stdin(), &mut s)?; Some(s) }
+                Some(t) => Some(t),
+                None if input_stream => None,
+                None => bail!("no task given (pass one, use '-' to read stdin, or --input-format stream-json)"),
+            };
             if no_net { cfg.net.enabled = false; }
             let workdir = dir.unwrap_or(std::env::current_dir()?).canonicalize().context("workdir does not exist")?;
-            let (text, _stats) = run_agent(&cfg, &client, &workdir, &task, None, cli.verbose, cli.json, cli.yes).await?;
-            if !cli.json { println!("\n{text}"); }
+            let mut output = harness::headless::OutputFormat::parse(&output_format).context("--output-format must be text|json|stream-json")?;
+            if cli.json && output == harness::headless::OutputFormat::Text { output = harness::headless::OutputFormat::StreamJson; }
+            let opts = harness::headless::Options {
+                output, input_stream,
+                json_schema: json_schema.as_deref().map(harness::headless::load_schema).transpose()?,
+                verbose: cli.verbose, yes: cli.yes, max_turns,
+            };
+            let code = harness::headless::run(cfg, workdir, task, opts).await?;
+            if code != 0 { std::process::exit(code); }
         }
         Cmd::Eval { filter, out } => {
             let report = eval::run_all(&cfg, &client, filter.as_deref(), cli.verbose).await?;
