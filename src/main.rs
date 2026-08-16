@@ -105,6 +105,12 @@ enum Cmd {
         #[arg(long)]
         merge: bool,
     },
+    /// Serve the web UI (same UI as the desktop app) on localhost
+    Serve {
+        /// address to bind, e.g. 127.0.0.1:7878 (use 0.0.0.0:7878 to reach it from other devices — no auth!)
+        #[arg(long, default_value = "127.0.0.1:7878")]
+        bind: String,
+    },
     /// List saved sessions
     Sessions,
     /// List models on the configured server
@@ -144,6 +150,7 @@ async fn main() -> Result<()> {
             println!("{}", serde_json::to_string(&serde_json::json!({"branch": v.branch, "green": v.green, "tests_ok": v.tests_ok, "reasons": v.reasons}))?);
             if !v.green { std::process::exit(1); }
         }
+        Cmd::Serve { bind } => { harness::serve::serve(cfg, &bind).await?; }
         Cmd::Sessions => {
             let store = harness::sessions::SessionStore::open()?;
             for (i, m) in store.list(None).iter().take(40).enumerate() { println!("{:>2}. {}  {:<50} {:<30} {} turns · {}", i + 1, m.id, llm::truncate_for_log(&m.title, 50), m.workdir, m.turns, harness::sessions::fmt_age(m.updated)); }

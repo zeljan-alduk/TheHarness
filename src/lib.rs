@@ -14,6 +14,7 @@ pub mod permissions;
 pub mod plugins;
 pub mod procs;
 pub mod sandbox;
+pub mod serve;
 pub mod security;
 pub mod sessions;
 pub mod setup;
