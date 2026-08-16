@@ -73,7 +73,7 @@ for cmd, marker in [("/help", "Commands"), ("/tools", "download_file"), ("/confi
                     ("/sessions live", "Live sessions"), ("/msg nobody hi", "delivered to 1 session"), ("/agents", "Sub-agents"), ("/plugin update all", None), ("/doctor", "Doctor"), ("/todos", "todo"), ("/hooks", "Hooks"), ("/skills", None), ("/agents", "Sub-agents"), ("/effort", "effort"), ("/backend", "backend:"), ("/rename e2e session", "session renamed"), ("/export", None), ("/release-notes", "Recent commits")]:
     send(cmd + "\r"); pump(0.8)
     step(f"{cmd}", marker is None or marker in screen())
-    if cmd == "/settings": send("\x1b"); pump(0.3)
+    if cmd in ("/settings", "/config"): send("q"); pump(0.5)
 send("/mod\t"); pump(0.3); step("tab-completes /model", "/model " in screen()); send("\x15")  # ctrl+u clears line
 buf = b""; send(f"look at {IMG}"); pump(0.5); step("image path harvested on submit (pending)", True)
 if NO_MODEL:
