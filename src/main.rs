@@ -155,6 +155,8 @@ enum PluginCmd {
     Disable { name: String },
     Remove { name: String },
     Update { name: String },
+    /// Update all installed git plugins
+    UpdateAll,
 }
 
 #[tokio::main]
@@ -162,7 +164,7 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     let mut cfg = config::Config::load(cli.config.as_deref())?;
     if let Some(m) = &cli.permissions { cfg.permissions.mode = harness::permissions::Mode::parse(m).context("--permissions must be bypass|auto|ask|plan")?; }
-    sandbox::configure_seatbelt(cfg.sandbox.mode == "seatbelt", cfg.sandbox.deny_network, cfg.sandbox.allow_write.clone());
+    sandbox::configure_seatbelt(cfg.sandbox.mode == "seatbelt" || cfg.sandbox.mode == "bwrap", cfg.sandbox.deny_network, cfg.sandbox.allow_write.clone());
     let client = llm::Client::new(&cfg.llm)?;
 
     match cli.cmd.unwrap_or(Cmd::Chat) {
@@ -206,7 +208,7 @@ async fn main() -> Result<()> {
         Cmd::Tool { dir, name, args } => {
             let workdir = dir.unwrap_or(std::env::current_dir()?).canonicalize().context("workdir does not exist")?;
             let store = if cfg.memory.enabled { harness::memory::MemoryStore::open(&cfg.memory).ok() } else { None };
-            let ctx = tools::ToolCtx { workdir: workdir.clone(), timeout: Duration::from_secs(cfg.agent.tool_timeout_secs), max_output: cfg.agent.max_tool_output_chars, net: cfg.net.clone(), memory: store, subagent: None, redact_secrets: cfg.security.redact_secrets, hooks: cfg.hooks.clone(), todos: Default::default(), lsp_servers: cfg.lsp.servers.clone(), extra_roots: vec![], approver: None, inbox: Default::default(), cancel: None, cwd: None };
+            let ctx = tools::ToolCtx { workdir: workdir.clone(), timeout: Duration::from_secs(cfg.agent.tool_timeout_secs), max_output: cfg.agent.max_tool_output_chars, net: cfg.net.clone(), memory: store, subagent: None, redact_secrets: cfg.security.redact_secrets, hooks: cfg.hooks.clone(), todos: Default::default(), lsp_servers: cfg.lsp.servers.clone(), extra_roots: vec![], approver: None, inbox: Default::default(), cancel: None, cwd: None, session_id: None };
             let ts = tools::build_toolset(cfg.net.enabled, &workdir, name.starts_with("mcp__")).await;
             let out = ts.registry.call(&name, args.as_deref().unwrap_or("{}"), &ctx).await;
             println!("{}", out.text);
@@ -244,6 +246,7 @@ async fn main() -> Result<()> {
                 PluginCmd::Disable { name } => { p.set_enabled(&name, false)?; println!("disabled {name}"); }
                 PluginCmd::Remove { name } => { p.remove(&name)?; println!("removed {name}"); }
                 PluginCmd::Update { name } => { println!("{}", p.update(&name).await?); }
+                PluginCmd::UpdateAll => { for (n, r) in p.update_all().await { println!("{n}: {}", match r { Ok(m) => m, Err(e) => format!("failed: {e:#}") }); } }
             }
         }
         Cmd::Mcp { dir } => {
@@ -323,7 +326,7 @@ async fn run_agent(cfg: &config::Config, client: &llm::Client, workdir: &std::pa
         net: cfg.net.clone(),
         memory: None,
         subagent: None,
-        redact_secrets: cfg.security.redact_secrets, hooks: cfg.hooks.clone(), todos: Default::default(), lsp_servers: cfg.lsp.servers.clone(), extra_roots: vec![], approver: None, inbox: Default::default(), cancel: None, cwd: None,
+        redact_secrets: cfg.security.redact_secrets, hooks: cfg.hooks.clone(), todos: Default::default(), lsp_servers: cfg.lsp.servers.clone(), extra_roots: vec![], approver: None, inbox: Default::default(), cancel: None, cwd: None, session_id: None,
     };
     let store = if cfg.memory.enabled { harness::memory::MemoryStore::open(&cfg.memory).ok() } else { None };
     if let Some(m) = &store { let _ = m.touch_project(workdir); }

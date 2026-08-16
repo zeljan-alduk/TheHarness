@@ -1,0 +1,5 @@
+name = "md_docs_from_code"
+tags = ["docs", "python", "easy"]
+prompt = "Read lib.py and write API.md documenting every public function (name, parameters, return value, one-line description) as a markdown table with the columns Function | Parameters | Returns | Description, one row per function, in source order. Do not document private (_underscore) functions."
+check = "grep -q '^| Function' API.md && grep -q '| add ' API.md && grep -q '| slugify ' API.md && grep -q '| clamp ' API.md && ! grep -q '_helper' API.md && test $(grep -c '^| ' API.md) -ge 4"
+max_turns = 10

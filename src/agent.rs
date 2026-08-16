@@ -320,6 +320,7 @@ impl<'a> Agent<'a> {
             }
             if last_usage.prompt_tokens > self.context_budget {
                 let before = last_usage.prompt_tokens;
+                if !self.ctx.hooks.pre_compact.is_empty() { let _ = crate::hooks::run_event(&self.ctx.hooks, "pre_compact", "auto", serde_json::json!({"trigger": "auto", "prompt_tokens": before}), &self.ctx.workdir).await; }
                 match compact_llm_with(&self.client.aux(), msgs, 8, None, Some(self.sink)).await {
                     Ok((n, summary, mb, ma)) => { stats.compactions += 1; self.sink.emit(&Event::Compacted { count: n, prompt_tokens: before, summary, map_before: mb, map_after: ma }); }
                     Err(_) => { let mb = context_map(msgs); let n = compact(msgs, 6); if n > 0 { stats.compactions += 1; self.sink.emit(&Event::Compacted { count: n, prompt_tokens: before, summary: String::new(), map_before: mb, map_after: context_map(msgs) }); } }
@@ -431,6 +432,7 @@ impl<'a> Agent<'a> {
                         match self.approver.ask(req.clone()).await {
                             crate::permissions::Approval::Once => { self.sink.emit(&Event::Permission { tool: name.clone(), summary: arg, decision: "allowed once".into() }); None }
                             crate::permissions::Approval::Always => { self.policy.allow_always(&req.suggested_rule); self.sink.emit(&Event::Permission { tool: name.clone(), summary: arg, decision: format!("always allowed ({})", req.suggested_rule) }); None }
+                            crate::permissions::Approval::AlwaysProject => { self.policy.allow_always_project(&req.suggested_rule); self.sink.emit(&Event::Permission { tool: name.clone(), summary: arg, decision: format!("always allowed in this project ({})", req.suggested_rule) }); None }
                             crate::permissions::Approval::Deny => { self.sink.emit(&Event::Permission { tool: name.clone(), summary: arg, decision: "denied by user".into() }); Some("error: the user declined this action. Do not retry it; ask what to do instead or take a different approach.".to_string()) }
                         }
                     }

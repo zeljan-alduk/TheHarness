@@ -154,6 +154,17 @@ impl Plugins {
         if !o.status.success() { bail!("git pull failed: {}", String::from_utf8_lossy(&o.stderr).trim()); }
         Ok(format!("updated {name}"))
     }
+    /// Update every installed git plugin (`git pull --ff-only`). Returns per-plugin results.
+    pub async fn update_all(&self) -> Vec<(String, Result<String>)> {
+        let mut out = Vec::new();
+        for p in self.installed() { let name = p.path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default(); if p.path.join(".git").exists() { out.push((name.clone(), self.update(&name).await)); } }
+        out
+    }
+    /// Plugins whose last fetch is older than `days` (by .git/FETCH_HEAD or HEAD mtime).
+    pub fn stale(&self, days: u64) -> Vec<String> {
+        let cutoff = std::time::SystemTime::now() - std::time::Duration::from_secs(days * 86400);
+        self.installed().into_iter().filter(|p| p.path.join(".git").exists()).filter(|p| { let f = p.path.join(".git/FETCH_HEAD"); let h = p.path.join(".git/HEAD"); let m = std::fs::metadata(&f).or_else(|_| std::fs::metadata(&h)).and_then(|m| m.modified()).ok(); m.map(|t| t < cutoff).unwrap_or(false) }).map(|p| p.path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default()).collect()
+    }
     pub fn remove(&mut self, name: &str) -> Result<()> {
         let d = self.dir.join(name); if !d.exists() { bail!("no installed plugin named '{name}'"); }
         if d.is_symlink() { std::fs::remove_file(&d)?; } else { std::fs::remove_dir_all(&d)?; }

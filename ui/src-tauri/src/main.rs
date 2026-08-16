@@ -92,7 +92,7 @@ async fn start_run(app: AppHandle, state: State<'_, RunState>, task: String, wor
             let policy = std::sync::Arc::new(harness::permissions::Policy::new(pcfg, &workdir));
             let approver: std::sync::Arc<dyn harness::permissions::Approver> = std::sync::Arc::new(TauriApprover { app: app2.clone() });
             let env = std::sync::Arc::new(harness::agent::SubAgentEnv::new(client.clone(), registry.clone(), policy.clone(), approver.clone(), sink.clone(), budget, true));
-            let ctx = ToolCtx { workdir: workdir.clone(), timeout: Duration::from_secs(cfg.agent.tool_timeout_secs), max_output: cfg.agent.max_tool_output_chars, net: cfg.net.clone(), memory: store.clone(), subagent: Some(env), redact_secrets: cfg.security.redact_secrets, hooks: cfg.hooks.clone(), todos: Default::default(), lsp_servers: cfg.lsp.servers.clone(), extra_roots: vec![], approver: Some(approver.clone()), inbox: Default::default(), cancel: None };
+            let ctx = ToolCtx { workdir: workdir.clone(), timeout: Duration::from_secs(cfg.agent.tool_timeout_secs), max_output: cfg.agent.max_tool_output_chars, net: cfg.net.clone(), memory: store.clone(), subagent: Some(env), redact_secrets: cfg.security.redact_secrets, hooks: cfg.hooks.clone(), todos: Default::default(), lsp_servers: cfg.lsp.servers.clone(), extra_roots: vec![], approver: Some(approver.clone()), inbox: Default::default(), cancel: None, cwd: None, session_id: None };
             let agent = Agent { client: &client, registry: &registry, ctx: &ctx, max_turns: cfg.agent.max_turns, context_budget: budget, sink: sink.as_ref(), stream: true, policy: &policy, approver: approver.as_ref() };
             agent.run(&system, &task).await.map(|(t, _)| t).map_err(|e| format!("{e:#}"))
         }.await;

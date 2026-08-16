@@ -44,6 +44,42 @@ fn highlight_line(lang: &str, line: &str, state: &mut Option<syntect::easy::High
     }
 }
 
+// ───────────────────────── custom keybindings ─────────────────────────
+/// ~/.config/harness/keybindings.toml — [bindings] action = "ctrl+x" | "alt+enter" | "shift+tab" | "f5" | "esc" …
+/// Actions: interrupt, next_task, toggle_panel, toggle_thinking, expand_tools, paste, cycle_permissions, newline,
+/// quit, scroll_up, scroll_down, clear_line, jump_bottom, complete
+#[derive(Clone, Default)]
+struct Keymap { map: std::collections::HashMap<String, (KeyCode, KeyModifiers)> }
+impl Keymap {
+    fn load() -> Self {
+        let mut m = std::collections::HashMap::new();
+        let defaults = [("interrupt", "esc"), ("next_task", "ctrl+n"), ("toggle_panel", "ctrl+p"), ("toggle_thinking", "ctrl+t"), ("expand_tools", "ctrl+o"), ("paste", "ctrl+v"), ("cycle_permissions", "shift+tab"), ("newline", "ctrl+j"), ("quit", "ctrl+d"), ("scroll_up", "pageup"), ("scroll_down", "pagedown"), ("clear_line", "ctrl+u"), ("jump_bottom", "ctrl+l"), ("complete", "tab")];
+        for (a, k) in defaults { if let Some(v) = parse_key(k) { m.insert(a.to_string(), v); } }
+        let p = harness::setup::config_dir().join("keybindings.toml");
+        if let Ok(t) = std::fs::read_to_string(&p) { if let Ok(v) = t.parse::<toml::Value>() { if let Some(b) = v.get("bindings").and_then(|b| b.as_table()) { for (a, k) in b { if let Some(ks) = k.as_str() { if let Some(v) = parse_key(ks) { m.insert(a.clone(), v); } } } } } }
+        else { let _ = std::fs::create_dir_all(p.parent().unwrap()); let _ = std::fs::write(&p, "# Custom keybindings — action = \"key\". Keys: ctrl+x, alt+x, shift+tab, f1..f12, esc, enter, tab, pageup, pagedown, up, down, home, end\n[bindings]\n# next_task = \"ctrl+n\"\n# toggle_panel = \"ctrl+p\"\n"); }
+        Self { map: m }
+    }
+    fn is(&self, action: &str, code: KeyCode, mods: KeyModifiers) -> bool {
+        match self.map.get(action) { Some((c, m)) => { let norm = |k: KeyCode| match k { KeyCode::Char(ch) => KeyCode::Char(ch.to_ascii_lowercase()), o => o }; norm(*c) == norm(code) && (m.contains(KeyModifiers::CONTROL) == mods.contains(KeyModifiers::CONTROL)) && (m.contains(KeyModifiers::ALT) == mods.contains(KeyModifiers::ALT)) && (!m.contains(KeyModifiers::SHIFT) || mods.contains(KeyModifiers::SHIFT) || matches!(code, KeyCode::BackTab)) } None => false }
+    }
+}
+fn parse_key(s: &str) -> Option<(KeyCode, KeyModifiers)> {
+    let mut mods = KeyModifiers::NONE; let mut key: Option<KeyCode> = None;
+    for part in s.split('+') {
+        match part.trim().to_lowercase().as_str() {
+            "ctrl" | "control" => mods |= KeyModifiers::CONTROL, "alt" | "opt" | "option" | "meta" => mods |= KeyModifiers::ALT, "shift" => mods |= KeyModifiers::SHIFT,
+            "esc" | "escape" => key = Some(KeyCode::Esc), "enter" | "return" => key = Some(KeyCode::Enter), "tab" => key = Some(if mods.contains(KeyModifiers::SHIFT) { KeyCode::BackTab } else { KeyCode::Tab }),
+            "backtab" => key = Some(KeyCode::BackTab), "pageup" | "pgup" => key = Some(KeyCode::PageUp), "pagedown" | "pgdn" => key = Some(KeyCode::PageDown), "up" => key = Some(KeyCode::Up), "down" => key = Some(KeyCode::Down), "left" => key = Some(KeyCode::Left), "right" => key = Some(KeyCode::Right), "home" => key = Some(KeyCode::Home), "end" => key = Some(KeyCode::End), "space" => key = Some(KeyCode::Char(' ')), "backspace" => key = Some(KeyCode::Backspace), "delete" | "del" => key = Some(KeyCode::Delete),
+            f if f.starts_with('f') && f[1..].parse::<u8>().is_ok() => key = Some(KeyCode::F(f[1..].parse().unwrap())),
+            c if c.chars().count() == 1 => key = Some(KeyCode::Char(c.chars().next().unwrap())),
+            _ => return None,
+        }
+    }
+    if matches!(key, Some(KeyCode::Tab)) && mods.contains(KeyModifiers::SHIFT) { key = Some(KeyCode::BackTab); }
+    key.map(|k| (k, mods))
+}
+
 // ───────────────────────── palette (dark / light) ─────────────────────────
 #[derive(Clone, Copy)]
 struct Pal { orange: Color, dim: Color, ok: Color, err: Color, think: Color, blue: Color, pink: Color, cyan: Color, fg: Color, panel_bg: Color }
@@ -58,7 +94,7 @@ fn pal() -> Pal {
 const SPINNER: [&str; 10] = ["✻", "✼", "✽", "✾", "✿", "❀", "✿", "✾", "✽", "✼"];
 const WORDS: [&str; 12] = ["Thinking", "Pondering", "Working", "Reasoning", "Cooking", "Tinkering", "Brewing", "Mulling", "Crunching", "Percolating", "Noodling", "Computing"];
 
-enum Msg { Question(harness::permissions::Question, tokio::sync::oneshot::Sender<harness::permissions::Answer>), SubEnv(Arc<harness::agent::SubAgentEnv>), Policy(Arc<harness::permissions::Policy>), CcSession(Arc<harness::claude_code::ClaudeCodeSession>), CcSid(String), Block(Block), Ask(harness::permissions::ApprovalRequest, tokio::sync::oneshot::Sender<harness::permissions::Approval>), Ev(Event), Done(Result<(String, harness::agent::RunStats), String>), Sys(SysSample), CtxLen(u64), Pasted(Result<PathBuf, String>), Frames(Result<(PathBuf, f64, Vec<(f64, PathBuf)>), String>), Toolset(Arc<Toolset>), Catalog(Result<harness::plugins::Catalog, String>), Notice(String) }
+enum Msg { Title(String), Question(harness::permissions::Question, tokio::sync::oneshot::Sender<harness::permissions::Answer>), SubEnv(Arc<harness::agent::SubAgentEnv>), Policy(Arc<harness::permissions::Policy>), CcSession(Arc<harness::claude_code::ClaudeCodeSession>), CcSid(String), Block(Block), Ask(harness::permissions::ApprovalRequest, tokio::sync::oneshot::Sender<harness::permissions::Approval>), Ev(Event), Done(Result<(String, harness::agent::RunStats), String>), Sys(SysSample), CtxLen(u64), Pasted(Result<PathBuf, String>), Frames(Result<(PathBuf, f64, Vec<(f64, PathBuf)>), String>), Toolset(Arc<Toolset>), Catalog(Result<harness::plugins::Catalog, String>), Notice(String) }
 
 /// Video scrubber state (modal over the transcript).
 struct VideoPicker { path: PathBuf, duration: f64, frames: Vec<(f64, PathBuf, String)>, cur: usize, selected: std::collections::BTreeSet<usize>, loading: bool, error: Option<String> }
@@ -341,6 +377,8 @@ struct App {
     think_scroll: usize,
     toolset: Option<Arc<Toolset>>,
     perm_mode: harness::permissions::Mode,
+    vim: bool, vim_normal: bool,
+    keymap: Keymap,
     live_policy: Option<Arc<harness::permissions::Policy>>,
     extra_roots: Vec<PathBuf>,
     /// worktree enter/exit state (shared with the running agent; persists across turns)
@@ -378,14 +416,17 @@ pub async fn run(cfg: Config, resume: Option<String>) -> Result<()> {
         quit: false, tick: 0, word: 0, models: vec![],
         metrics: Metrics::new(0), panel: None, attachments: vec![], tool_previews: Default::default(),
         picker, images: Default::default(), img_seq: 0,
-        think_scroll: 0, toolset: None, perm_mode: harness::permissions::Mode::Auto, live_policy: None, extra_roots: vec![], wt_cwd: harness::worktree::new_cell(), cc: None, cc_last_session: None, compact_progress: None, session_meta: harness::sessions::Meta::default(), todos: Default::default(), inbox: Default::default(), event_log: None, pending_ask: None, pending_q: None, subenv: None, attached: None, video: None, strip_rects: vec![], tr_rect: Rect::default(), panel_rect: Rect::default(), tr_start: 0, line_map: vec![],
+        think_scroll: 0, toolset: None, perm_mode: harness::permissions::Mode::Auto, vim: false, vim_normal: false, keymap: Keymap::load(), live_policy: None, extra_roots: vec![], wt_cwd: harness::worktree::new_cell(), cc: None, cc_last_session: None, compact_progress: None, session_meta: harness::sessions::Meta::default(), todos: Default::default(), inbox: Default::default(), event_log: None, pending_ask: None, pending_q: None, subenv: None, attached: None, video: None, strip_rects: vec![], tr_rect: Rect::default(), panel_rect: Rect::default(), tr_start: 0, line_map: vec![],
     };
     app.metrics.ctx_len = app.cfg.llm.context_budget_tokens.unwrap_or(0);
     app.perm_mode = app.cfg.permissions.mode;
     if app.cfg.ui.event_log { { let d = config_dir().join("logs").join(harness::memory::today_iso()); let _ = std::fs::create_dir_all(&d); app.event_log = std::fs::OpenOptions::new().create(true).append(true).open(d.join(format!("tui-{}.jsonl", std::process::id()))).ok(); } }
     if app.cfg.ui.theme == "light" { LIGHT.store(true, std::sync::atomic::Ordering::Relaxed); }
     app.banner();
+    if let Ok(p) = harness::plugins::Plugins::open() { let st = p.stale(7); if !st.is_empty() { app.blocks.push(Block::System(format!("plugins not updated for 7+ days: {} — /plugin update all", st.join(", ")))); } }
+    if !harness::permissions::is_trusted(&app.workdir) && app.perm_mode != harness::permissions::Mode::Plan { app.blocks.push(Block::System(format!("first time in {} — tools run here in '{}' mode. /trust remembers this directory; /plan for read-only.", short_path(&app.workdir), app.perm_mode.label()))); }
     if let Some(r) = resume { app.resume_session(&r); }
+    { let h = app.cfg.hooks.clone(); let wd = app.workdir.clone(); if !h.session_start.is_empty() { let tx = app.tx.clone(); tokio::spawn(async move { for o in harness::hooks::run_event(&h, "session_start", "", serde_json::json!({}), &wd).await { let _ = tx.send(Msg::Notice(format!("session_start hook: {}", o.trim()))); } }); } }
     app.reload_toolset();
     tokio::spawn(sampler(tx.clone()));
     tokio::spawn(fetch_ctx_len(app.cfg.llm.base_url.clone(), app.cfg.llm.model.clone(), tx.clone()));
@@ -407,6 +448,9 @@ pub async fn run(cfg: Config, resume: Option<String>) -> Result<()> {
             tokio::select! {
                 _ = ticker.tick() => {
                     app.tick += 1; if app.tick % 30 == 0 { app.word = (app.word + 1) % WORDS.len(); }
+                    // cross-session: heartbeat every ~5s, poll our mailbox every ~2s
+                    if app.tick % 60 == 0 { if app.session_meta.id.is_empty() { app.session_meta.id = harness::sessions::SessionStore::new_id(); } harness::mailbox::heartbeat(&harness::mailbox::Live { id: app.session_meta.id.clone(), title: if app.session_meta.title.is_empty() { "(new session)".into() } else { app.session_meta.title.clone() }, workdir: app.workdir.display().to_string(), pid: std::process::id(), backend: app.cfg.llm.provider.clone().unwrap_or("local".into()), updated: 0, busy: app.running.is_some() }); }
+                    if app.tick % 25 == 0 && !app.session_meta.id.is_empty() { for m in harness::mailbox::take(&app.session_meta.id) { app.blocks.push(Block::System(format!("✉ message from session {}: {}", m.from, truncate(&m.text, 200)))); app.inbox.push(format!("message from session {}", m.from), m.text); } }
                     // wakeups: inbox events (monitor lines, scheduled prompts, messages) start a turn when idle
                     if app.running.is_none() && app.pending_ask.is_none() && app.pending_q.is_none() && !app.inbox.is_empty() && app.tick % 12 == 0 { if let Some(m) = app.inbox.take_message() { app.set_status("inbox event → waking the agent"); app.start_run(m); } }
                     let cap = app.cfg.agent.max_task_secs;
@@ -421,6 +465,8 @@ pub async fn run(cfg: Config, resume: Option<String>) -> Result<()> {
     }.await;
     let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableMouseCapture, crossterm::event::DisableBracketedPaste);
     ratatui::restore();
+    if !app.session_meta.id.is_empty() { harness::mailbox::unregister(&app.session_meta.id); }
+    if !app.cfg.hooks.session_end.is_empty() { let _ = harness::hooks::run_event(&app.cfg.hooks, "session_end", "", serde_json::json!({"session": app.session_meta.id}), &app.workdir).await; }
     if let Some(h) = app.running.take() { h.abort(); }
     res
 }
@@ -511,11 +557,12 @@ impl App {
                 let ans = match k.code {
                     KeyCode::Char('y') | KeyCode::Enter => Some(harness::permissions::Approval::Once),
                     KeyCode::Char('a') => Some(harness::permissions::Approval::Always),
+                    KeyCode::Char('p') => Some(harness::permissions::Approval::AlwaysProject),
                     KeyCode::Char('n') | KeyCode::Esc => Some(harness::permissions::Approval::Deny),
                     KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => Some(harness::permissions::Approval::Deny),
                     _ => None,
                 };
-                if let Some(a) = ans { if let Some((req, tx)) = self.pending_ask.take() { let label = match &a { harness::permissions::Approval::Once => "allowed once".to_string(), harness::permissions::Approval::Always => format!("always allow {}", req.suggested_rule), harness::permissions::Approval::Deny => "denied".into() }; self.blocks.push(Block::System(format!("🔒 {label}"))); let _ = tx.send(a); } }
+                if let Some(a) = ans { if let Some((req, tx)) = self.pending_ask.take() { let label = match &a { harness::permissions::Approval::Once => "allowed once".to_string(), harness::permissions::Approval::Always => format!("always allow {}", req.suggested_rule), harness::permissions::Approval::AlwaysProject => format!("always allow {} (this project)", req.suggested_rule), harness::permissions::Approval::Deny => "denied".into() }; self.blocks.push(Block::System(format!("🔒 {label}"))); let _ = tx.send(a); } }
             }
             CEvent::Key(k) if k.kind == KeyEventKind::Press && self.video.is_some() => {
                 let n = self.video.as_ref().map(|v| v.frames.len()).unwrap_or(0);
@@ -535,6 +582,48 @@ impl App {
             CEvent::Key(k) if k.kind == KeyEventKind::Press => {
                 let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
                 let alt = k.modifiers.contains(KeyModifiers::ALT);
+                let km = self.keymap.clone();
+                // 1) global actions (custom keybindings) — take precedence over typing
+                if km.is("next_task", k.code, k.modifiers) { self.next_task(); return; }
+                if km.is("toggle_panel", k.code, k.modifiers) { self.panel = Some(!self.panel_visible(200)); return; }
+                if km.is("toggle_thinking", k.code, k.modifiers) { self.show_thinking = !self.show_thinking; return; }
+                if km.is("expand_tools", k.code, k.modifiers) { self.expand_tools = !self.expand_tools; return; }
+                if km.is("paste", k.code, k.modifiers) { let tx = self.tx.clone(); let store = if self.cfg.memory.enabled { harness::memory::MemoryStore::open(&self.cfg.memory).ok() } else { None }; self.set_status("reading clipboard…"); tokio::spawn(async move { let _ = tx.send(Msg::Pasted(clipboard_image(store).await)); }); return; }
+                if km.is("cycle_permissions", k.code, k.modifiers) { use harness::permissions::Mode::*; let m = match self.perm_mode { Auto => Ask, Ask => Plan, Plan => Bypass, Bypass => Auto }; self.set_perm_mode(m); self.set_status(format!("permissions → {}", self.perm_mode.label())); return; }
+                if km.is("newline", k.code, k.modifiers) || (k.code == KeyCode::Enter && alt) { self.insert_str("\n"); return; }
+                if km.is("quit", k.code, k.modifiers) && self.input.is_empty() { self.quit = true; return; }
+                if km.is("scroll_up", k.code, k.modifiers) || (k.code == KeyCode::Up && ctrl) { self.scroll_up += 10; return; }
+                if km.is("scroll_down", k.code, k.modifiers) || (k.code == KeyCode::Down && ctrl) { self.scroll_up = self.scroll_up.saturating_sub(10); return; }
+                if km.is("clear_line", k.code, k.modifiers) { let c = self.cursor; self.input = self.input.chars().skip(c).collect(); self.cursor = 0; return; }
+                if km.is("jump_bottom", k.code, k.modifiers) { self.scroll_up = 0; return; }
+                if km.is("complete", k.code, k.modifiers) { self.complete_slash(); return; }
+                if km.is("interrupt", k.code, k.modifiers) && self.running.is_some() { self.interrupt(); return; }
+                // 2) vim normal mode
+                if self.vim && self.vim_normal {
+                    let n = self.input.chars().count();
+                    match k.code {
+                        KeyCode::Char('i') => self.vim_normal = false,
+                        KeyCode::Char('a') => { self.cursor = (self.cursor + 1).min(n); self.vim_normal = false; }
+                        KeyCode::Char('A') => { self.cursor = n; self.vim_normal = false; }
+                        KeyCode::Char('I') => { self.cursor = 0; self.vim_normal = false; }
+                        KeyCode::Char('h') | KeyCode::Left => self.cursor = self.cursor.saturating_sub(1),
+                        KeyCode::Char('l') | KeyCode::Right => self.cursor = (self.cursor + 1).min(n),
+                        KeyCode::Char('0') | KeyCode::Home => self.cursor = self.line_start(),
+                        KeyCode::Char('$') | KeyCode::End => self.cursor = self.line_end(),
+                        KeyCode::Char('w') => { let cs: Vec<char> = self.input.chars().collect(); let mut i = self.cursor; while i < cs.len() && !cs[i].is_whitespace() { i += 1; } while i < cs.len() && cs[i].is_whitespace() { i += 1; } self.cursor = i; }
+                        KeyCode::Char('b') => { let cs: Vec<char> = self.input.chars().collect(); let mut i = self.cursor; while i > 0 && cs[i - 1].is_whitespace() { i -= 1; } while i > 0 && !cs[i - 1].is_whitespace() { i -= 1; } self.cursor = i; }
+                        KeyCode::Char('x') => { let mut cs: Vec<char> = self.input.chars().collect(); if self.cursor < cs.len() { cs.remove(self.cursor); self.input = cs.into_iter().collect(); } }
+                        KeyCode::Char('d') => { self.input.clear(); self.cursor = 0; } // dd (single d clears the line — simplification)
+                        KeyCode::Char('u') => { if let Some(prev) = self.history.last() { self.input = prev.clone(); self.cursor = self.input.chars().count(); } }
+                        KeyCode::Enter => self.submit(),
+                        KeyCode::Char('j') | KeyCode::Down => self.history_next(),
+                        KeyCode::Char('k') | KeyCode::Up => self.history_prev(),
+                        KeyCode::Char(':') => { self.insert_str("/"); self.vim_normal = false; }
+                        KeyCode::Esc => { if self.running.is_some() { self.interrupt(); } }
+                        _ => {}
+                    }
+                    return;
+                }
                 match (k.code, ctrl, alt) {
                     (KeyCode::Char('c'), true, _) => {
                         if self.running.is_some() { self.interrupt(); }
@@ -542,29 +631,16 @@ impl App {
                         else if self.last_ctrl_c.map(|t| t.elapsed() < Duration::from_millis(1500)).unwrap_or(false) { self.quit = true; }
                         else { self.last_ctrl_c = Some(Instant::now()); self.set_status("Press ctrl+c again to exit"); }
                     }
-                    (KeyCode::Char('d'), true, _) if self.input.is_empty() => self.quit = true,
-                    (KeyCode::Esc, _, _) => { if self.running.is_some() { self.interrupt(); } else if !self.input.is_empty() { self.input.clear(); self.cursor = 0; } }
-                    (KeyCode::Enter, _, true) | (KeyCode::Char('j'), true, _) => self.insert_str("\n"),
+                    (KeyCode::Esc, _, _) => { if self.running.is_some() { self.interrupt(); } else if self.vim { self.vim_normal = true; } else if !self.input.is_empty() { self.input.clear(); self.cursor = 0; } }
                     (KeyCode::Enter, _, _) => self.submit(),
-                    (KeyCode::Char('o'), true, _) => { self.expand_tools = !self.expand_tools; }
-                    (KeyCode::Char('t'), true, _) => { self.show_thinking = !self.show_thinking; }
-                    (KeyCode::Char('l'), true, _) => { self.scroll_up = 0; }
-                    (KeyCode::Char('p'), true, _) => { self.panel = Some(!self.panel_visible(200)); }
-                    (KeyCode::Char('n'), true, _) => self.next_task(),
-                    (KeyCode::Char('v'), true, _) => { let tx = self.tx.clone(); let store = if self.cfg.memory.enabled { harness::memory::MemoryStore::open(&self.cfg.memory).ok() } else { None }; self.set_status("reading clipboard…"); tokio::spawn(async move { let _ = tx.send(Msg::Pasted(clipboard_image(store).await)); }); }
-                    (KeyCode::Char('u'), true, _) => { let c = self.cursor; self.input = self.input.chars().skip(c).collect(); self.cursor = 0; }
                     (KeyCode::Char('a'), true, _) | (KeyCode::Home, _, _) => self.cursor = self.line_start(),
                     (KeyCode::Char('e'), true, _) | (KeyCode::End, _, _) => self.cursor = self.line_end(),
                     (KeyCode::Backspace, _, _) => { if self.cursor > 0 { let mut cs: Vec<char> = self.input.chars().collect(); cs.remove(self.cursor - 1); self.input = cs.into_iter().collect(); self.cursor -= 1; } }
                     (KeyCode::Delete, _, _) => { let mut cs: Vec<char> = self.input.chars().collect(); if self.cursor < cs.len() { cs.remove(self.cursor); self.input = cs.into_iter().collect(); } }
                     (KeyCode::Left, _, _) => { self.cursor = self.cursor.saturating_sub(1); }
                     (KeyCode::Right, _, _) => { self.cursor = (self.cursor + 1).min(self.input.chars().count()); }
-                    (KeyCode::Up, true, _) | (KeyCode::PageUp, _, _) => { self.scroll_up += 10; }
-                    (KeyCode::Down, true, _) | (KeyCode::PageDown, _, _) => { self.scroll_up = self.scroll_up.saturating_sub(10); }
                     (KeyCode::Up, _, _) => { if !self.input.contains('\n') { self.history_prev(); } }
                     (KeyCode::Down, _, _) => { if !self.input.contains('\n') { self.history_next(); } }
-                    (KeyCode::BackTab, _, _) => { use harness::permissions::Mode::*; let m = match self.perm_mode { Auto => Ask, Ask => Plan, Plan => Bypass, Bypass => Auto }; self.set_perm_mode(m); self.set_status(format!("permissions → {}", self.perm_mode.label())); }
-                    (KeyCode::Tab, _, _) => { self.complete_slash(); }
                     (KeyCode::Char(c), false, false) => { self.insert_str(&c.to_string()); }
                     _ => {}
                 }
@@ -692,6 +768,17 @@ impl App {
                 lines.push("Images: ctrl+v pastes from the clipboard; typing or dragging an image path attaches it. Previews render as a color mosaic; the model sees the full image.".into());
                 self.blocks.push(Block::Banner(lines));
             }
+            "/msg" | "/send" => {
+                let mut it = arg.splitn(2, ' '); let to = it.next().unwrap_or("").to_string(); let text = it.next().unwrap_or("").trim().to_string();
+                if to.is_empty() || text.is_empty() { self.blocks.push(Block::Error("usage: /msg <session id|prefix|title|all> <text>   (see /sessions live)".into())); }
+                else { match harness::mailbox::send(&to, &self.session_meta.id, &text) { Ok(n) => self.blocks.push(Block::System(format!("✉ delivered to {n} session(s)"))), Err(e) => self.blocks.push(Block::Error(format!("send failed: {e}"))) } }
+            }
+            "/sessions" if arg == "live" => {
+                let l = harness::mailbox::live();
+                let mut lines = vec![format!("Live sessions ({}) — /msg <id|prefix|title|all> <text>", l.len())];
+                for s in l { lines.push(format!("  {}{}  {:<40} {}  [{}]{}", if s.id == self.session_meta.id { "● " } else { "  " }, s.id, truncate(&s.title, 40), short_path(std::path::Path::new(&s.workdir)), s.backend, if s.busy { " busy" } else { "" })); }
+                self.blocks.push(Block::Banner(lines));
+            }
             "/sessions" => {
                 match harness::sessions::SessionStore::open() {
                     Ok(store) => { let list = store.list(None); let mut lines = vec![format!("Sessions ({}) — /resume <n|id|last>   · current: {}", list.len(), if self.session_meta.id.is_empty() { "(unsaved)" } else { &self.session_meta.id })]; for (i, m) in list.iter().take(25).enumerate() { lines.push(format!("  {:>2}. {}  {:<50} {:<28} {} turns · {}", i + 1, m.id, truncate(&m.title, 50), short_path(std::path::Path::new(&m.workdir)), m.turns, harness::sessions::fmt_age(m.updated))); } self.blocks.push(Block::Banner(lines)); }
@@ -813,14 +900,24 @@ impl App {
             }
             "/video" => { if arg.is_empty() { self.blocks.push(Block::Error("usage: /video <path>".into())); } else { let p = if arg.starts_with('~') { PathBuf::from(arg.replacen('~', &harness::setup::home_dir().display().to_string(), 1)) } else { PathBuf::from(&arg) }; if p.is_file() { self.open_video(&p); } else { self.blocks.push(Block::Error(format!("no such file: {arg}"))); } } }
             "/permissions" | "/perm" | "/mode" => {
+                let mut it = arg.splitn(2, ' '); let sub = it.next().unwrap_or("").to_string(); let rest = it.next().unwrap_or("").trim().to_string();
                 if arg.is_empty() {
-                    let rules = harness::permissions::persisted_rules();
-                    let mut lines = vec![format!("permission mode: {} ({})", format!("{:?}", self.perm_mode).to_lowercase(), self.perm_mode.label()), "switch: /permissions bypass|auto|ask|plan   (shift+tab cycles)".into(), format!("config allow: {:?}", self.cfg.permissions.allow), format!("config deny:  {:?}", self.cfg.permissions.deny), format!("always-allowed (this machine): {:?}", rules)];
+                    let rules = harness::permissions::persisted_rules(); let proj = harness::permissions::project_rules(&self.workdir);
+                    let mut lines = vec![format!("permission mode: {} ({})", format!("{:?}", self.perm_mode).to_lowercase(), self.perm_mode.label()), "switch: /permissions bypass|auto|ask|plan   (shift+tab cycles) · rules: /permissions add <rule> [project] · remove <rule>".into(), format!("config allow: {:?}", self.cfg.permissions.allow), format!("config deny:  {:?}", self.cfg.permissions.deny), format!("always-allowed (this machine): {:?}", rules), format!("always-allowed (this project, .harness/permissions.json): {:?}", proj), format!("directory trusted: {}  (/trust to remember this directory)", harness::permissions::is_trusted(&self.workdir))];
                     lines.push("Rules are '<tool>' or '<tool>:<glob>' matched on the primary argument (bash cmd, file path, url).".into());
                     self.blocks.push(Block::Banner(lines));
+                } else if sub == "add" && !rest.is_empty() {
+                    let (rule, project) = match rest.strip_suffix(" project") { Some(r) => (r.trim().to_string(), true), None => (rest.clone(), false) };
+                    match &self.live_policy { Some(p) => { if project { p.allow_always_project(&rule) } else { p.allow_always(&rule) } } None => { let p = harness::permissions::Policy::new(self.cfg.permissions.clone(), &self.workdir); if project { p.allow_always_project(&rule) } else { p.allow_always(&rule) } } }
+                    self.blocks.push(Block::System(format!("rule added{}: {rule}", if project { " (project)" } else { "" })));
+                } else if sub == "remove" && !rest.is_empty() {
+                    let p = self.live_policy.clone().unwrap_or_else(|| Arc::new(harness::permissions::Policy::new(self.cfg.permissions.clone(), &self.workdir)));
+                    let n = p.remove_rule(&rest); self.blocks.push(Block::System(format!("removed {n} rule(s) matching {rest}")));
                 } else if let Some(m) = harness::permissions::Mode::parse(&arg) { self.set_perm_mode(m); self.blocks.push(Block::System(format!("permissions → {}", m.label()))); }
-                else { self.blocks.push(Block::Error("usage: /permissions [bypass|auto|ask|plan]".into())); }
+                else { self.blocks.push(Block::Error("usage: /permissions [bypass|auto|ask|plan] · add <rule> [project] · remove <rule>".into())); }
             }
+            "/trust" => { harness::permissions::trust(&self.workdir); self.blocks.push(Block::System(format!("{} is now a trusted directory", short_path(&self.workdir)))); }
+            "/vim" => { self.vim = !self.vim; self.vim_normal = false; self.blocks.push(Block::System(format!("vim mode {} — esc → NORMAL (h/l/w/b/0/$ move, x delete, d clear, i/a/A/I insert, j/k history, : starts a /command, enter sends)", if self.vim { "on" } else { "off" }))); }
             "/theme" => { let light = match arg.as_str() { "light" => true, "dark" => false, _ => !LIGHT.load(std::sync::atomic::Ordering::Relaxed) }; LIGHT.store(light, std::sync::atomic::Ordering::Relaxed); self.blocks.push(Block::System(format!("theme → {}", if light { "light" } else { "dark" }))); }
             "/plan" => { let m = if self.perm_mode == harness::permissions::Mode::Plan { harness::permissions::Mode::Auto } else { harness::permissions::Mode::Plan }; self.set_perm_mode(m); self.blocks.push(Block::System(format!("permissions → {}", self.perm_mode.label()))); }
             "/context" | "/ctx" => {
@@ -1033,8 +1130,15 @@ impl App {
                 let mut it = arg.split_whitespace(); let which = it.next().unwrap_or("").to_string(); let model = it.next().map(String::from); let effort = it.next().map(|e| e.to_lowercase());
                 match which.as_str() {
                     "" => { self.blocks.push(Block::Banner(vec![format!("backend: {} · model {}", self.cfg.llm.provider.clone().unwrap_or("openai (local/compatible server)".into()), self.model), "switch: /backend local [model]  ·  /backend claude [model] [effort]   (claude = official Claude Code CLI on your subscription, default claude-fable-5; effort low|medium|high|max, also /effort)".into(), "        /backend anthropic <model>  (Anthropic API key from ANTHROPIC_API_KEY)".into()])); }
-                    "local" | "openai" | "lmstudio" => { self.cfg.llm.provider = None; if let Some(m) = model { self.cfg.llm.model = m; } self.model = self.cfg.llm.model.clone(); if let Some(cc) = self.cc.take() { tokio::spawn(async move { cc.stop().await; }); } self.cc_last_session = None; self.blocks.push(Block::System(format!("backend → local server {} · model {}", self.cfg.llm.base_url, self.model))); tokio::spawn(fetch_ctx_len(self.cfg.llm.base_url.clone(), self.model.clone(), self.tx.clone())); }
+                    "local" | "lmstudio" => { self.cfg.llm.provider = None; if let Some(m) = model { self.cfg.llm.model = m; } self.model = self.cfg.llm.model.clone(); if let Some(cc) = self.cc.take() { tokio::spawn(async move { cc.stop().await; }); } self.cc_last_session = None; self.blocks.push(Block::System(format!("backend → local server {} · model {}", self.cfg.llm.base_url, self.model))); tokio::spawn(fetch_ctx_len(self.cfg.llm.base_url.clone(), self.model.clone(), self.tx.clone())); }
                     "claude" | "claude-code" | "cc" => { self.cfg.llm.provider = Some("claude-code".into()); self.cfg.llm.model = model.unwrap_or("claude-fable-5".into()); if let Some(e) = effort { if matches!(e.as_str(), "low" | "medium" | "high" | "xhigh" | "max") { self.cfg.llm.effort = Some(e); } } if self.cfg.llm.effort.is_none() { self.cfg.llm.effort = Some("medium".into()); } self.model = self.cfg.llm.model.clone(); if let Some(cc) = self.cc.take() { tokio::spawn(async move { cc.stop().await; }); } self.cc_last_session = None; self.metrics.ctx_len = 0; self.blocks.push(Block::System(format!("backend → Claude Code (subscription) · model {} · tools bridged over MCP · context window reported after the first turn", self.model))); }
+                    "gemini" | "openai" | "openrouter" | "groq" | "mistral" | "deepseek" | "xai" | "together" => {
+                        let (url, env, default_model) = match which.as_str() { "gemini" => ("https://generativelanguage.googleapis.com/v1beta/openai", "GEMINI_API_KEY", "gemini-2.5-pro"), "openai" => ("https://api.openai.com/v1", "OPENAI_API_KEY", "gpt-5"), "openrouter" => ("https://openrouter.ai/api/v1", "OPENROUTER_API_KEY", "anthropic/claude-sonnet-4.5"), "groq" => ("https://api.groq.com/openai/v1", "GROQ_API_KEY", "llama-3.3-70b-versatile"), "mistral" => ("https://api.mistral.ai/v1", "MISTRAL_API_KEY", "mistral-large-latest"), "deepseek" => ("https://api.deepseek.com/v1", "DEEPSEEK_API_KEY", "deepseek-chat"), "xai" => ("https://api.x.ai/v1", "XAI_API_KEY", "grok-4"), _ => ("https://api.together.xyz/v1", "TOGETHER_API_KEY", "meta-llama/Llama-3.3-70B-Instruct-Turbo") };
+                        self.cfg.llm.provider = Some("openai".into()); self.cfg.llm.base_url = url.into(); self.cfg.llm.model = model.unwrap_or(default_model.into()); self.model = self.cfg.llm.model.clone();
+                        match std::env::var(env) { Ok(k) if !k.is_empty() => { self.cfg.llm.api_key = Some(k); self.blocks.push(Block::System(format!("backend → {which} ({url}) · model {} · key from ${env}", self.model))); } _ => { self.blocks.push(Block::Error(format!("backend → {which} set, but ${env} is not set — export it and re-run /backend {which}"))); } }
+                        if let Some(cc) = self.cc.take() { tokio::spawn(async move { cc.stop().await; }); }
+                        self.metrics.ctx_len = 0; tokio::spawn(fetch_ctx_len(self.cfg.llm.base_url.clone(), self.model.clone(), self.tx.clone()));
+                    }
                     "anthropic" => { self.cfg.llm.provider = Some("anthropic".into()); self.cfg.llm.base_url = "https://api.anthropic.com".into(); if let Some(m) = model { self.cfg.llm.model = m; } self.model = self.cfg.llm.model.clone(); self.metrics.ctx_len = 200_000; if self.cfg.llm.thinking_budget.is_none() { self.cfg.llm.thinking_budget = Some(8000); } self.blocks.push(Block::System(format!("backend → Anthropic API · model {}", self.model))); }
                     other => self.blocks.push(Block::Error(format!("unknown backend '{other}' (local | claude | anthropic)"))),
                 }
@@ -1090,6 +1194,7 @@ impl App {
                 let tx2 = self.tx.clone(); let net = self.net; let wd = self.workdir.clone();
                 tokio::spawn(async move { tokio::time::sleep(Duration::from_secs(8)).await; let ts = harness::tools::build_toolset(net, &wd, true).await; let _ = tx2.send(Msg::Toolset(Arc::new(ts))); });
             }
+            "update" if rest == "all" || rest == "--all" => { let tx = self.tx.clone(); tokio::spawn(async move { if let Ok(p) = harness::plugins::Plugins::open() { for (n, r) in p.update_all().await { let _ = tx.send(Msg::Notice(format!("plugin {n}: {}", match r { Ok(m) => m, Err(e) => format!("failed: {e:#}") }))); } } }); }
             "enable" | "disable" | "remove" | "rm" | "update" => {
                 if rest.is_empty() { self.blocks.push(Block::Error(format!("usage: /plugin {sub} <name>"))); return; }
                 let res: Result<String, String> = (|| {
@@ -1170,6 +1275,8 @@ impl App {
         let toolset = self.toolset.clone();
         let todos = self.todos.clone();
         let extra_roots = self.extra_roots.clone();
+        if self.session_meta.id.is_empty() { self.session_meta.id = harness::sessions::SessionStore::new_id(); }
+        let session_id = self.session_meta.id.clone();
         let inbox = self.inbox.clone();
         let cwd = self.wt_cwd.clone();
         let perm_mode = self.perm_mode;
@@ -1191,7 +1298,7 @@ impl App {
                 let _ = tx.send(Msg::Policy(policy.clone()));
                 let approver: Arc<dyn harness::permissions::Approver> = Arc::new(TuiApprover(tx.clone()));
                 let mut env_ = harness::agent::SubAgentEnv::new(client.clone(), registry.clone(), policy.clone(), approver.clone(), sink.clone(), budget, true); env_.cc_effort = cfg.llm.effort.clone(); let env = Arc::new(env_); let _ = tx.send(Msg::SubEnv(env.clone()));
-                let ctx = ToolCtx { workdir: workdir.clone(), timeout: Duration::from_secs(cfg.agent.tool_timeout_secs), max_output: cfg.agent.max_tool_output_chars, net: cfg.net.clone(), memory: store.clone(), subagent: Some(env), redact_secrets: cfg.security.redact_secrets, hooks: cfg.hooks.clone(), todos: todos.clone(), lsp_servers: cfg.lsp.servers.clone(), extra_roots: extra_roots.clone(), approver: Some(approver.clone()), inbox: inbox.clone(), cancel: None, cwd: Some(cwd.clone()) };
+                let ctx = ToolCtx { workdir: workdir.clone(), timeout: Duration::from_secs(cfg.agent.tool_timeout_secs), max_output: cfg.agent.max_tool_output_chars, net: cfg.net.clone(), memory: store.clone(), subagent: Some(env), redact_secrets: cfg.security.redact_secrets, hooks: cfg.hooks.clone(), todos: todos.clone(), lsp_servers: cfg.lsp.servers.clone(), extra_roots: extra_roots.clone(), approver: Some(approver.clone()), inbox: inbox.clone(), cancel: None, cwd: Some(cwd.clone()), session_id: Some(session_id.clone()) };
                 let agent = Agent { client: &client, registry, ctx: &ctx, max_turns: cfg.agent.max_turns, context_budget: budget, sink: sink.as_ref(), stream: true, policy: &policy, approver: approver.as_ref() };
                 let extra = format!("You are in an interactive session: the user can see everything and will reply; keep final answers concise.{extra_prompt}");
                 let system = harness::agent::system_prompt_with_memory(&workdir.display().to_string(), &registry.names(), Some(&extra), store.as_ref());
@@ -1214,6 +1321,21 @@ impl App {
             let _ = tx.send(Msg::Done(res));
         });
         self.running = Some(handle);
+    }
+
+    /// Ask the aux model for a short session title after the first turn (local/API backends).
+    fn spawn_title(&mut self) {
+        if !self.session_meta.title.is_empty() && self.session_meta.title.len() < 40 && !self.session_meta.title.ends_with('…') { return; }
+        if self.cfg.llm.provider.as_deref() == Some("claude-code") { return; }
+        let session = self.session.clone(); let cfg = self.cfg.clone(); let tx = self.tx.clone();
+        tokio::spawn(async move {
+            let msgs = session.lock().await.clone();
+            let first = msgs.iter().find(|m| m.role == "user").map(|m| m.text()).unwrap_or_default();
+            if first.trim().is_empty() { return; }
+            let Ok(client) = Client::new(&cfg.llm) else { return };
+            let req = vec![Message::system("Reply with a 3–6 word title for a coding session that starts with the following request. Title only, no quotes, no trailing period."), Message::user(truncate(&first, 600))];
+            if let Ok((r, _)) = client.aux().chat(&req, &[]).await { let t = r.text().lines().next().unwrap_or("").trim().trim_matches('"').to_string(); if (3..=80).contains(&t.len()) { let _ = tx.send(Msg::Title(t)); } }
+        });
     }
 
     /// Reflection runs *after* Done so the next queued task starts immediately; skipped when tasks are waiting.
@@ -1262,7 +1384,12 @@ impl App {
         let Ok(store) = harness::sessions::SessionStore::open() else { return };
         let id = if which == "last" || which == "latest" || which.is_empty() { match store.latest_for(&self.workdir.display().to_string()).or_else(|| store.list(None).into_iter().next()) { Some(m) => m.id, None => { self.blocks.push(Block::Error("no saved sessions".into())); return; } } }
             else if let Ok(n) = which.parse::<usize>() { match store.list(None).get(n.saturating_sub(1)) { Some(m) => m.id.clone(), None => { self.blocks.push(Block::Error(format!("no session #{n}"))); return; } } }
-            else { which.to_string() };
+            else {
+                // fuzzy: exact id, id prefix, or title/workdir substring (case-insensitive); ambiguous → show matches
+                let all = store.list(None); let q = which.to_lowercase();
+                let hits: Vec<&harness::sessions::Meta> = if let Some(m) = all.iter().find(|m| m.id == which) { vec![m] } else { all.iter().filter(|m| m.id.starts_with(which) || m.title.to_lowercase().contains(&q) || m.workdir.to_lowercase().contains(&q)).collect() };
+                match hits.len() { 1 => hits[0].id.clone(), 0 => { self.blocks.push(Block::Error(format!("no session matches '{which}' — /sessions"))); return; } _ => { let mut lines = vec![format!("{} sessions match '{which}' — pick one: /resume <id>", hits.len())]; for m in hits.iter().take(15) { lines.push(format!("  {}  {:<50} {}", m.id, truncate(&m.title, 50), harness::sessions::fmt_age(m.updated))); } self.blocks.push(Block::Banner(lines)); return; } }
+            };
         match store.load(&id) {
             Ok((meta, msgs)) => {
                 self.blocks.clear(); self.banner();
@@ -1317,6 +1444,7 @@ impl App {
             Msg::CcSession(s) => { self.cc = Some(s); }
             Msg::Policy(p) => { p.set_mode(self.perm_mode); self.live_policy = Some(p); }
             Msg::SubEnv(e) => { self.subenv = Some(e); }
+            Msg::Title(t) => { self.session_meta.title = t; self.save_session(); }
             Msg::Question(q, tx) => {
                 let mut lines = vec![format!("❓ {}", q.question)];
                 for (i, o) in q.options.iter().enumerate() { lines.push(format!("   [{}] {}{}", i + 1, o.label, if o.description.is_empty() { String::new() } else { format!(" — {}", o.description) })); }
@@ -1348,6 +1476,7 @@ impl App {
                     let title = match &res { Ok(_) => "Harness: task finished", Err(_) => "Harness: task stopped" };
                     let body = truncate(&self.blocks.iter().rev().find_map(|b| if let Block::User(t, _) = b { Some(t.clone()) } else { None }).unwrap_or_default(), 80).replace('"', "'");
                     let title = title.to_string();
+                    { let h = self.cfg.hooks.clone(); let wd = self.workdir.clone(); let (t2, b2) = (title.clone(), body.clone()); if !h.notification.is_empty() { tokio::spawn(async move { let _ = harness::hooks::run_event(&h, "notification", &t2, serde_json::json!({"title": t2, "body": b2}), &wd).await; }); } }
                     tokio::spawn(async move {
                         if cfg!(target_os = "macos") { let script = format!("display notification \"{body}\" with title \"{title}\" sound name \"Glass\""); let _ = tokio::process::Command::new("osascript").arg("-e").arg(script).output().await; }
                         else if cfg!(target_os = "linux") { let _ = tokio::process::Command::new("notify-send").arg(&title).arg(&body).output().await; }
@@ -1356,7 +1485,7 @@ impl App {
                 }
                 self.save_session();
                 match res {
-                    Ok((_, stats)) => { self.spawn_reflection(&stats); }
+                    Ok((_, stats)) => { if self.history.len() <= 1 { self.spawn_title(); } self.spawn_reflection(&stats); }
                     Err(e) => { if !e.contains("interrupted") { self.blocks.push(Block::Error(e)); } }
                 }
                 if !self.queued.is_empty() {
@@ -1471,7 +1600,8 @@ impl App {
 const COMMANDS: &[(&str, &str)] = &[
     ("/help", "show commands and keys"),
     ("/clear", "start a new session (forget the transcript)"),
-    ("/sessions", "list saved sessions"),
+    ("/sessions", "list saved sessions · /sessions live = other running sessions"),
+    ("/msg", "message another live session: /msg <id|prefix|title|all> <text>"),
     ("/resume", "resume a saved session: /resume <n|id|last>"),
     ("/model", "show or switch the model: /model <name>"),
     ("/backend", "switch backend: local (LM Studio etc.) | claude [model] [effort] (Claude Code CLI, subscription) | anthropic <model>"),
@@ -1498,7 +1628,9 @@ const COMMANDS: &[(&str, &str)] = &[
     ("/reload", "restart tools, MCP servers and plugins"),
     ("/permissions", "show or set permission mode: bypass|auto|ask|plan"),
     ("/plan", "toggle plan mode (read-only)"),
+    ("/trust", "remember this directory as trusted (no first-time notice)"),
     ("/theme", "switch theme: /theme light|dark"),
+    ("/vim", "toggle vim-style modal editing in the prompt"),
     ("/workflow", "run a workflow: /workflow <name> [args]  (list with /workflow)"),
     ("/queue", "show queued tasks (/queue clear)"),
     ("/next", "stop the current task and start the next queued one (ctrl+n)"),
@@ -1549,7 +1681,7 @@ fn draw(f: &mut Frame, app: &mut App) {
     } else if let Some((req, _)) = &app.pending_ask {
         Some(vec![Span::styled(" 🔒 ", Style::default().fg(Color::Black).bg(pal().orange)), Span::styled(format!(" {}({}) ", req.tool, truncate(&req.summary, width.saturating_sub(70))), Style::default().fg(Color::Black).bg(pal().orange).bold()),
                   Span::styled(format!("  {} · ", req.reason), Style::default().fg(pal().orange)),
-                  Span::styled("[y] allow once  ", Style::default().fg(pal().ok).bold()), Span::styled(format!("[a] always ({})  ", req.suggested_rule), Style::default().fg(pal().cyan)), Span::styled("[n] deny", Style::default().fg(pal().err).bold())])
+                  Span::styled("[y] once  ", Style::default().fg(pal().ok).bold()), Span::styled(format!("[a] always ({})  ", req.suggested_rule), Style::default().fg(pal().cyan)), Span::styled("[p] always in this project  ", Style::default().fg(pal().cyan)), Span::styled("[n] deny", Style::default().fg(pal().err).bold())])
     } else if let Some((f, phase, _)) = &app.compact_progress {
         let barw = 30usize; let filled = ((f * barw as f64) as usize).min(barw);
         Some(vec![Span::styled("⟲ compacting context ", Style::default().fg(pal().orange)), Span::styled("█".repeat(filled), Style::default().fg(pal().orange)), Span::styled("░".repeat(barw - filled), Style::default().fg(pal().dim)), Span::styled(format!(" {:>3.0}%  {phase}", f * 100.0), Style::default().fg(pal().dim))])
@@ -1634,6 +1766,7 @@ fn draw(f: &mut Frame, app: &mut App) {
     if !app.net { st.push(dot()); st.push(Span::styled("offline", Style::default().fg(pal().pink))); }
     if !app.queued.is_empty() { st.push(dot()); st.push(Span::styled(format!("{} queued", app.queued.len()), Style::default().fg(pal().cyan))); }
     if let Some(id) = app.attached { st.push(dot()); st.push(Span::styled(format!("attached #{id}"), Style::default().fg(pal().orange))); }
+    if app.vim { st.push(dot()); st.push(Span::styled(if app.vim_normal { "-- NORMAL --" } else { "-- INSERT --" }, Style::default().fg(if app.vim_normal { pal().orange } else { pal().ok }).bold())); }
     if let Some(wt) = app.wt_cwd.lock().unwrap().as_ref() { st.push(dot()); st.push(Span::styled(format!("worktree {}", wt.name), Style::default().fg(pal().orange))); }
     let lw: usize = st.iter().map(|s| s.content.chars().count()).sum();
     let right = if app.running.is_none() { "? for shortcuts · /help" } else { "esc to interrupt" };
@@ -1845,9 +1978,31 @@ fn render_block(b: &Block, app: &App, width: usize, out: &mut Vec<Line<'static>>
             }
             let mut first = true;
             let mut in_code: Option<(String, Option<syntect::easy::HighlightLines<'static>>)> = None;
-            for l in text.lines() {
+            let all_lines: Vec<&str> = text.lines().collect();
+            let mut li = 0usize;
+            while li < all_lines.len() {
+                let l = all_lines[li]; li += 1;
                 let bullet = if first { Span::styled("⏺ ", Style::default().fg(pal().fg)) } else { Span::raw("  ") };
                 first = false;
+                // markdown table: consecutive lines starting with '|'
+                if in_code.is_none() && l.trim_start().starts_with('|') && l.trim_end().ends_with('|') {
+                    let mut rows: Vec<Vec<String>> = vec![parse_row(l)];
+                    while li < all_lines.len() && all_lines[li].trim_start().starts_with('|') { rows.push(parse_row(all_lines[li])); li += 1; }
+                    let sep_idx: Option<usize> = rows.iter().position(|r| r.iter().all(|c| !c.is_empty() && c.chars().all(|ch| ch == '-' || ch == ':' || ch == ' ')));
+                    let cols = rows.iter().map(|r| r.len()).max().unwrap_or(0);
+                    let mut widths = vec![0usize; cols];
+                    for (ri, r) in rows.iter().enumerate() { if Some(ri) == sep_idx { continue; } for (ci, c) in r.iter().enumerate() { widths[ci] = widths[ci].max(c.chars().count()).min(40); } }
+                    let mut first_row = true;
+                    for (ri, r) in rows.iter().enumerate() {
+                        if Some(ri) == sep_idx { let mut spans = vec![bullet.clone()]; for (ci, wdt) in widths.iter().enumerate() { spans.push(Span::styled(format!("{}{}", "─".repeat(wdt + 2), if ci + 1 < cols { "┼" } else { "" }), Style::default().fg(pal().dim))); } out.push(Line::from(spans)); continue; }
+                        let mut spans = vec![if first_row { bullet.clone() } else { Span::raw("  ") }];
+                        for ci in 0..cols { let cell = r.get(ci).cloned().unwrap_or_default(); let cell = truncate(&cell, widths[ci]); let pad = widths[ci].saturating_sub(cell.chars().count()); let hdr = sep_idx == Some(ri + 1); spans.push(Span::styled(format!(" {cell}{} ", " ".repeat(pad)), if hdr { Style::default().bold().fg(pal().orange) } else { Style::default() })); if ci + 1 < cols { spans.push(Span::styled("│", Style::default().fg(pal().dim))); } }
+                        out.push(Line::from(spans)); first_row = false;
+                    }
+                    continue;
+                }
+                // lists: "- ", "* ", "1. " and nested (leading spaces)
+                if in_code.is_none() { let t = l.trim_start(); let indent = l.len() - t.len(); if let Some(rest) = t.strip_prefix("- ").or_else(|| t.strip_prefix("* ")).or_else(|| t.strip_prefix("• ")) { let mut spans = vec![bullet.clone(), Span::raw(" ".repeat(indent)), Span::styled("• ", Style::default().fg(pal().orange))]; spans.extend(md_spans(rest)); push_wrapped(out, spans, w, 4 + indent); continue; } if let Some(pos) = t.find(". ") { if pos <= 3 && t[..pos].chars().all(|c| c.is_ascii_digit()) { let mut spans = vec![bullet.clone(), Span::raw(" ".repeat(indent)), Span::styled(format!("{}. ", &t[..pos]), Style::default().fg(pal().orange))]; spans.extend(md_spans(&t[pos + 2..])); push_wrapped(out, spans, w, 4 + indent); continue; } } if let Some(rest) = t.strip_prefix("- [ ] ").or_else(|| t.strip_prefix("- [x] ")).or_else(|| t.strip_prefix("- [X] ")) { let done = t.starts_with("- [x") || t.starts_with("- [X"); let mut spans = vec![bullet.clone(), Span::raw(" ".repeat(indent)), Span::styled(if done { "☑ " } else { "☐ " }, Style::default().fg(if done { pal().ok } else { pal().dim }))]; spans.extend(md_spans(rest)); push_wrapped(out, spans, w, 4 + indent); continue; } if t.starts_with("> ") { let mut spans = vec![bullet.clone(), Span::styled("▍ ", Style::default().fg(pal().dim))]; spans.extend(md_spans(&t[2..]).into_iter().map(|sp| Span::styled(sp.content.to_string(), sp.style.fg(pal().dim).italic()))); push_wrapped(out, spans, w, 4); continue; } if t == "---" || t == "***" { out.push(Line::from(vec![bullet.clone(), Span::styled("─".repeat(w.saturating_sub(4)), Style::default().fg(pal().dim))])); continue; } }
                 if let Some(rest) = l.trim_start().strip_prefix("```") {
                     if in_code.is_none() { in_code = Some((rest.trim().split_whitespace().next().unwrap_or("txt").to_string(), None)); out.push(Line::from(vec![bullet, Span::styled(format!("```{}", rest.trim()), Style::default().fg(pal().dim))])); }
                     else { in_code = None; out.push(Line::from(vec![bullet, Span::styled("```", Style::default().fg(pal().dim))])); }
@@ -1968,6 +2123,8 @@ fn render_block(b: &Block, app: &App, width: usize, out: &mut Vec<Line<'static>>
         Block::Finished(t) => { push_wrapped(out, vec![Span::styled("  ✓ ", Style::default().fg(pal().ok)), Span::styled(t.clone(), Style::default().fg(pal().dim))], w, 4); }
     }
 }
+
+fn parse_row(l: &str) -> Vec<String> { let t = l.trim().trim_start_matches('|').trim_end_matches('|'); t.split('|').map(|c| c.trim().to_string()).collect() }
 
 /// Minimal inline markdown: `code` and **bold** and headings.
 fn md_spans(l: &str) -> Vec<Span<'static>> {

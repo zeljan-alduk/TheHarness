@@ -74,7 +74,7 @@ async fn call_tool(host: &BridgeHost, name: &str, args: Value) -> Value {
         crate::permissions::Decision::Ask(r) => {
             let arg = Policy::primary_arg(name, &args);
             let req = crate::permissions::ApprovalRequest { tool: name.to_string(), summary: arg.clone(), suggested_rule: Policy::suggested_rule(name, &arg), reason: r };
-            match host.approver.ask(req.clone()).await { crate::permissions::Approval::Once => None, crate::permissions::Approval::Always => { host.policy.allow_always(&req.suggested_rule); None } crate::permissions::Approval::Deny => Some("error: the user declined this action.".into()) }
+            match host.approver.ask(req.clone()).await { crate::permissions::Approval::Once => None, crate::permissions::Approval::Always => { host.policy.allow_always(&req.suggested_rule); None } crate::permissions::Approval::AlwaysProject => { host.policy.allow_always_project(&req.suggested_rule); None } crate::permissions::Approval::Deny => Some("error: the user declined this action.".into()) }
         }
     };
     let out = match blocked { Some(m) => crate::tools::ToolOutput { text: m, images: vec![] }, None => host.registry.call(name, &args_s, &host.ctx).await };

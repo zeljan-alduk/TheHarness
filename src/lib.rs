@@ -11,6 +11,7 @@ pub mod hooks;
 pub mod inbox;
 pub mod llm;
 pub mod lsp;
+pub mod mailbox;
 pub mod mcp;
 pub mod mcp_bridge;
 pub mod memory;

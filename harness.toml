@@ -57,11 +57,17 @@ deny = ["bash:rm -rf /*", "bash:rm -rf ~*", "bash:*mkfs*", "bash:*dd if=*"]
 ask = []
 
 [hooks]
-# Shell hooks (JSON on stdin). pre_tool exit code 2 blocks the call. See src/hooks.rs.
-pre_tool = []
-post_tool = []
+# Shell hooks (JSON on stdin). Entries are commands or { command, matcher, timeout_secs } where matcher is a
+# glob / "a|b" on the tool name (tool events) or subject. pre_tool exit code 2 blocks the call. See src/hooks.rs.
+pre_tool = []          # e.g. [{ command = "./scripts/guard.sh", matcher = "bash" }]
+post_tool = []         # e.g. [{ command = "cargo fmt", matcher = "write_file|edit_file|apply_patch" }]
 on_stop = []
 on_prompt = []
+session_start = []
+session_end = []
+subagent_stop = []
+pre_compact = []
+notification = []
 
 [security]
 redact_secrets = true
@@ -72,8 +78,8 @@ theme = "dark"         # dark | light  (/theme toggles at runtime)
 event_log = true       # ~/.config/harness/logs/<date>/tui-<pid>.jsonl
 
 [sandbox]
-# "none" | "seatbelt" (macOS sandbox-exec: shell may only write inside the workdir, temp dirs and
-# ~/.config/harness; deny_network = true also blocks outbound connections except localhost)
+# "none" | "seatbelt" (macOS sandbox-exec) | "bwrap" (Linux bubblewrap): shell may only write inside the
+# workdir, temp dirs and ~/.config/harness (+allow_write); deny_network = true blocks outbound connections
 mode = "none"
 deny_network = false
 allow_write = []
