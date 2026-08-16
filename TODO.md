@@ -46,3 +46,12 @@ Status: ☐ open · ◐ partial · ☑ done.
 
 `apply_patch`, `diagnostics`, `view_image`, `read_pdf`, `pdf_edit`, `extract_archive`, `download_file`, `memory`,
 `list_dir`, `spawn_agent {read_only}`.
+
+## Coordination — handled by the *other* Claude session on branch `feature/parity-b` (do NOT implement here)
+The following are being implemented concurrently in a separate git worktree and will be merged into main;
+skip them to avoid conflicts: hooks parity (SessionStart/End, SubagentStop, PreCompact, Notification, matchers),
+permission scopes (project always-rules, /permissions add/remove, directory trust), session picker/fuzzy resume +
+auto titles, markdown tables/lists rendering, vim mode + custom keybindings, cross-session messaging
+(send_message/list_sessions), provider presets (/backend gemini|openai|openrouter), bwrap sandbox on Linux,
+plugin auto-update, more eval tasks. Keep committing your own items normally; avoid touching src/tui.rs
+rendering functions and src/permissions.rs beyond what your items need.
