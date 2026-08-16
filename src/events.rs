@@ -17,6 +17,8 @@ pub enum Event {
     /// `images` are data: URLs (only for tools that return images, e.g. view_image).
     ToolResult { id: String, name: String, result: String, secs: f64, images: Vec<String> },
     Compacted { count: usize, prompt_tokens: u64 },
+    /// One model call finished: exact token counts and timing (ttft = time to first streamed token).
+    ModelResponse { prompt_tokens: u64, completion_tokens: u64, ttft_secs: f64, secs: f64, tool_calls: usize },
     RunFinished { stop_reason: String, turns: usize, tool_calls: usize, prompt_tokens: u64, completion_tokens: u64, wall_secs: f64 },
     Error { message: String },
 }
@@ -34,6 +36,10 @@ impl Sink for StderrSink {
         match e {
             Event::RunStarted { model, workdir, tools } => eprintln!("model={model} workdir={workdir} tools={tools:?}"),
             Event::Turn { .. } | Event::ReasoningDelta { .. } | Event::AssistantDelta { .. } => {}
+            Event::ModelResponse { prompt_tokens, completion_tokens, ttft_secs, secs, .. } => if self.verbose {
+                let gen = if *secs > *ttft_secs && *completion_tokens > 0 { *completion_tokens as f64 / (*secs - *ttft_secs) } else { 0.0 };
+                eprintln!("⏱ {prompt_tokens}+{completion_tokens} tok · ttft {ttft_secs:.1}s · {gen:.1} tok/s");
+            },
             Event::Reasoning { text } => if self.verbose { eprintln!("💭 {}", t(text.trim(), 400)) },
             Event::Assistant { text } => if self.verbose { eprintln!("🗣 {}", t(text.trim(), 800)) },
             Event::ToolCall { name, args, .. } => eprintln!("▶ {name} {}", t(&args.replace('\n', "\\n"), 300)),

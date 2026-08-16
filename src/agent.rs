@@ -82,10 +82,15 @@ impl<'a> Agent<'a> {
     /// Multi-turn: append `task` as a user turn to an existing transcript (created if empty) and run
     /// until the model stops calling tools. The transcript is left ready for the next turn.
     pub async fn run_turn(&self, msgs: &mut Vec<Message>, system: &str, task: &str) -> Result<(String, RunStats)> {
+        self.run_turn_message(msgs, system, Message::user(task)).await
+    }
+
+    /// Like `run_turn` but the user turn is a prepared message (e.g. text + image parts).
+    pub async fn run_turn_message(&self, msgs: &mut Vec<Message>, system: &str, user: Message) -> Result<(String, RunStats)> {
         let start = Instant::now();
         if msgs.is_empty() { msgs.push(Message::system(system)); } else if msgs[0].role == "system" { msgs[0] = Message::system(system); }
         repair_dangling(msgs);
-        msgs.push(Message::user(task));
+        msgs.push(user);
         let defs = self.registry.defs();
         let mut stats = RunStats::default();
         let mut last_usage = Usage::default();
@@ -105,10 +110,15 @@ impl<'a> Agent<'a> {
             }
             stats.turns += 1;
             self.sink.emit(&Event::Turn { n: stats.turns });
+            let call_start = Instant::now();
+            let mut first_token: Option<Instant> = None;
             let res = if self.stream {
-                self.client.chat_stream(msgs, &defs, |d| match d {
-                    Delta::Reasoning(t) => self.sink.emit(&Event::ReasoningDelta { text: t }),
-                    Delta::Content(t) => self.sink.emit(&Event::AssistantDelta { text: t }),
+                self.client.chat_stream(msgs, &defs, |d| {
+                    if first_token.is_none() { first_token = Some(Instant::now()); }
+                    match d {
+                        Delta::Reasoning(t) => self.sink.emit(&Event::ReasoningDelta { text: t }),
+                        Delta::Content(t) => self.sink.emit(&Event::AssistantDelta { text: t }),
+                    }
                 }).await
             } else {
                 self.client.chat(msgs, &defs).await
@@ -117,6 +127,12 @@ impl<'a> Agent<'a> {
                 Ok(x) => x,
                 Err(e) => { self.sink.emit(&Event::Error { message: format!("{e:#}") }); return Err(e); }
             };
+            let secs = call_start.elapsed().as_secs_f64();
+            self.sink.emit(&Event::ModelResponse {
+                prompt_tokens: usage.prompt_tokens, completion_tokens: usage.completion_tokens,
+                ttft_secs: first_token.map(|t| (t - call_start).as_secs_f64()).unwrap_or(secs), secs,
+                tool_calls: msg.tool_calls.as_ref().map(|c| c.len()).unwrap_or(0),
+            });
             stats.prompt_tokens += usage.prompt_tokens;
             stats.completion_tokens += usage.completion_tokens;
             last_usage = usage;
