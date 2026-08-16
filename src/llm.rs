@@ -157,6 +157,8 @@ impl Client {
         })
     }
     pub fn provider(&self) -> Provider { self.provider }
+    /// True when a separate (usually smaller/faster) aux model is configured.
+    pub fn has_aux(&self) -> bool { self.aux_model.is_some() }
     /// Client for auxiliary calls (reflection, compaction): the configured aux model, or this one.
     pub fn aux(&self) -> Client { match &self.aux_model { Some(m) => self.with_model(m), None => self.clone() } }
 

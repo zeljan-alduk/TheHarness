@@ -427,7 +427,19 @@ impl<'a> Agent<'a> {
                 }
                 let av: serde_json::Value = serde_json::from_str(args).unwrap_or(serde_json::Value::Null);
                 let ro = self.registry.is_read_only(name);
-                let d = self.policy.check(name, &av, ro);
+                let mut d = self.policy.check(name, &av, ro);
+                // auto mode: let the classifier decide borderline calls instead of stopping the run
+                if let crate::permissions::Decision::Ask(reason) = &d {
+                    if let Some((verdict, why)) = self.policy.classify(self.client, name, &av, reason).await {
+                        let arg = crate::permissions::Policy::primary_arg(name, &av);
+                        match &verdict {
+                            crate::permissions::Decision::Allow => self.sink.emit(&Event::Permission { tool: name.clone(), summary: arg, decision: format!("auto-allowed (classifier): {why}") }),
+                            crate::permissions::Decision::Deny(_) => self.sink.emit(&Event::Permission { tool: name.clone(), summary: arg, decision: format!("auto-denied (classifier): {why}") }),
+                            crate::permissions::Decision::Ask(_) => {}
+                        }
+                        d = verdict;
+                    }
+                }
                 let msg = match d {
                     crate::permissions::Decision::Allow => None,
                     crate::permissions::Decision::Deny(r) => { self.sink.emit(&Event::Permission { tool: name.clone(), summary: crate::permissions::Policy::primary_arg(name, &av), decision: format!("denied: {r}") }); Some(format!("error: blocked by permission policy ({r}). Ask the user or choose another approach.")) }

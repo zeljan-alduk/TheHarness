@@ -283,7 +283,8 @@ fn compact_transcript(msgs: &[Message], max_chars: usize) -> String {
     out
 }
 
-fn extract_json(s: &str) -> Option<String> {
+/// First balanced JSON object/array in a model reply (it may be fenced or wrapped in prose).
+pub fn extract_json(s: &str) -> Option<String> {
     let a = s.find('{')?; let b = s.rfind('}')?;
     if b > a { Some(s[a..=b].to_string()) } else { None }
 }

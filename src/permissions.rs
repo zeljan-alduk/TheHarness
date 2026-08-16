@@ -4,8 +4,13 @@
 //!             workdir ask; network tools free (default)
 //!   ask     — every mutating call asks
 //!   plan    — read-only: mutating tools denied, shell limited to inspection commands (ask otherwise)
-//! Rules: "<tool>" or "<tool>:<glob>" matched against the call's primary argument
-//! (bash → cmd, file tools → path, web/download → url, mcp → tool name). Order: deny, allow, ask, mode default.
+//! Rules: "<tool>", "<tool>:<glob>" or the Claude-Code form "Tool(<glob>)", matched against the call's
+//! primary argument (bash → cmd, file tools → path, web/download → url, mcp → tool name). A pattern of
+//! the form "<arg>:<glob>" matches one JSON argument instead — "Agent(subagent_type:review*)" — and
+//! "domain:<glob>" matches the host of a URL argument.
+//! Order: deny rules, allow rules (config/session/parent), built-in guards (catastrophic shell commands
+//! and credential files are refused unless an allow rule covers them), ask rules, mode default.
+//! In auto mode a call that would ask can first be decided by an LLM classifier — see `classify`.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -25,6 +30,22 @@ pub struct PermissionsConfig {
     #[serde(default)] pub allow: Vec<String>,
     #[serde(default)] pub deny: Vec<String>,
     #[serde(default)] pub ask: Vec<String>,
+    /// Auto mode: what the LLM classifier should wave through, ask about, or refuse.
+    #[serde(default)] pub auto: AutoConfig,
+}
+
+/// `[permissions.auto]` — the classifier that decides borderline calls in auto mode instead of
+/// stopping the run with a prompt. Instructions are plain English, one rule per entry.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct AutoConfig {
+    /// None = on when an aux model is configured, off otherwise. false disables it entirely.
+    #[serde(default)] pub classifier: Option<bool>,
+    /// "safe, reversible things in the project" …
+    #[serde(default)] pub allow: Vec<String>,
+    /// Always stop and ask about these, whatever the classifier thinks.
+    #[serde(default)] pub ask: Vec<String>,
+    /// Refuse outright.
+    #[serde(default)] pub deny: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -65,6 +86,15 @@ const RISKY: &[&str] = &[
     "git commit --amend", "git rebase", "git branch -D", "git tag -d", "gh pr merge", "gh release",
     "del /s", "del /q", "rmdir /s", "rd /s", "format ", "remove-item -recurse", "rm -recurse", "diskpart", "reg delete", "schtasks", "net user",
 ];
+/// Never allowed outside bypass mode: destroys data outside the project or the machine itself.
+const CATASTROPHIC: &[&str] = &["rm -rf /", "rm -rf /*", "rm -fr /", "rm -rf ~", "rm -rf $HOME", "rm -rf .. ", ":(){", "mkfs", "dd if=/dev/zero of=/dev/", "dd if=/dev/random of=/dev/", "> /dev/sda", "chmod -R 777 /", "chown -R / ", "shutdown -h", "diskutil eraseDisk", "format c:", "del /f /s /q c:\\"];
+/// Files never read into the model's context (an explicit allow rule still wins).
+const SENSITIVE: &[&str] = &["**/.env", "**/.env.*", "**/id_rsa*", "**/id_ed25519*", "**/.ssh/**", "**/*.pem", "**/*.key", "**/.netrc", "**/.npmrc", "**/.pypirc", "**/.aws/credentials", "**/.config/gh/hosts.yml", "**/credentials.json", "**/service-account*.json"];
+/// …except these, which are meant to be shared.
+const SENSITIVE_OK: &[&str] = &["**/.env.example", "**/.env.sample", "**/.env.template", "**/.env.defaults", "**/*.pub"];
+/// Claude-Code / Codex tool names accepted in rules, mapped to ours.
+const TOOL_ALIASES: &[(&str, &str)] = &[("bash", "bash"), ("shell", "bash"), ("read", "read_file"), ("write", "write_file"), ("edit", "edit_file"), ("multiedit", "edit_file"), ("ls", "list_dir"), ("glob", "glob"), ("grep", "grep"), ("webfetch", "web_fetch"), ("websearch", "web_search"), ("task", "spawn_agent"), ("agent", "spawn_agent"), ("todowrite", "todo"), ("notebookedit", "notebook_edit"), ("askuserquestion", "ask_user")];
+
 const PLAN_OK: &[&str] = &["git status", "git log", "git diff", "git show", "git branch", "git blame", "ls", "cat ", "head ", "tail ", "grep ", "rg ", "find ", "fd ", "wc ", "tree", "pwd", "echo ", "which ", "file ", "stat ", "du ", "df ", "env", "printenv", "cargo check", "cargo metadata", "cargo tree", "python3 -c \"import", "node -e", "jq ", "sed -n", "awk ", "sort", "uniq", "diff "];
 /// Tools that are not read-only per the registry but never touch files/state outside the harness itself.
 const BENIGN: &[&str] = &["todo", "ask_user", "notify"];
@@ -115,11 +145,42 @@ impl Policy {
         }
     }
 
-    fn rule_matches(rule: &str, tool: &str, arg: &str) -> bool {
-        let (rt, pat) = match rule.split_once(':') { Some((t, p)) => (t.trim(), Some(p.trim())), None => (rule.trim(), None) };
-        if !glob_match(rt, tool) { return false; }
-        match pat { None => true, Some(p) => glob_match(p, arg) }
+    /// Rules accept `tool`, `tool:<glob>` and the Claude-Code form `Tool(<glob>)`; the pattern may be
+    /// `<arg>:<glob>` to match one JSON argument (`Agent(model:*opus*)`) or `domain:<glob>` for URLs.
+    pub fn parse_rule(rule: &str) -> (String, Option<String>) {
+        let r = rule.trim();
+        if let Some(open) = r.find('(') {
+            if r.ends_with(')') {
+                let tool = r[..open].trim();
+                let pat = r[open + 1..r.len() - 1].trim();
+                return (canonical_tool(tool), (!pat.is_empty()).then(|| pat.to_string()));
+            }
+        }
+        match r.split_once(':') {
+            // mcp__server__tool has no pattern part
+            Some((t, p)) if !t.is_empty() && !r.starts_with("mcp__") => (canonical_tool(t), Some(p.trim().to_string())),
+            _ => (canonical_tool(r), None),
+        }
     }
+
+    fn rule_matches_args(rule: &str, tool: &str, arg: &str, args: &Value) -> bool {
+        let (rt, pat) = Self::parse_rule(rule);
+        if !glob_match(&rt, tool) { return false; }
+        let Some(p) = pat else { return true };
+        // `<arg>:<glob>` — match a named JSON argument (domain: matches the host of a URL argument)
+        if let Some((key, val)) = p.split_once(':') {
+            let (key, val) = (key.trim(), val.trim());
+            if key == "domain" { return url_host(arg).map(|h| glob_match(val, &h) || h.ends_with(&format!(".{val}"))).unwrap_or(false); }
+            if args.get(key).is_some() {
+                let a = args.get(key).map(|v| match v { Value::String(s) => s.clone(), other => other.to_string() }).unwrap_or_default();
+                return glob_match(val, &a);
+            }
+        }
+        glob_match(&p, arg)
+    }
+
+    #[cfg(test)]
+    fn rule_matches(rule: &str, tool: &str, arg: &str) -> bool { Self::rule_matches_args(rule, tool, arg, &Value::Null) }
 
     fn outside_workdir(&self, tool: &str, arg: &str) -> bool {
         if !matches!(tool, "write_file" | "edit_file" | "apply_patch" | "extract_archive" | "pdf_edit" | "download_file") { return false; }
@@ -131,10 +192,19 @@ impl Policy {
 
     pub fn check(&self, tool: &str, args: &Value, read_only_tool: bool) -> Decision {
         let arg = Self::primary_arg(tool, args);
-        for r in &self.cfg.deny { if Self::rule_matches(r, tool, &arg) { return Decision::Deny(format!("denied by rule '{r}'")); } }
-        for r in self.session_allow.lock().unwrap().iter().chain(self.cfg.allow.iter()) { if Self::rule_matches(r, tool, &arg) { return Decision::Allow; } }
-        if let Some(p) = &self.parent { for r in p.session_rules() { if Self::rule_matches(&r, tool, &arg) { return Decision::Allow; } } }
-        for r in &self.cfg.ask { if Self::rule_matches(r, tool, &arg) { return Decision::Ask(format!("matches rule '{r}'")); } }
+        for r in &self.cfg.deny { if Self::rule_matches_args(r, tool, &arg, args) { return Decision::Deny(format!("denied by rule '{r}'")); } }
+        // an explicit allow rule (config, session or parent) wins over the built-in guards below
+        let explicit_allow = self.session_allow.lock().unwrap().iter().chain(self.cfg.allow.iter()).any(|r| Self::rule_matches_args(r, tool, &arg, args))
+            || self.parent.as_ref().map(|p| p.session_rules().iter().any(|r| Self::rule_matches_args(r, tool, &arg, args))).unwrap_or(false);
+        if explicit_allow { return Decision::Allow; }
+        if self.effective_mode() != Mode::Bypass {
+            if SHELL_TOOLS.contains(&tool) {
+                let a = arg.to_lowercase();
+                if let Some(r) = CATASTROPHIC.iter().find(|r| a.contains(*r)) { return Decision::Deny(format!("refused: '{}' destroys data outside this project (allow it explicitly in [permissions].allow if you really mean it)", r.trim())); }
+            }
+            if let Some(p) = secret_file(tool, &arg) { return Decision::Deny(format!("{p} holds credentials — it is never read into the model's context (add an allow rule to override)")); }
+        }
+        for r in &self.cfg.ask { if Self::rule_matches_args(r, tool, &arg, args) { return Decision::Ask(format!("matches rule '{r}'")); } }
         // mutating iff the registry does not declare the tool read-only (benign UI tools excepted)
         let mutating = !read_only_tool && !BENIGN.contains(&tool);
         match self.effective_mode() {
@@ -154,6 +224,37 @@ impl Policy {
             }
         }
     }
+
+    /// Auto mode's LLM classifier: decide a borderline call instead of interrupting the user.
+    /// Returns None when the classifier is off or unavailable — the caller then asks the user
+    /// (fail-closed: an unparseable or hedging answer never means "allow").
+    pub async fn classify(&self, client: &crate::llm::Client, tool: &str, args: &Value, reason: &str) -> Option<(Decision, String)> {
+        if self.effective_mode() != Mode::Auto { return None; }
+        let a = &self.cfg.auto;
+        if a.classifier == Some(false) { return None; }
+        if a.classifier.is_none() && !client.has_aux() { return None; }
+        let arg = Self::primary_arg(tool, args);
+        let mut instr = String::new();
+        for x in &a.deny { instr.push_str(&format!("- DENY: {x}\n")); }
+        for x in &a.ask { instr.push_str(&format!("- ASK: {x}\n")); }
+        for x in &a.allow { instr.push_str(&format!("- ALLOW: {x}\n")); }
+        if instr.is_empty() { instr.push_str("- ALLOW: reversible work inside the project (builds, tests, formatters, package scripts, git commands that do not rewrite history or push)\n- ASK: anything that leaves the project directory, touches the network with side effects, installs software globally, or deletes data\n- DENY: anything that exfiltrates secrets or damages the machine\n"); }
+        let system = format!(
+"You are the permission classifier of a local coding agent. The agent works autonomously in {}; the user is not watching. Decide whether this tool call may run.\nHouse rules (top to bottom, later ones do not override DENY):\n{instr}\nAnswer with JSON only: {{\"decision\": \"allow\"|\"ask\"|\"deny\", \"reason\": \"<= 15 words\"}}.\nRules: choose \"ask\" whenever you are unsure — a wrong \"allow\" is far worse than a needless question. Never allow: deleting or overwriting data outside the project, writing to system paths, credentials/secret exfiltration, `sudo`, disabling tests or safety checks to make something pass, force-pushing, or destroying git history.",
+            self.workdir.display());
+        let user = format!("tool: {tool}\nprimary argument: {}\nfull arguments: {}\nwhy the heuristic hesitated: {reason}\n\nJSON:", crate::llm::truncate_for_log(&arg, 400), crate::llm::truncate_for_log(&args.to_string(), 1200));
+        let req = vec![crate::llm::Message::system(system), crate::llm::Message::user(user)];
+        let (reply, _) = client.aux().chat(&req, &[]).await.ok()?;
+        let text = reply.text();
+        let v: Value = serde_json::from_str(crate::memory::extract_json(&text)?.trim()).ok()?;
+        let why = v["reason"].as_str().unwrap_or("").trim().to_string();
+        match v["decision"].as_str().map(|d| d.trim().to_lowercase()).as_deref() {
+            Some("allow") => Some((Decision::Allow, why)),
+            Some("deny") => Some((Decision::Deny(format!("classifier: {why}")), why)),
+            _ => None,
+        }
+    }
+
 }
 
 /// Plan mode: a shell line is safe if every segment (split on ; && || |) starts with an inspection command,
@@ -181,6 +282,28 @@ pub fn glob_match(pat: &str, text: &str) -> bool {
     }
     let p: Vec<char> = pat.chars().collect(); let t: Vec<char> = text.chars().collect();
     rec(&p, &t)
+}
+
+/// Rule tool names are case-insensitive and accept the Claude-Code spelling (`Bash`, `WebFetch`, …).
+fn canonical_tool(t: &str) -> String {
+    let k = t.trim().to_lowercase();
+    TOOL_ALIASES.iter().find(|(a, _)| *a == k).map(|(_, c)| c.to_string()).unwrap_or(k)
+}
+
+fn url_host(u: &str) -> Option<String> {
+    let rest = u.split_once("://").map(|(_, r)| r).unwrap_or(u);
+    let host = rest.split(['/', '?', '#']).next()?.split('@').next_back()?.split(':').next()?;
+    (!host.is_empty()).then(|| host.to_lowercase())
+}
+
+/// The path a call would read, if it is a credentials file the model should never see.
+fn secret_file(tool: &str, arg: &str) -> Option<String> {
+    if !matches!(tool, "read_file" | "view_image" | "read_pdf" | "notebook_edit" | "edit_file" | "write_file" | "apply_patch") { return None; }
+    let p = arg.trim();
+    if p.is_empty() { return None; }
+    let norm = p.replace('\\', "/");
+    if SENSITIVE_OK.iter().any(|g| crate::instructions::glob_path(g, &norm)) { return None; }
+    SENSITIVE.iter().any(|g| crate::instructions::glob_path(g, &norm)).then(|| norm)
 }
 
 fn rules_file() -> PathBuf { crate::setup::config_dir().join("permissions.json") }
@@ -214,7 +337,7 @@ pub fn trust(workdir: &Path) { let w = workdir.canonicalize().unwrap_or(workdir.
 mod tests {
     use super::*;
     use serde_json::json;
-    fn pol(mode: Mode) -> Policy { Policy::new(PermissionsConfig { mode, allow: vec!["bash:cargo *".into()], deny: vec!["bash:rm -rf /*".into()], ask: vec![] }, Path::new("/tmp")) }
+    fn pol(mode: Mode) -> Policy { Policy::new(PermissionsConfig { mode, allow: vec!["bash:cargo *".into()], deny: vec!["bash:rm -rf /*".into()], ..Default::default() }, Path::new("/tmp")) }
     #[test]
     fn globs() { assert!(glob_match("bash:git *", "bash:git status")); assert!(glob_match("*", "anything")); assert!(!glob_match("git *", "cargo test")); }
     #[test]
@@ -237,6 +360,33 @@ mod tests {
         let by = pol(Mode::Bypass);
         assert!(matches!(by.check("bash", &json!({"cmd":"sudo rm -rf build"}), false), Decision::Allow));
     }
+    #[test]
+    fn rule_syntax_and_guards() {
+        // Claude-Code spelling, argument matchers and domain rules
+        assert!(Policy::rule_matches("Bash(git * main)", "bash", "git push main"));
+        assert!(Policy::rule_matches("Read(src/**)", "read_file", "src/a/b.rs"));
+        assert!(Policy::rule_matches_args("WebFetch(domain:example.com)", "web_fetch", "https://api.example.com/x", &json!({"url":"https://api.example.com/x"})));
+        assert!(!Policy::rule_matches_args("WebFetch(domain:example.com)", "web_fetch", "https://evil.com/x", &json!({"url":"https://evil.com/x"})));
+        assert!(Policy::rule_matches_args("Agent(subagent_type:review*)", "spawn_agent", "", &json!({"subagent_type":"reviewer"})));
+        assert!(Policy::rule_matches("mcp__chrome-devtools__*", "mcp__chrome-devtools__click", ""));
+
+        let p = pol(Mode::Auto);
+        // credentials are never read, in any mode but bypass
+        assert!(matches!(p.check("read_file", &json!({"path":".env"}), true), Decision::Deny(_)));
+        assert!(matches!(p.check("read_file", &json!({"path":"app/.env.production"}), true), Decision::Deny(_)));
+        assert!(matches!(p.check("read_file", &json!({"path":".env.example"}), true), Decision::Allow));
+        assert!(matches!(p.check("read_file", &json!({"path":"/home/u/.ssh/id_rsa"}), true), Decision::Deny(_)));
+        assert!(matches!(pol(Mode::Bypass).check("read_file", &json!({"path":".env"}), true), Decision::Allow));
+        let allowed = Policy::new(PermissionsConfig { mode: Mode::Auto, allow: vec!["Read(.env)".into()], ..Default::default() }, Path::new("/tmp"));
+        assert!(matches!(allowed.check("read_file", &json!({"path":".env"}), true), Decision::Allow), "an explicit allow rule overrides the guard");
+
+        // catastrophic commands are refused outright, not merely asked about
+        assert!(matches!(p.check("bash", &json!({"cmd":"rm -rf ~"}), false), Decision::Deny(_)));
+        assert!(matches!(p.check("bash", &json!({"cmd":"sudo mkfs.ext4 /dev/sda1"}), false), Decision::Deny(_)));
+        assert!(matches!(p.check("bash", &json!({"cmd":"rm -rf build"}), false), Decision::Ask(_)));
+        assert!(matches!(pol(Mode::Bypass).check("bash", &json!({"cmd":"rm -rf ~"}), false), Decision::Allow));
+    }
+
     #[test]
     fn non_read_only_tools_are_mutating() {
         let p = pol(Mode::Auto);

@@ -50,11 +50,23 @@ download_timeout_secs = 3600
 
 [permissions]
 # bypass | auto | ask | plan.  auto: reads free, writes inside the workdir free, risky shell commands
-# and writes outside the workdir ask for approval. Rules: "<tool>" or "<tool>:<glob on primary arg>".
+# and writes outside the workdir ask for approval. Regardless of mode (except bypass) the harness
+# refuses catastrophic shell commands and never reads .env / ssh keys / credentials into the context.
+# Rules: "<tool>", "<tool>:<glob on primary arg>", or the Claude-Code form "Tool(<glob>)"; the pattern
+# may address one argument — "Agent(subagent_type:review*)", "WebFetch(domain:example.com)".
 mode = "auto"
 allow = ["bash:git status*", "bash:git diff*", "bash:git log*", "bash:cargo *", "bash:npm test*", "bash:pytest*"]
 deny = ["bash:rm -rf /*", "bash:rm -rf ~*", "bash:*mkfs*", "bash:*dd if=*"]
 ask = []
+
+[permissions.auto]
+# In auto mode, borderline calls are decided by a classifier (the aux model) instead of interrupting
+# you; it fails closed — anything it is unsure about still asks. classifier: true | false | unset
+# (unset = on when llm.aux_model is configured). The lists are plain English, one instruction each.
+# classifier = true
+allow = []   # e.g. "formatters, linters and test runners for this project"
+ask = []     # e.g. "anything that pushes to a remote or opens a PR"
+deny = []    # e.g. "uploading files anywhere"
 
 [hooks]
 # Shell hooks (JSON on stdin). Entries are commands or { command, matcher, timeout_secs } where matcher is a
