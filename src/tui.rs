@@ -58,7 +58,7 @@ fn pal() -> Pal {
 const SPINNER: [&str; 10] = ["✻", "✼", "✽", "✾", "✿", "❀", "✿", "✾", "✽", "✼"];
 const WORDS: [&str; 12] = ["Thinking", "Pondering", "Working", "Reasoning", "Cooking", "Tinkering", "Brewing", "Mulling", "Crunching", "Percolating", "Noodling", "Computing"];
 
-enum Msg { CcSession(Arc<harness::claude_code::ClaudeCodeSession>), CcSid(String), Block(Block), Ask(harness::permissions::ApprovalRequest, tokio::sync::oneshot::Sender<harness::permissions::Approval>), Ev(Event), Done(Result<(String, harness::agent::RunStats), String>), Sys(SysSample), CtxLen(u64), Pasted(Result<PathBuf, String>), Frames(Result<(PathBuf, f64, Vec<(f64, PathBuf)>), String>), Toolset(Arc<Toolset>), Catalog(Result<harness::plugins::Catalog, String>), Notice(String) }
+enum Msg { Policy(Arc<harness::permissions::Policy>), CcSession(Arc<harness::claude_code::ClaudeCodeSession>), CcSid(String), Block(Block), Ask(harness::permissions::ApprovalRequest, tokio::sync::oneshot::Sender<harness::permissions::Approval>), Ev(Event), Done(Result<(String, harness::agent::RunStats), String>), Sys(SysSample), CtxLen(u64), Pasted(Result<PathBuf, String>), Frames(Result<(PathBuf, f64, Vec<(f64, PathBuf)>), String>), Toolset(Arc<Toolset>), Catalog(Result<harness::plugins::Catalog, String>), Notice(String) }
 
 /// Video scrubber state (modal over the transcript).
 struct VideoPicker { path: PathBuf, duration: f64, frames: Vec<(f64, PathBuf, String)>, cur: usize, selected: std::collections::BTreeSet<usize>, loading: bool, error: Option<String> }
@@ -335,6 +335,8 @@ struct App {
     think_scroll: usize,
     toolset: Option<Arc<Toolset>>,
     perm_mode: harness::permissions::Mode,
+    live_policy: Option<Arc<harness::permissions::Policy>>,
+    extra_roots: Vec<PathBuf>,
     cc: Option<Arc<harness::claude_code::ClaudeCodeSession>>,
     cc_last_session: Option<String>,
     compact_progress: Option<(f64, String, Instant)>,
@@ -364,7 +366,7 @@ pub async fn run(cfg: Config, resume: Option<String>) -> Result<()> {
         quit: false, tick: 0, word: 0, models: vec![],
         metrics: Metrics::new(0), panel: None, attachments: vec![], tool_previews: Default::default(),
         picker, images: Default::default(), img_seq: 0,
-        think_scroll: 0, toolset: None, perm_mode: harness::permissions::Mode::Auto, cc: None, cc_last_session: None, compact_progress: None, session_meta: harness::sessions::Meta::default(), todos: Default::default(), event_log: None, pending_ask: None, video: None, strip_rects: vec![], tr_rect: Rect::default(), panel_rect: Rect::default(), tr_start: 0, line_map: vec![],
+        think_scroll: 0, toolset: None, perm_mode: harness::permissions::Mode::Auto, live_policy: None, extra_roots: vec![], cc: None, cc_last_session: None, compact_progress: None, session_meta: harness::sessions::Meta::default(), todos: Default::default(), event_log: None, pending_ask: None, video: None, strip_rects: vec![], tr_rect: Rect::default(), panel_rect: Rect::default(), tr_start: 0, line_map: vec![],
     };
     app.metrics.ctx_len = app.cfg.llm.context_budget_tokens.unwrap_or(0);
     app.perm_mode = app.cfg.permissions.mode;
@@ -430,6 +432,10 @@ impl App {
     }
 
     fn set_status(&mut self, s: impl Into<String>) { self.status_msg = Some((s.into(), Instant::now())); }
+    fn set_perm_mode(&mut self, m: harness::permissions::Mode) {
+        self.perm_mode = m; if let Some(p) = &self.live_policy { p.set_mode(m); }
+        if m == harness::permissions::Mode::Bypass { if let Some((_, tx)) = self.pending_ask.take() { let _ = tx.send(harness::permissions::Approval::Once); self.blocks.push(Block::System("🔒 pending prompt auto-approved (bypass)".into())); } }
+    }
 
     /// (Re)build tools: built-ins + MCP servers from global/project/plugin configs. Async; swaps in when ready.
     fn reload_toolset(&mut self) {
@@ -528,7 +534,7 @@ impl App {
                     (KeyCode::Down, true, _) | (KeyCode::PageDown, _, _) => { self.scroll_up = self.scroll_up.saturating_sub(10); }
                     (KeyCode::Up, _, _) => { if !self.input.contains('\n') { self.history_prev(); } }
                     (KeyCode::Down, _, _) => { if !self.input.contains('\n') { self.history_next(); } }
-                    (KeyCode::BackTab, _, _) => { use harness::permissions::Mode::*; self.perm_mode = match self.perm_mode { Auto => Ask, Ask => Plan, Plan => Bypass, Bypass => Auto }; self.set_status(format!("permissions → {}", self.perm_mode.label())); }
+                    (KeyCode::BackTab, _, _) => { use harness::permissions::Mode::*; let m = match self.perm_mode { Auto => Ask, Ask => Plan, Plan => Bypass, Bypass => Auto }; self.set_perm_mode(m); self.set_status(format!("permissions → {}", self.perm_mode.label())); }
                     (KeyCode::Tab, _, _) => { self.complete_slash(); }
                     (KeyCode::Char(c), false, false) => { self.insert_str(&c.to_string()); }
                     _ => {}
@@ -777,11 +783,11 @@ impl App {
                     let mut lines = vec![format!("permission mode: {} ({})", format!("{:?}", self.perm_mode).to_lowercase(), self.perm_mode.label()), "switch: /permissions bypass|auto|ask|plan   (shift+tab cycles)".into(), format!("config allow: {:?}", self.cfg.permissions.allow), format!("config deny:  {:?}", self.cfg.permissions.deny), format!("always-allowed (this machine): {:?}", rules)];
                     lines.push("Rules are '<tool>' or '<tool>:<glob>' matched on the primary argument (bash cmd, file path, url).".into());
                     self.blocks.push(Block::Banner(lines));
-                } else if let Some(m) = harness::permissions::Mode::parse(&arg) { self.perm_mode = m; self.blocks.push(Block::System(format!("permissions → {}", m.label()))); }
+                } else if let Some(m) = harness::permissions::Mode::parse(&arg) { self.set_perm_mode(m); self.blocks.push(Block::System(format!("permissions → {}", m.label()))); }
                 else { self.blocks.push(Block::Error("usage: /permissions [bypass|auto|ask|plan]".into())); }
             }
             "/theme" => { let light = match arg.as_str() { "light" => true, "dark" => false, _ => !LIGHT.load(std::sync::atomic::Ordering::Relaxed) }; LIGHT.store(light, std::sync::atomic::Ordering::Relaxed); self.blocks.push(Block::System(format!("theme → {}", if light { "light" } else { "dark" }))); }
-            "/plan" => { self.perm_mode = if self.perm_mode == harness::permissions::Mode::Plan { harness::permissions::Mode::Auto } else { harness::permissions::Mode::Plan }; self.blocks.push(Block::System(format!("permissions → {}", self.perm_mode.label()))); }
+            "/plan" => { let m = if self.perm_mode == harness::permissions::Mode::Plan { harness::permissions::Mode::Auto } else { harness::permissions::Mode::Plan }; self.set_perm_mode(m); self.blocks.push(Block::System(format!("permissions → {}", self.perm_mode.label()))); }
             "/context" | "/ctx" => {
                 let tx = self.tx.clone(); let session = self.session.clone(); let cfg = self.cfg.clone(); let workdir = self.workdir.clone(); let toolset = self.toolset.clone();
                 let window = self.metrics.ctx_len; let measured = self.last_prompt_tokens;
@@ -858,10 +864,111 @@ impl App {
                     }
                 }
             }
+            "/keybindings" | "/keys" | "/shortcuts" => {
+                self.blocks.push(Block::Banner(vec![
+                    "Keyboard shortcuts".into(),
+                    "  enter            send · queue if a task is running      alt+enter / ctrl+j   newline".into(),
+                    "  esc              interrupt the current task (context kept) · clear input when idle".into(),
+                    "  ctrl+c           interrupt · clear input · press twice to quit     ctrl+d   quit (empty input)".into(),
+                    "  ctrl+n           stop current task and start the next queued one".into(),
+                    "  ctrl+o           expand/collapse all tool outputs      click a block  fold/unfold it".into(),
+                    "  ctrl+t           show/hide thinking inline               ctrl+p         dashboard panel".into(),
+                    "  ctrl+v           paste image/file from clipboard        ctrl+u         clear line".into(),
+                    "  ctrl+a / ctrl+e  line start / end                       ctrl+l         jump to bottom".into(),
+                    "  shift+tab        cycle permission mode (auto → ask → plan → bypass)".into(),
+                    "  tab              complete a /command                     ↑ / ↓          input history".into(),
+                    "  pgup / pgdn, ctrl+↑/↓, mouse wheel   scroll transcript (wheel over the panel scrolls thinking)".into(),
+                    "  y / a / n        answer a permission prompt (once / always / deny)".into(),
+                    "  video scrubber:  ←/→ frames · space select · a all · enter attach · esc cancel".into(),
+                    "  text selection:  hold shift (kitty/wezterm/iterm) or fn/option (Terminal.app) while dragging".into(),
+                ]));
+            }
+            "/status" => {
+                let cc = self.cfg.llm.provider.as_deref() == Some("claude-code");
+                let mut lines = vec![
+                    format!("backend   {}", if cc { format!("Claude Code · {} · effort {}", self.model, self.cfg.llm.effort.clone().unwrap_or("medium".into())) } else if self.cfg.llm.provider.as_deref() == Some("anthropic") { format!("Anthropic API · {}", self.model) } else { format!("{} · {}", self.cfg.llm.base_url, self.model) }),
+                    format!("context   {} window · last prompt {} · session {} in / {} out", fmt_k(self.metrics.ctx_len), fmt_k(self.last_prompt_tokens), fmt_k(self.total_prompt), fmt_k(self.total_completion)),
+                    format!("session   {} · {} turns · workdir {}", if self.session_meta.id.is_empty() { "(unsaved)".to_string() } else { self.session_meta.id.clone() }, self.history.len(), short_path(&self.workdir)),
+                    format!("perms     {} · net {} · tools {}", self.perm_mode.label(), if self.net { "on" } else { "off" }, self.toolset.as_ref().map(|t| t.registry.len()).unwrap_or(0)),
+                    format!("queue     {} waiting · running: {}", self.queued.len(), self.running.is_some()),
+                ];
+                if let Ok(p) = harness::plugins::Plugins::open() { let en = p.enabled(); lines.push(format!("plugins   {} enabled ({} skills)", en.len(), en.iter().map(|x| x.skills.len()).sum::<usize>())); }
+                self.blocks.push(Block::Banner(lines));
+            }
+            "/doctor" => {
+                let st = harness::setup::check();
+                let mut lines = vec!["Doctor — external tools".to_string()];
+                for t in &st { lines.push(format!("  {} {:<26} {}", if t.ok() { "✓" } else { "·" }, t.name, if t.ok() { t.found.first().map(|(_, p)| p.display().to_string()).unwrap_or_default() } else { format!("missing → {}", t.install.clone().unwrap_or("(system)".into())) })); }
+                lines.push(String::new());
+                lines.push(format!("  claude CLI  {}", harness::claude_code::claude_bin().map(|p| p.display().to_string()).unwrap_or("not found (needed for /backend claude)".into())));
+                lines.push(format!("  config      {}", short_path(&harness::setup::config_dir().join("harness.toml"))));
+                lines.push(format!("  memory dir  {}  · sessions {}  · plugins {}", short_path(&harness::setup::config_dir()), short_path(&harness::setup::config_dir().join("sessions")), short_path(&harness::setup::config_dir().join("plugins"))));
+                lines.push("  fix missing tools: harness setup --install".into());
+                self.blocks.push(Block::Banner(lines));
+            }
+            "/init" => {
+                let prompt = "Analyze this repository and write HARNESS.md at the repo root — project instructions for a coding agent working here: how to build/run/test (exact commands), directory structure and key files, code conventions, common pitfalls, and anything an engineer would tell a new teammate. Base it only on what you find (read README, build files, CI, existing docs, and skim the source). Keep it under 150 lines. If HARNESS.md exists, improve it instead of replacing it.".to_string();
+                if self.running.is_some() { self.queued.push(prompt); self.set_status("queued /init"); } else { self.start_run(prompt); }
+            }
+            "/add-dir" => {
+                let p = if arg.starts_with('~') { PathBuf::from(arg.replacen('~', &harness::setup::home_dir().display().to_string(), 1)) } else { PathBuf::from(&arg) };
+                match p.canonicalize() { Ok(p) if p.is_dir() => { self.extra_roots.push(p.clone()); self.blocks.push(Block::System(format!("added {} — file tools may now read/write there (this session)", short_path(&p)))); } _ => self.blocks.push(Block::Error(format!("usage: /add-dir <existing directory>  ({arg})"))) }
+            }
+            "/rename" => { if arg.is_empty() { self.blocks.push(Block::Error("usage: /rename <title>".into())); } else { self.session_meta.title = arg.clone(); self.save_session(); self.blocks.push(Block::System(format!("session renamed: {arg}"))); } }
+            "/export" => {
+                let session = self.session.clone(); let tx = self.tx.clone(); let name = if arg.is_empty() { format!("session-{}.md", if self.session_meta.id.is_empty() { "unsaved".into() } else { self.session_meta.id.clone() }) } else { arg.clone() };
+                let out = harness::setup::config_dir().join("exports").join(&name);
+                tokio::spawn(async move {
+                    let msgs = session.lock().await.clone();
+                    let mut md = String::from("# Harness session export\n\n");
+                    for m in msgs.iter().skip(1) { match m.role.as_str() { "user" => md.push_str(&format!("## User\n\n{}\n\n", m.text())), "assistant" => { let t = m.text(); if !t.trim().is_empty() { md.push_str(&format!("## Assistant\n\n{}\n\n", t)); } if let Some(c) = &m.tool_calls { for c in c { md.push_str(&format!("**tool** `{}` `{}`\n\n", c.function.name, truncate(&c.function.arguments, 300))); } } } "tool" => md.push_str(&format!("```\n{}\n```\n\n", truncate(&m.text(), 1500))), _ => {} } }
+                    let _ = std::fs::create_dir_all(out.parent().unwrap());
+                    let r = std::fs::write(&out, md).map(|_| out.display().to_string()).map_err(|e| e.to_string());
+                    let _ = tx.send(Msg::Notice(match r { Ok(p) => format!("exported to {p}"), Err(e) => format!("export failed: {e}") }));
+                });
+            }
+            "/todos" => { let t = self.todos.lock().map(|t| t.clone()).unwrap_or_default(); if t.is_empty() { self.blocks.push(Block::System("no todos (the agent maintains them with the todo tool)".into())); } else { self.blocks.push(Block::Banner(std::iter::once("Todos".to_string()).chain(t.iter().map(|x| format!("  {} #{} {}", match x.status.as_str() { "done" => "☑", "in_progress" => "▶", _ => "☐" }, x.id, x.text))).collect())); } }
+            "/hooks" => { let h = &self.cfg.hooks; self.blocks.push(Block::Banner(vec!["Hooks (harness.toml [hooks]) — JSON on stdin; pre_tool exit 2 blocks the call".into(), format!("  pre_tool  {:?}", h.pre_tool), format!("  post_tool {:?}", h.post_tool), format!("  on_stop   {:?}", h.on_stop), format!("  on_prompt {:?}", h.on_prompt), format!("  timeout   {}s", h.timeout_secs)])); }
+            "/skills" => { match harness::plugins::Plugins::open() { Ok(p) => { let sk: Vec<_> = p.enabled().into_iter().flat_map(|x| x.skills).collect(); if sk.is_empty() { self.blocks.push(Block::System("no skills installed — /plugin list".into())); } else { self.blocks.push(Block::Banner(std::iter::once(format!("Skills ({}) — the model loads them with load_skill", sk.len())).chain(sk.iter().map(|s| format!("  {:<28} {}  [{}]", s.name, truncate(&s.description, 80), s.plugin))).collect())); } } Err(e) => self.blocks.push(Block::Error(e.to_string())) } }
+            "/diff" => { let wd = self.workdir.clone(); let tx = self.tx.clone(); tokio::spawn(async move { let o = harness::sandbox::run_shell("git status --short | head -40; echo; git diff --stat HEAD | tail -25", &wd, Duration::from_secs(20), 12000).await; let _ = tx.send(Msg::Block(Block::Banner(std::iter::once("git diff (working tree vs HEAD)".to_string()).chain(o.map(|o| o.stdout).unwrap_or_default().lines().map(String::from)).collect()))); }); }
+            "/copy" => {
+                let last = self.blocks.iter().rev().find_map(|b| if let Block::Assistant { text, .. } = b { Some(text.clone()) } else { None }).unwrap_or_default();
+                if last.is_empty() { self.set_status("nothing to copy"); } else {
+                    let tx = self.tx.clone();
+                    tokio::spawn(async move {
+                        let cmd = if cfg!(target_os = "macos") { "pbcopy" } else if cfg!(windows) { "clip" } else { "xclip -selection clipboard" };
+                        let mut c = tokio::process::Command::new("/bin/sh"); c.arg("-c").arg(cmd).stdin(std::process::Stdio::piped());
+                        if let Ok(mut ch) = c.spawn() { if let Some(mut si) = ch.stdin.take() { use tokio::io::AsyncWriteExt; let _ = si.write_all(last.as_bytes()).await; } let _ = ch.wait().await; let _ = tx.send(Msg::Notice("last answer copied to the clipboard".into())); }
+                    });
+                }
+            }
+            "/usage" => { self.command("/cost"); }
+            "/review" => { self.command(&format!("/workflow review {arg}")); }
+            "/pr-comments" => { let wd = self.workdir.clone(); let tx = self.tx.clone(); let a = arg.clone(); tokio::spawn(async move { let o = harness::sandbox::run_shell(&format!("gh pr view {a} --comments 2>&1 | head -120", ), &wd, Duration::from_secs(30), 16000).await; let _ = tx.send(Msg::Block(Block::Banner(std::iter::once("PR comments (gh)".to_string()).chain(o.map(|o| o.stdout).unwrap_or_default().lines().map(String::from)).collect()))); }); }
+            "/release-notes" | "/changelog" => { let wd = self.workdir.clone(); let tx = self.tx.clone(); tokio::spawn(async move { let o = harness::sandbox::run_shell("git log --oneline -30", &wd, Duration::from_secs(20), 12000).await; let _ = tx.send(Msg::Block(Block::Banner(std::iter::once("Recent commits".to_string()).chain(o.map(|o| o.stdout).unwrap_or_default().lines().map(String::from)).collect()))); }); }
+            "/bug" | "/feedback" => { self.blocks.push(Block::Banner(vec!["Report a harness bug: include the session id and the event log".into(), format!("  session   {}", if self.session_meta.id.is_empty() { "(unsaved)".into() } else { self.session_meta.id.clone() }), format!("  log       {}", short_path(&harness::setup::config_dir().join("logs"))), "  repo      docs/GAPS.md · README.md".into()])); }
+            "/agents" => { self.blocks.push(Block::Banner(vec!["Sub-agents".into(), "  the model delegates with spawn_agent {task, workdir?, read_only?} — several in one turn run in parallel".into(), "  events appear as ↳1 …, ↳2 … tool blocks; the parent only sees each sub-agent's final report".into(), "  workflows (/workflow) orchestrate agent steps deterministically".into()])); }
+            "/rewind" | "/undo" => {
+                if self.running.is_some() { self.set_status("finish or interrupt first"); }
+                else {
+                    let session = self.session.clone(); let tx = self.tx.clone(); let wd = self.workdir.clone();
+                    // drop the transcript back to before the last user turn
+                    let last_user_idx = self.blocks.iter().rposition(|b| matches!(b, Block::User(..)));
+                    if let Some(i) = last_user_idx { self.blocks.truncate(i); }
+                    tokio::spawn(async move {
+                        let mut msgs = session.lock().await;
+                        if let Some(i) = msgs.iter().rposition(|m| m.role == "user" && !m.text().starts_with("[harness]")) { msgs.truncate(i); }
+                        let n = msgs.len();
+                        drop(msgs);
+                        let o = harness::sandbox::run_shell("git status --short | head -20", &wd, Duration::from_secs(10), 4000).await.map(|o| o.stdout).unwrap_or_default();
+                        let _ = tx.send(Msg::Notice(format!("rewound the conversation to before the last turn ({n} messages kept). Files changed on disk are NOT reverted — review with /diff, undo with `git checkout -- <file>` or ask the agent.{}", if o.trim().is_empty() { String::new() } else { format!("\n{}", o.trim()) })));
+                    });
+                }
+            }
             "/effort" => {
                 let lvl = arg.trim().to_lowercase();
-                if lvl.is_empty() { self.blocks.push(Block::System(format!("effort: {} (Claude Code backend) — /effort low|medium|high|max", self.cfg.llm.effort.clone().unwrap_or("default".into())))); }
-                else if !matches!(lvl.as_str(), "low" | "medium" | "high" | "max") { self.blocks.push(Block::Error("usage: /effort low|medium|high|max".into())); }
+                if lvl.is_empty() { self.blocks.push(Block::System(format!("effort: {} (Claude Code backend) — /effort low|medium|high|xhigh|max", self.cfg.llm.effort.clone().unwrap_or("medium (default)".into())))); }
+                else if !matches!(lvl.as_str(), "low" | "medium" | "high" | "xhigh" | "max") { self.blocks.push(Block::Error("usage: /effort low|medium|high|xhigh|max".into())); }
                 else {
                     self.cfg.llm.effort = Some(lvl.clone());
                     if let Some(cc) = self.cc.take() { tokio::spawn(async move { cc.stop().await; }); }
@@ -873,7 +980,7 @@ impl App {
                 match which.as_str() {
                     "" => { self.blocks.push(Block::Banner(vec![format!("backend: {} · model {}", self.cfg.llm.provider.clone().unwrap_or("openai (local/compatible server)".into()), self.model), "switch: /backend local [model]  ·  /backend claude [model] [effort]   (claude = official Claude Code CLI on your subscription, default claude-fable-5; effort low|medium|high|max, also /effort)".into(), "        /backend anthropic <model>  (Anthropic API key from ANTHROPIC_API_KEY)".into()])); }
                     "local" | "openai" | "lmstudio" => { self.cfg.llm.provider = None; if let Some(m) = model { self.cfg.llm.model = m; } self.model = self.cfg.llm.model.clone(); if let Some(cc) = self.cc.take() { tokio::spawn(async move { cc.stop().await; }); } self.cc_last_session = None; self.blocks.push(Block::System(format!("backend → local server {} · model {}", self.cfg.llm.base_url, self.model))); tokio::spawn(fetch_ctx_len(self.cfg.llm.base_url.clone(), self.model.clone(), self.tx.clone())); }
-                    "claude" | "claude-code" | "cc" => { self.cfg.llm.provider = Some("claude-code".into()); self.cfg.llm.model = model.unwrap_or("claude-fable-5".into()); if let Some(e) = effort { if matches!(e.as_str(), "low" | "medium" | "high" | "max") { self.cfg.llm.effort = Some(e); } } self.model = self.cfg.llm.model.clone(); if let Some(cc) = self.cc.take() { tokio::spawn(async move { cc.stop().await; }); } self.cc_last_session = None; self.metrics.ctx_len = 0; self.blocks.push(Block::System(format!("backend → Claude Code (subscription) · model {} · tools bridged over MCP · context window reported after the first turn", self.model))); }
+                    "claude" | "claude-code" | "cc" => { self.cfg.llm.provider = Some("claude-code".into()); self.cfg.llm.model = model.unwrap_or("claude-fable-5".into()); if let Some(e) = effort { if matches!(e.as_str(), "low" | "medium" | "high" | "xhigh" | "max") { self.cfg.llm.effort = Some(e); } } if self.cfg.llm.effort.is_none() { self.cfg.llm.effort = Some("medium".into()); } self.model = self.cfg.llm.model.clone(); if let Some(cc) = self.cc.take() { tokio::spawn(async move { cc.stop().await; }); } self.cc_last_session = None; self.metrics.ctx_len = 0; self.blocks.push(Block::System(format!("backend → Claude Code (subscription) · model {} · tools bridged over MCP · context window reported after the first turn", self.model))); }
                     "anthropic" => { self.cfg.llm.provider = Some("anthropic".into()); self.cfg.llm.base_url = "https://api.anthropic.com".into(); if let Some(m) = model { self.cfg.llm.model = m; } self.model = self.cfg.llm.model.clone(); self.metrics.ctx_len = 200_000; if self.cfg.llm.thinking_budget.is_none() { self.cfg.llm.thinking_budget = Some(8000); } self.blocks.push(Block::System(format!("backend → Anthropic API · model {}", self.model))); }
                     other => self.blocks.push(Block::Error(format!("unknown backend '{other}' (local | claude | anthropic)"))),
                 }
@@ -1008,6 +1115,7 @@ impl App {
         let workdir = self.workdir.clone();
         let toolset = self.toolset.clone();
         let todos = self.todos.clone();
+        let extra_roots = self.extra_roots.clone();
         let perm_mode = self.perm_mode;
         let cc_existing = self.cc.clone(); let cc_resume = self.cc_last_session.clone();
         let cc_images: Vec<(String, String)> = atts.iter().map(|a| (a.mime.clone(), a.b64.clone())).collect();
@@ -1024,9 +1132,10 @@ impl App {
                 let sink: Arc<dyn Sink> = Arc::new(TuiSink(tx.clone()));
                 let mut pcfg = cfg.permissions.clone(); pcfg.mode = perm_mode; pcfg.allow.extend(harness::permissions::persisted_rules());
                 let policy = Arc::new(harness::permissions::Policy::new(pcfg, &workdir));
+                let _ = tx.send(Msg::Policy(policy.clone()));
                 let approver: Arc<dyn harness::permissions::Approver> = Arc::new(TuiApprover(tx.clone()));
                 let env = Arc::new(harness::agent::SubAgentEnv::new(client.clone(), registry.clone(), policy.clone(), approver.clone(), sink.clone(), budget, true));
-                let ctx = ToolCtx { workdir: workdir.clone(), timeout: Duration::from_secs(cfg.agent.tool_timeout_secs), max_output: cfg.agent.max_tool_output_chars, net: cfg.net.clone(), memory: store.clone(), subagent: Some(env), redact_secrets: cfg.security.redact_secrets, hooks: cfg.hooks.clone(), todos: todos.clone(), lsp_servers: cfg.lsp.servers.clone() };
+                let ctx = ToolCtx { workdir: workdir.clone(), timeout: Duration::from_secs(cfg.agent.tool_timeout_secs), max_output: cfg.agent.max_tool_output_chars, net: cfg.net.clone(), memory: store.clone(), subagent: Some(env), redact_secrets: cfg.security.redact_secrets, hooks: cfg.hooks.clone(), todos: todos.clone(), lsp_servers: cfg.lsp.servers.clone(), extra_roots: extra_roots.clone() };
                 let agent = Agent { client: &client, registry, ctx: &ctx, max_turns: cfg.agent.max_turns, context_budget: budget, sink: sink.as_ref(), stream: true, policy: &policy, approver: approver.as_ref() };
                 let extra = format!("You are in an interactive session: the user can see everything and will reply; keep final answers concise.{extra_prompt}");
                 let system = harness::agent::system_prompt_with_memory(&workdir.display().to_string(), &registry.names(), Some(&extra), store.as_ref());
@@ -1035,7 +1144,7 @@ impl App {
                     // Claude Code backend: our tools bridged over MCP; the claude CLI drives the loop
                     let cc = match cc_existing { Some(c) => c, None => {
                         let host = Arc::new(harness::mcp_bridge::BridgeHost { registry: registry.clone(), ctx: ctx.clone(), policy: policy.clone(), approver: approver.clone(), sink: sink.clone() });
-                        let c = harness::claude_code::ClaudeCodeSession::start_with(&workdir, Some(cfg.llm.model.as_str()), cfg.llm.effort.as_deref(), &system, host, cc_resume.as_deref()).await.map_err(|e| format!("{e:#}"))?;
+                        let c = harness::claude_code::ClaudeCodeSession::start_with(&workdir, Some(cfg.llm.model.as_str()), Some(cfg.llm.effort.as_deref().unwrap_or("medium")), &system, host, cc_resume.as_deref()).await.map_err(|e| format!("{e:#}"))?;
                         let _ = tx.send(Msg::CcSession(c.clone())); c } };
                     if msgs.is_empty() { msgs.push(Message::system(&system)); }
                     msgs.push(user_msg);
@@ -1150,6 +1259,7 @@ impl App {
         match m {
             Msg::Block(b) => self.blocks.push(b),
             Msg::CcSession(s) => { self.cc = Some(s); }
+            Msg::Policy(p) => { p.set_mode(self.perm_mode); self.live_policy = Some(p); }
             Msg::CcSid(id) => { self.cc_last_session = Some(id); }
             Msg::Ask(req, tx) => { self.blocks.push(Block::System(format!("🔒 approval needed — {}({}) · {}", req.tool, truncate(&req.summary, 100), req.reason))); self.pending_ask = Some((req, tx)); }
             Msg::Ev(e) => self.on_event(e),
@@ -1301,7 +1411,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ("/resume", "resume a saved session: /resume <n|id|last>"),
     ("/model", "show or switch the model: /model <name>"),
     ("/backend", "switch backend: local (LM Studio etc.) | claude [model] [effort] (Claude Code CLI, subscription) | anthropic <model>"),
-    ("/effort", "Claude Code backend reasoning effort: /effort low|medium|high|max"),
+    ("/effort", "Claude Code backend reasoning effort: /effort low|medium|high|xhigh|max (default medium)"),
     ("/cd", "change working directory"),
     ("/pwd", "print working directory"),
     ("/tools", "list the tools the model can call"),
@@ -1328,6 +1438,23 @@ const COMMANDS: &[(&str, &str)] = &[
     ("/workflow", "run a workflow: /workflow <name> [args]  (list with /workflow)"),
     ("/queue", "show queued tasks (/queue clear)"),
     ("/next", "stop the current task and start the next queued one (ctrl+n)"),
+    ("/status", "backend, context, session, permissions at a glance"),
+    ("/doctor", "check external tools, claude CLI, config paths"),
+    ("/init", "have the agent write HARNESS.md project instructions"),
+    ("/add-dir", "allow file tools to access another directory this session"),
+    ("/rename", "rename the current session"),
+    ("/export", "export the transcript to markdown (~/.config/harness/exports)"),
+    ("/todos", "show the agent's todo list"),
+    ("/hooks", "show configured hooks"),
+    ("/skills", "list installed skills"),
+    ("/diff", "git status + diff stat of the working tree"),
+    ("/copy", "copy the last answer to the clipboard"),
+    ("/review", "run the review workflow on the working-tree diff"),
+    ("/pr-comments", "show PR comments via gh: /pr-comments [number]"),
+    ("/rewind", "drop the last turn from the conversation (files not reverted)"),
+    ("/release-notes", "recent commits"),
+    ("/agents", "how sub-agents work"),
+    ("/keybindings", "list keyboard shortcuts"),
     ("/exit", "quit"),
 ];
 

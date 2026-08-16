@@ -55,12 +55,13 @@ const RISKY: &[&str] = &[
 const PLAN_OK: &[&str] = &["git status", "git log", "git diff", "git show", "git branch", "git blame", "ls", "cat ", "head ", "tail ", "grep ", "rg ", "find ", "fd ", "wc ", "tree", "pwd", "echo ", "which ", "file ", "stat ", "du ", "df ", "env", "printenv", "cargo check", "cargo metadata", "cargo tree", "python3 -c \"import", "node -e", "jq ", "sed -n", "awk ", "sort", "uniq", "diff "];
 const MUTATING: &[&str] = &["write_file", "edit_file", "apply_patch", "bash", "download_file", "extract_archive", "pdf_edit", "memory", "spawn_agent"];
 
-pub struct Policy { pub cfg: PermissionsConfig, pub workdir: PathBuf, session_allow: std::sync::Mutex<Vec<String>> }
+pub struct Policy { pub cfg: PermissionsConfig, pub workdir: PathBuf, session_allow: std::sync::Mutex<Vec<String>>, mode: std::sync::Mutex<Mode> }
 
 impl Policy {
-    pub fn new(cfg: PermissionsConfig, workdir: &Path) -> Self { Self { cfg, workdir: workdir.to_path_buf(), session_allow: std::sync::Mutex::new(vec![]) } }
-    pub fn mode(&self) -> Mode { self.cfg.mode }
-    pub fn set_mode(&mut self, m: Mode) { self.cfg.mode = m; }
+    pub fn new(cfg: PermissionsConfig, workdir: &Path) -> Self { let mode = cfg.mode; Self { cfg, workdir: workdir.to_path_buf(), session_allow: std::sync::Mutex::new(vec![]), mode: std::sync::Mutex::new(mode) } }
+    /// Current mode (live: `set_mode` takes effect for running sessions too).
+    pub fn mode(&self) -> Mode { *self.mode.lock().unwrap() }
+    pub fn set_mode(&self, m: Mode) { *self.mode.lock().unwrap() = m; }
     pub fn allow_always(&self, rule: &str) { self.session_allow.lock().unwrap().push(rule.to_string()); persist_rule(rule); }
 
     /// Primary argument used for rule matching and the human-readable summary.
@@ -103,7 +104,7 @@ impl Policy {
         for r in self.session_allow.lock().unwrap().iter().chain(self.cfg.allow.iter()) { if Self::rule_matches(r, tool, &arg) { return Decision::Allow; } }
         for r in &self.cfg.ask { if Self::rule_matches(r, tool, &arg) { return Decision::Ask(format!("matches rule '{r}'")); } }
         let mutating = MUTATING.contains(&tool) || tool.starts_with("mcp__") && !read_only_tool;
-        match self.cfg.mode {
+        match self.mode() {
             Mode::Bypass => Decision::Allow,
             Mode::Plan => {
                 if read_only_tool || tool == "load_skill" || tool == "web_search" || tool == "web_fetch" { return Decision::Allow; }

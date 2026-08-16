@@ -39,12 +39,14 @@ pub struct ToolCtx {
     pub todos: std::sync::Arc<std::sync::Mutex<Vec<todo::TodoItem>>>,
     /// Language servers ([lsp] config; empty = built-in defaults).
     pub lsp_servers: std::collections::HashMap<String, crate::lsp::LspServerConfig>,
+    /// Additional directories file tools may access (/add-dir).
+    pub extra_roots: Vec<PathBuf>,
 }
 
 impl ToolCtx {
     /// A context with defaults (no memory/sub-agents/hooks) — tests, `harness tool`, sub-processes.
     pub fn basic(workdir: PathBuf) -> Self {
-        Self { workdir, timeout: Duration::from_secs(120), max_output: 16000, net: crate::config::NetConfig::default(), memory: None, subagent: None, redact_secrets: true, hooks: Default::default(), todos: Default::default(), lsp_servers: Default::default() }
+        Self { workdir, timeout: Duration::from_secs(120), max_output: 16000, net: crate::config::NetConfig::default(), memory: None, subagent: None, redact_secrets: true, hooks: Default::default(), todos: Default::default(), lsp_servers: Default::default(), extra_roots: vec![] }
     }
     /// Resolve a model-supplied path against workdir and refuse escapes.
     /// Symlinks are resolved on the deepest existing ancestor.
@@ -65,8 +67,8 @@ impl ToolCtx {
         let mut probe = norm.clone();
         while !probe.exists() { if !probe.pop() { break; } }
         let real = probe.canonicalize().unwrap_or(probe);
-        if !real.starts_with(&root) {
-            bail!("path escapes workdir: {} (workdir is {})", p, root.display());
+        if !real.starts_with(&root) && !self.extra_roots.iter().any(|r| real.starts_with(r)) {
+            bail!("path escapes workdir: {} (workdir is {}; allow more with /add-dir)", p, root.display());
         }
         Ok(norm)
     }
