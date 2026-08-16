@@ -19,6 +19,7 @@ cargo build --release
 ./target/release/harness eval                          # run the benchmark, JSON report → $TMPDIR/harness-eval-runs/report.json
 ./target/release/harness self "Make the bash tool return the cwd in its result"   # agent edits itself on a proposal/* branch
 ./target/release/harness --json run "..."              # JSONL event stream on stdout (for UIs)
+./target/release/harness tool bash '{"cmd":"ls"}'      # call one tool directly, no model (debug tools)
 ```
 
 ## Desktop UI (Tauri)
@@ -42,7 +43,7 @@ src/
   agent.rs     the loop: model → tool calls → results → model; budgets; context compaction
   events.rs    structured Event stream + Sink trait (StderrSink, JsonlSink) — core never prints
   sandbox.rs   local process supervision: timeout, process-group kill, env scrub, output caps
-  tools/       bash, read_file, write_file, edit_file, list_dir, view_image, web_fetch, web_search
+  tools/       bash, read_file, write_file, edit_file, list_dir, view_image, web_fetch, web_search, download_file
   eval.rs      the fitness function: runs evals/tasks/* in fresh git-initialised workdirs
   lib.rs       exposes all of the above as the `harness` library
 evals/tasks/<name>/task.toml  (+ fixture/)  — prompt + `check` shell command (exit 0 = pass)
@@ -77,6 +78,9 @@ and for every eval workdir.
   it can't be without a container; the system prompt + git history are the guardrail.
 - **Vision**: Qwen3.8 is a VLM; `view_image` attaches a file as an `image_url` part in a follow-up
   user turn (tool results are text-only in the OpenAI protocol). Old image payloads are dropped on compaction.
+- **Downloads**: `download_file` fetches big files with parallel HTTP-range segments, checkpoints
+  progress in `<file>.harness-dl.json`, retries with backoff, and **auto-resumes** on the next call
+  after a timeout/crash; optional sha256 verification. `harness tool download_file '{...}'` runs it standalone.
 - **Internet**: `web_fetch` (HTML→text, size cap) and `web_search` (DuckDuckGo HTML, no API
   key). Toggle with `[net] enabled` or `HARNESS_NET=0` / `--no-net`.
 - **Context**: when the prompt exceeds `context_budget_tokens`, old tool results are compacted

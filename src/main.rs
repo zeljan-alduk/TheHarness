@@ -55,6 +55,14 @@ enum Cmd {
         /// What to improve
         task: String,
     },
+    /// Call a single tool directly (no model) — for debugging tools: harness tool bash '{"cmd":"ls"}'
+    Tool {
+        #[arg(short = 'C', long)]
+        dir: Option<PathBuf>,
+        name: String,
+        /// JSON arguments (default: {})
+        args: Option<String>,
+    },
     /// List models on the configured server
     Models,
     /// Print the effective configuration
@@ -68,6 +76,15 @@ async fn main() -> Result<()> {
     let client = llm::Client::new(&cfg.llm)?;
 
     match cli.cmd {
+        Cmd::Tool { dir, name, args } => {
+            let workdir = dir.unwrap_or(std::env::current_dir()?).canonicalize().context("workdir does not exist")?;
+            let ctx = tools::ToolCtx { workdir, timeout: Duration::from_secs(cfg.agent.tool_timeout_secs), max_output: cfg.agent.max_tool_output_chars, net: cfg.net.clone() };
+            let registry = tools::Registry::defaults(cfg.net.enabled);
+            let out = registry.call(&name, args.as_deref().unwrap_or("{}"), &ctx).await;
+            println!("{}", out.text);
+            if !out.images.is_empty() { eprintln!("({} image(s) attached)", out.images.len()); }
+            if out.text.starts_with("error:") { std::process::exit(1); }
+        }
         Cmd::Models => {
             for m in client.list_models().await? { println!("{m}"); }
         }

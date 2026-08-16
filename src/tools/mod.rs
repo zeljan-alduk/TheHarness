@@ -1,4 +1,5 @@
 pub mod bash;
+pub mod download;
 pub mod fs;
 pub mod image;
 pub mod web;
@@ -80,6 +81,7 @@ impl Registry {
         if net_enabled {
             tools.push(Box::new(web::WebFetch));
             tools.push(Box::new(web::WebSearch));
+            tools.push(Box::new(download::DownloadFile));
         }
         Self { tools }
     }

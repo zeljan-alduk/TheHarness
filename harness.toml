@@ -21,3 +21,11 @@ tasks_dir = "evals/tasks"
 # Where eval workdirs are created. Keep this OUTSIDE any Cargo workspace (default: $TMPDIR/harness-eval-runs).
 # runs_dir = "/tmp/harness-eval-runs"
 task_timeout_secs = 900
+
+[net]
+enabled = true
+timeout_secs = 30
+max_fetch_bytes = 2000000
+# download_file: parallel range segments and per-call wall-clock cap (auto-resumes on the next call)
+download_segments = 4
+download_timeout_secs = 3600

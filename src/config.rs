@@ -58,6 +58,12 @@ pub struct NetConfig {
     pub max_fetch_bytes: usize,
     #[serde(default = "d_ua")]
     pub user_agent: String,
+    /// Parallel segments for download_file on servers that support HTTP ranges.
+    #[serde(default = "d_dl_segments")]
+    pub download_segments: usize,
+    /// Wall-clock cap for a single download_file call (it resumes on the next call).
+    #[serde(default = "d_dl_timeout")]
+    pub download_timeout_secs: u64,
 }
 
 fn d_temp() -> f32 { 0.2 }
@@ -72,6 +78,8 @@ fn d_task_timeout() -> u64 { 900 }
 fn d_true() -> bool { true }
 fn d_fetch_timeout() -> u64 { 30 }
 fn d_fetch_bytes() -> usize { 2_000_000 }
+fn d_dl_segments() -> usize { 4 }
+fn d_dl_timeout() -> u64 { 3600 }
 fn d_ua() -> String { "Mozilla/5.0 (compatible; harness/0.1; +https://github.com/) ".into() }
 
 impl Default for EvalConfig {
@@ -81,7 +89,7 @@ impl Default for EvalConfig {
 }
 impl Default for NetConfig {
     fn default() -> Self {
-        Self { enabled: true, timeout_secs: d_fetch_timeout(), max_fetch_bytes: d_fetch_bytes(), user_agent: d_ua() }
+        Self { enabled: true, timeout_secs: d_fetch_timeout(), max_fetch_bytes: d_fetch_bytes(), user_agent: d_ua(), download_segments: d_dl_segments(), download_timeout_secs: d_dl_timeout() }
     }
 }
 
