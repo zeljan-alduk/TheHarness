@@ -31,7 +31,7 @@ const CYAN: Color = Color::Rgb(90, 205, 220);
 const SPINNER: [&str; 10] = ["✻", "✼", "✽", "✾", "✿", "❀", "✿", "✾", "✽", "✼"];
 const WORDS: [&str; 12] = ["Thinking", "Pondering", "Working", "Reasoning", "Cooking", "Tinkering", "Brewing", "Mulling", "Crunching", "Percolating", "Noodling", "Computing"];
 
-enum Msg { Ev(Event), Done(Result<String, String>), Sys(SysSample), CtxLen(u64), Pasted(Result<PathBuf, String>), Frames(Result<(PathBuf, f64, Vec<(f64, PathBuf)>), String>), Toolset(Arc<Toolset>), Catalog(Result<harness::plugins::Catalog, String>), Notice(String) }
+enum Msg { Ev(Event), Done(Result<(String, harness::agent::RunStats), String>), Sys(SysSample), CtxLen(u64), Pasted(Result<PathBuf, String>), Frames(Result<(PathBuf, f64, Vec<(f64, PathBuf)>), String>), Toolset(Arc<Toolset>), Catalog(Result<harness::plugins::Catalog, String>), Notice(String) }
 
 /// Video scrubber state (modal over the transcript).
 struct VideoPicker { path: PathBuf, duration: f64, frames: Vec<(f64, PathBuf, String)>, cur: usize, selected: std::collections::BTreeSet<usize>, loading: bool, error: Option<String> }
@@ -422,6 +422,7 @@ impl App {
                     (KeyCode::Char('t'), true, _) => { self.show_thinking = !self.show_thinking; }
                     (KeyCode::Char('l'), true, _) => { self.scroll_up = 0; }
                     (KeyCode::Char('p'), true, _) => { self.panel = Some(!self.panel_visible(200)); }
+                    (KeyCode::Char('n'), true, _) => self.next_task(),
                     (KeyCode::Char('v'), true, _) => { let tx = self.tx.clone(); let store = if self.cfg.memory.enabled { harness::memory::MemoryStore::open(&self.cfg.memory).ok() } else { None }; self.set_status("reading clipboard…"); tokio::spawn(async move { let _ = tx.send(Msg::Pasted(clipboard_image(store).await)); }); }
                     (KeyCode::Char('u'), true, _) => { let c = self.cursor; self.input = self.input.chars().skip(c).collect(); self.cursor = 0; }
                     (KeyCode::Char('a'), true, _) | (KeyCode::Home, _, _) => self.cursor = self.line_start(),
@@ -550,7 +551,7 @@ impl App {
                 let mut lines = vec!["Commands".to_string()];
                 for (c, d) in COMMANDS { lines.push(format!("  {c:<14} {d}")); }
                 lines.push(String::new());
-                lines.push("Keys: enter send · alt+enter/ctrl+j newline · esc interrupt · ctrl+c clear/exit · ctrl+o expand tools · ctrl+t thinking · ctrl+p panel · ctrl+v paste image · pgup/pgdn scroll · ↑/↓ history".into());
+                lines.push("Keys: enter send · alt+enter/ctrl+j newline · esc interrupt · ctrl+c clear/exit · ctrl+o expand tools · ctrl+t thinking · ctrl+p panel · ctrl+v paste image · ctrl+n next task · pgup/pgdn scroll · ↑/↓ history".into());
                 lines.push("Mouse: wheel/trackpad scrolls the transcript and the thinking panel; click a tool call, answer or thought to fold/unfold it. Hold shift (or fn/option in Terminal) to select text.".into());
                 lines.push("Video: paste/drag a video (mp4/mov/webm/mkv/gif) or /video <path> → frame scrubber; select frames, enter attaches them as images with timestamps.".into());
                 lines.push("Images: ctrl+v pastes from the clipboard; typing or dragging an image path attaches it. Previews render as a color mosaic; the model sees the full image.".into());
@@ -658,6 +659,12 @@ impl App {
                 }
             }
             "/video" => { if arg.is_empty() { self.blocks.push(Block::Error("usage: /video <path>".into())); } else { let p = if arg.starts_with('~') { PathBuf::from(arg.replacen('~', &std::env::var("HOME").unwrap_or_default(), 1)) } else { PathBuf::from(&arg) }; if p.is_file() { self.open_video(&p); } else { self.blocks.push(Block::Error(format!("no such file: {arg}"))); } } }
+            "/queue" => {
+                if self.queued.is_empty() { self.blocks.push(Block::System("queue is empty".into())); }
+                else { let mut lines = vec![format!("Queued tasks ({}) — /next skips the current one, /queue clear empties the queue", self.queued.len())]; for (i, q) in self.queued.iter().enumerate() { lines.push(format!("  {}. {}", i + 1, truncate(q, 120))); } self.blocks.push(Block::Banner(lines)); }
+                if arg == "clear" { self.queued.clear(); self.blocks.push(Block::System("queue cleared".into())); }
+            }
+            "/next" | "/skip" => self.next_task(),
             "/exit" | "/quit" | "/q" => self.quit = true,
             _ => {
                 let name = cmd.trim_start_matches('/');
@@ -785,7 +792,7 @@ impl App {
         self.run_started = Instant::now();
         self.metrics.turn_start = Some(Instant::now()); self.metrics.live_peak = 0.0; self.metrics.live_chars.clear();
         let handle = tokio::spawn(async move {
-            let res: Result<String, String> = async {
+            let res: Result<(String, harness::agent::RunStats), String> = async {
                 let client = Client::new(&cfg.llm).map_err(|e| e.to_string())?;
                 let store = if cfg.memory.enabled { harness::memory::MemoryStore::open(&cfg.memory).ok() } else { None };
                 let ctx = ToolCtx { workdir: workdir.clone(), timeout: Duration::from_secs(cfg.agent.tool_timeout_secs), max_output: cfg.agent.max_tool_output_chars, net: cfg.net.clone(), memory: store.clone() };
@@ -797,12 +804,39 @@ impl App {
                 let system = harness::agent::system_prompt_with_memory(&workdir.display().to_string(), &registry.names(), Some(&extra), store.as_ref());
                 let mut msgs = session.lock().await;
                 let out = agent.run_turn_message(&mut msgs, &system, user_msg).await.map_err(|e| format!("{e:#}"))?;
-                if let Some(m) = &store { harness::agent::reflect_after_run(&client, m, &msgs, &out.1, &sink).await; }
-                Ok(out.0)
+                Ok(out)
             }.await;
             let _ = tx.send(Msg::Done(res));
         });
         self.running = Some(handle);
+    }
+
+    /// Reflection runs *after* Done so the next queued task starts immediately; skipped when tasks are waiting.
+    fn spawn_reflection(&mut self, stats: &harness::agent::RunStats) {
+        if !self.cfg.memory.enabled || !self.cfg.memory.auto_reflect || stats.tool_calls < self.cfg.memory.reflect_min_tool_calls || stats.stop_reason != "done" { return; }
+        if !self.queued.is_empty() { return; }
+        let tx = self.tx.clone(); let session = self.session.clone(); let cfg = self.cfg.clone();
+        tokio::spawn(async move {
+            let sink = TuiSink(tx.clone());
+            let Ok(store) = harness::memory::MemoryStore::open(&cfg.memory) else { return };
+            let Ok(client) = Client::new(&cfg.llm) else { return };
+            let msgs = session.lock().await.clone();
+            match store.reflect(&client, &msgs).await {
+                Ok(items) => for (f, s, t) in items { sink.emit(&Event::Memory { file: f, section: s, text: t }); },
+                Err(_) => {}
+            }
+            if let Ok(done) = store.maybe_consolidate(&client).await { for f in done { sink.emit(&Event::Memory { file: f, section: "consolidated".into(), text: "merged and de-duplicated".into() }); } }
+        });
+    }
+
+    /// Stop the current task (if any) and immediately start the next queued one.
+    fn next_task(&mut self) {
+        if self.running.is_some() {
+            self.interrupt();
+            // Done(Err interrupted) arrives asynchronously? No — abort is immediate and no Done is sent; start next now.
+        }
+        if let Some(next) = if self.queued.is_empty() { None } else { Some(self.queued.remove(0)) } { self.start_run(next); }
+        else { self.set_status("no queued task"); }
     }
 
     fn interrupt(&mut self) {
@@ -839,8 +873,15 @@ impl App {
             Msg::Pasted(Err(e)) => self.set_status(e),
             Msg::Done(res) => {
                 self.running = None;
-                if let Err(e) = res { if !e.contains("interrupted") { self.blocks.push(Block::Error(e)); } }
-                if !self.queued.is_empty() { let next = self.queued.remove(0); self.start_run(next); }
+                match res {
+                    Ok((_, stats)) => { self.spawn_reflection(&stats); }
+                    Err(e) => { if !e.contains("interrupted") { self.blocks.push(Block::Error(e)); } }
+                }
+                if !self.queued.is_empty() {
+                    let next = self.queued.remove(0);
+                    self.set_status(format!("→ next task ({} left in queue)", self.queued.len()));
+                    self.start_run(next);
+                }
             }
         }
     }
@@ -946,6 +987,8 @@ const COMMANDS: &[(&str, &str)] = &[
     ("/plugin", "plugins: list · install <owner/repo> · enable|disable|remove|update|info <name>"),
     ("/mcp", "show configured MCP servers and live MCP tools"),
     ("/reload", "restart tools, MCP servers and plugins"),
+    ("/queue", "show queued tasks (/queue clear)"),
+    ("/next", "stop the current task and start the next queued one (ctrl+n)"),
     ("/exit", "quit"),
 ];
 

@@ -66,6 +66,8 @@ pub trait Tool: Send + Sync {
     fn name(&self) -> &'static str;
     fn description(&self) -> &'static str;
     fn parameters(&self) -> Value;
+    /// True if the tool never mutates state; read-only calls in one turn are executed in parallel.
+    fn read_only(&self) -> bool { false }
     async fn call(&self, args: Value, ctx: &ToolCtx) -> Result<ToolOutput>;
 }
 
@@ -105,6 +107,8 @@ impl Registry {
     }
 
     pub fn names(&self) -> Vec<&'static str> { self.tools.iter().map(|t| t.name()).collect() }
+    pub fn is_read_only(&self, name: &str) -> bool { self.tools.iter().find(|t| t.name() == name).map(|t| t.read_only()).unwrap_or(false) }
+    pub fn get(&self, name: &str) -> Option<&dyn Tool> { self.tools.iter().find(|t| t.name() == name).map(|b| b.as_ref()) }
 
     /// Errors are returned as text so the model can recover.
     pub async fn call(&self, name: &str, args_json: &str, ctx: &ToolCtx) -> ToolOutput {

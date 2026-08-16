@@ -67,6 +67,7 @@ pub fn html_to_text(html: &str) -> String {
 
 #[async_trait]
 impl Tool for WebFetch {
+    fn read_only(&self) -> bool { true }
     fn name(&self) -> &'static str { "web_fetch" }
     fn description(&self) -> &'static str { "Fetch a URL over HTTP(S) and return its content as readable text (HTML is converted to text; JSON/plain returned as-is). Use for docs, APIs, raw files from GitHub, etc." }
     fn parameters(&self) -> Value {
@@ -83,6 +84,7 @@ impl Tool for WebFetch {
 
 #[async_trait]
 impl Tool for WebSearch {
+    fn read_only(&self) -> bool { true }
     fn name(&self) -> &'static str { "web_search" }
     fn description(&self) -> &'static str { "Search the web. Returns a list of results (title, URL, snippet). Follow up with web_fetch to read a result." }
     fn parameters(&self) -> Value {

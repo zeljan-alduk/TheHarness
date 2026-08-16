@@ -10,6 +10,7 @@ pub struct ListDir;
 
 #[async_trait]
 impl Tool for ReadFile {
+    fn read_only(&self) -> bool { true }
     fn name(&self) -> &'static str { "read_file" }
     fn description(&self) -> &'static str { "Read a text file. Returns numbered lines. Use offset/limit for large files." }
     fn parameters(&self) -> Value {
@@ -75,6 +76,7 @@ impl Tool for EditFile {
 
 #[async_trait]
 impl Tool for ListDir {
+    fn read_only(&self) -> bool { true }
     fn name(&self) -> &'static str { "list_dir" }
     fn description(&self) -> &'static str { "List a directory (non-recursive). Directories end with '/'." }
     fn parameters(&self) -> Value {

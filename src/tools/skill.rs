@@ -9,6 +9,7 @@ pub struct LoadSkill;
 
 #[async_trait]
 impl Tool for LoadSkill {
+    fn read_only(&self) -> bool { true }
     fn name(&self) -> &'static str { "load_skill" }
     fn description(&self) -> &'static str { "Load a skill (instructions + reference files) provided by an installed plugin. Call it when a task matches one of the skills listed in your system prompt, then follow the returned instructions." }
     fn parameters(&self) -> Value { json!({"type":"object","properties":{"name":{"type":"string"}},"required":["name"]}) }

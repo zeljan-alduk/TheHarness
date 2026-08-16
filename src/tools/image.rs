@@ -43,6 +43,7 @@ fn dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
 
 #[async_trait]
 impl Tool for ViewImage {
+    fn read_only(&self) -> bool { true }
     fn name(&self) -> &'static str { "view_image" }
     fn description(&self) -> &'static str {
         "Look at an image file (png/jpg/gif/webp) — screenshots, plots, generated images, UI renders. The image is shown to you in the next message so you can describe, verify or critique it."

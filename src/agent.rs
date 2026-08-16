@@ -123,7 +123,8 @@ Rules:
 - Verify your work: run the build, tests, or the program itself with bash. If it fails, fix it and re-run.
 - The working directory is a git repository. Use `git status`, `git diff`, `git log` freely to understand state, and `git checkout -- <file>` / `git revert` to undo mistakes. Commit when a coherent unit of work is done, with a clear message.
 - Tool outputs may be truncated in the middle; use offset/limit or grep to see more.
-- When done, your final message (with no tool calls) must state what changed and how you verified it.",
+- When done, your final message (with no tool calls) must state what changed and how you verified it.
+- Finish decisively: once the task is verified, stop calling tools and answer. Do not re-verify, re-read, or polish beyond what was asked; the user may have queued the next task.",
         tools = tools.join(", "));
     if let Some(e) = extra { s.push_str("\n\n"); s.push_str(e); }
     s.push_str("\n\n"); s.push_str(&crate::setup::summary_line());
@@ -180,6 +181,8 @@ impl<'a> Agent<'a> {
         let mut last_usage = Usage::default();
         let mut truncations = 0u32;
         let mut retries = 0u32;
+        let mut last_sig: Vec<String> = Vec::new();
+        let mut repeats = 0u32;
         self.sink.emit(&Event::RunStarted { model: self.client.model().to_string(), workdir: self.ctx.workdir.display().to_string(), tools: self.registry.names().iter().map(|s| s.to_string()).collect() });
 
         loop {
@@ -267,18 +270,38 @@ impl<'a> Agent<'a> {
             msgs.push(assistant);
 
             let mut pending_images: Vec<(String, Vec<(String, String)>)> = Vec::new();
-            for call in calls {
+            // loop detection: identical call repeated back-to-back
+            let sig: Vec<String> = calls.iter().map(|c| format!("{}:{}", c.function.name, c.function.arguments)).collect();
+            if sig == last_sig { repeats += 1; } else { repeats = 0; last_sig = sig; }
+            let all_read_only = calls.iter().all(|c| self.registry.is_read_only(&c.function.name));
+            let mut prepared: Vec<(String, String, String)> = Vec::new(); // (id, name, args)
+            for call in &calls {
                 stats.tool_calls += 1;
-                let name = call.function.name.clone();
-                let args = call.function.arguments.clone();
                 let id = if call.id.is_empty() { format!("call_{}", stats.tool_calls) } else { call.id.clone() };
-                self.sink.emit(&Event::ToolCall { id: id.clone(), name: name.clone(), args: args.clone() });
-                let t0 = Instant::now();
-                let out = self.registry.call(&name, &args, self.ctx).await;
-                self.sink.emit(&Event::ToolResult { id: id.clone(), name: name.clone(), result: out.text.clone(), secs: t0.elapsed().as_secs_f64(),
+                self.sink.emit(&Event::ToolCall { id: id.clone(), name: call.function.name.clone(), args: call.function.arguments.clone() });
+                prepared.push((id, call.function.name.clone(), call.function.arguments.clone()));
+            }
+            let outputs: Vec<(crate::tools::ToolOutput, f64)> = if all_read_only && prepared.len() > 1 {
+                // independent reads: run concurrently
+                let futs = prepared.iter().map(|(_, name, args)| async move { let t0 = Instant::now(); let o = self.registry.call(name, args, self.ctx).await; (o, t0.elapsed().as_secs_f64()) });
+                futures_util::future::join_all(futs).await
+            } else {
+                let mut v = Vec::new();
+                for (_, name, args) in &prepared { let t0 = Instant::now(); let o = self.registry.call(name, args, self.ctx).await; v.push((o, t0.elapsed().as_secs_f64())); }
+                v
+            };
+            for ((id, name, _), (out, secs)) in prepared.into_iter().zip(outputs) {
+                self.sink.emit(&Event::ToolResult { id: id.clone(), name: name.clone(), result: out.text.clone(), secs,
                     images: out.images.iter().map(|(m, b)| format!("data:{m};base64,{b}")).collect() });
                 msgs.push(Message::tool(id, name.clone(), out.text));
                 if !out.images.is_empty() { pending_images.push((name, out.images)); }
+            }
+            if repeats == 2 {
+                msgs.push(Message::user("[harness] You have issued the exact same tool call three times in a row with the same result. Do not repeat it: change approach, or if the task is complete, stop calling tools and give your final answer now."));
+            } else if repeats >= 4 {
+                self.sink.emit(&Event::Error { message: "stopping: the model is looping on the same tool call".into() });
+                stats.stop_reason = "loop".into(); stats.wall_secs = start.elapsed().as_secs_f64(); self.finish(&stats);
+                return Ok((last_text(msgs).unwrap_or_else(|| "(stopped: repeated identical tool calls)".into()), stats));
             }
             // Tool results are text-only in the OpenAI protocol; images ride in a follow-up user turn.
             if !pending_images.is_empty() {
