@@ -385,6 +385,7 @@ struct App {
     wt_cwd: harness::worktree::CwdCell,
     cc: Option<Arc<harness::claude_code::ClaudeCodeSession>>,
     cc_last_session: Option<String>,
+    cc_rate: Option<(String, String, u64)>,
     compact_progress: Option<(f64, String, Instant)>,
     session_meta: harness::sessions::Meta,
     todos: Arc<std::sync::Mutex<Vec<harness::tools::todo::TodoItem>>>,
@@ -416,7 +417,7 @@ pub async fn run(cfg: Config, resume: Option<String>) -> Result<()> {
         quit: false, tick: 0, word: 0, models: vec![],
         metrics: Metrics::new(0), panel: None, attachments: vec![], tool_previews: Default::default(),
         picker, images: Default::default(), img_seq: 0,
-        think_scroll: 0, toolset: None, perm_mode: harness::permissions::Mode::Auto, vim: false, vim_normal: false, keymap: Keymap::load(), live_policy: None, extra_roots: vec![], wt_cwd: harness::worktree::new_cell(), cc: None, cc_last_session: None, compact_progress: None, session_meta: harness::sessions::Meta::default(), todos: Default::default(), inbox: Default::default(), event_log: None, pending_ask: None, pending_q: None, subenv: None, attached: None, video: None, strip_rects: vec![], tr_rect: Rect::default(), panel_rect: Rect::default(), tr_start: 0, line_map: vec![],
+        think_scroll: 0, toolset: None, perm_mode: harness::permissions::Mode::Auto, vim: false, vim_normal: false, keymap: Keymap::load(), live_policy: None, cc_rate: None, extra_roots: vec![], wt_cwd: harness::worktree::new_cell(), cc: None, cc_last_session: None, compact_progress: None, session_meta: harness::sessions::Meta::default(), todos: Default::default(), inbox: Default::default(), event_log: None, pending_ask: None, pending_q: None, subenv: None, attached: None, video: None, strip_rects: vec![], tr_rect: Rect::default(), panel_rect: Rect::default(), tr_start: 0, line_map: vec![],
     };
     app.metrics.ctx_len = app.cfg.llm.context_budget_tokens.unwrap_or(0);
     app.perm_mode = app.cfg.permissions.mode;
@@ -1025,6 +1026,7 @@ impl App {
                     format!("perms     {} · net {} · tools {}", self.perm_mode.label(), if self.net { "on" } else { "off" }, self.toolset.as_ref().map(|t| t.registry.len()).unwrap_or(0)),
                     format!("queue     {} waiting · running: {}", self.queued.len(), self.running.is_some()),
                 ];
+                if let Some((st, kind, at)) = &self.cc_rate { let mins = at.saturating_sub(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)) / 60; lines.push(format!("claude    rate limit {st} ({kind}) · window resets in {}h{:02}m · /usage for details", mins / 60, mins % 60)); }
                 if let Ok(p) = harness::plugins::Plugins::open() { let en = p.enabled(); lines.push(format!("plugins   {} enabled ({} skills)", en.len(), en.iter().map(|x| x.skills.len()).sum::<usize>())); }
                 self.blocks.push(Block::Banner(lines));
             }
@@ -1074,6 +1076,12 @@ impl App {
                         if let Ok(mut ch) = c.spawn() { if let Some(mut si) = ch.stdin.take() { use tokio::io::AsyncWriteExt; let _ = si.write_all(last.as_bytes()).await; } let _ = ch.wait().await; let _ = tx.send(Msg::Notice("last answer copied to the clipboard".into())); }
                     });
                 }
+            }
+            "/usage" if self.cfg.llm.provider.as_deref() == Some("claude-code") => {
+                if let Some(cc) = self.cc.clone() {
+                    let tx = self.tx.clone(); self.blocks.push(Block::System("asking Claude Code for subscription usage…".into()));
+                    tokio::spawn(async move { match cc.command("/usage").await { Ok(t) => { let mut lines = vec!["Claude subscription usage (from Claude Code /usage)".to_string()]; lines.extend(t.lines().map(String::from)); let _ = tx.send(Msg::Block(Block::Banner(lines))); } Err(e) => { let _ = tx.send(Msg::Notice(format!("usage: {e:#}"))); } } });
+                } else { self.blocks.push(Block::System("no Claude session yet — send one message first, then /usage".into())); }
             }
             "/usage" => { self.command("/cost"); }
             "/review" => { self.command(&format!("/workflow review {arg}")); }
@@ -1515,6 +1523,7 @@ impl App {
                 if let Some(Block::Reasoning { text: t, streaming: true, .. }) = self.blocks.last_mut() { t.push_str(&text); }
                 else { self.blocks.push(Block::Reasoning { text, streaming: true, show: None, started: Instant::now(), ended: None }); }
             }
+            Event::RateLimit { status, kind, resets_at } => { if status != "allowed" { self.blocks.push(Block::Error(format!("Claude subscription rate limit: {status} ({kind}); resets in {}m", resets_at.saturating_sub(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)) / 60))); } self.cc_rate = Some((status, kind, resets_at)); }
             Event::ContextInfo { window, source } => { if window > 0 && window != self.metrics.ctx_len { self.metrics.ctx_len = window; self.blocks.push(Block::System(format!("context window: {} tokens ({source}) · auto-compaction (local backends) at {}", fmt_k(window), fmt_k(self.cfg.llm.effective_budget(Some(window)))))); } }
             Event::ThinkingStatus { est_tokens, done } => {
                 let label = |n: u64, d: bool| if d { format!("(reasoning hidden by the provider — ~{} tokens)", fmt_k(n)) } else { format!("(reasoning hidden by the provider — thinking… ~{} tokens so far)", fmt_k(n)) };
@@ -1615,6 +1624,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ("/expand", "toggle expanded tool output (ctrl+o)"),
     ("/panel", "toggle the dashboard panel (ctrl+p)"),
     ("/cost", "token usage for this session"),
+    ("/usage", "Claude backend: subscription usage (proxied Claude Code /usage); otherwise same as /cost"),
     ("/compact", "compact the context into a precise handoff note: /compact [focus]"),
     ("/context", "context map: what fills the window (prompt, tools, memory, messages) + heaviest items"),
     ("/config", "effective configuration"),

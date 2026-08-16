@@ -14,6 +14,8 @@ pub enum Event {
     ThinkingStatus { est_tokens: u64, done: bool },
     /// The backend reported the model's context window (tokens).
     ContextInfo { window: u64, source: String },
+    /// Claude Code backend: subscription rate-limit status (five_hour / seven_day …), reset time (unix secs).
+    RateLimit { status: String, kind: String, resets_at: u64 },
     AssistantDelta { text: String },
     Reasoning { text: String },
     Assistant { text: String },
@@ -47,7 +49,7 @@ impl Sink for StderrSink {
         use crate::llm::truncate_for_log as t;
         match e {
             Event::RunStarted { model, workdir, tools } => eprintln!("model={model} workdir={workdir} tools={tools:?}"),
-            Event::Turn { .. } | Event::ReasoningDelta { .. } | Event::AssistantDelta { .. } | Event::ThinkingStatus { .. } | Event::ContextInfo { .. } => {}
+            Event::Turn { .. } | Event::ReasoningDelta { .. } | Event::AssistantDelta { .. } | Event::ThinkingStatus { .. } | Event::ContextInfo { .. } | Event::RateLimit { .. } => {}
             Event::ModelResponse { prompt_tokens, completion_tokens, ttft_secs, secs, .. } => if self.verbose {
                 let gen = if *secs > *ttft_secs && *completion_tokens > 0 { *completion_tokens as f64 / (*secs - *ttft_secs) } else { 0.0 };
                 eprintln!("⏱ {prompt_tokens}+{completion_tokens} tok · ttft {ttft_secs:.1}s · {gen:.1} tok/s");

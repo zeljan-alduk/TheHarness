@@ -75,6 +75,7 @@ impl ClaudeCodeSession {
         loop {
             let Some(ev) = rx.recv().await else { bail!("claude process ended unexpectedly{}", drain_stderr()) };
             match ev["type"].as_str().unwrap_or("") {
+                "rate_limit_event" => { let i = &ev["rate_limit_info"]; sink.emit(&Event::RateLimit { status: i["status"].as_str().unwrap_or("").to_string(), kind: i["rateLimitType"].as_str().unwrap_or("").to_string(), resets_at: i["resetsAt"].as_u64().unwrap_or(0) }); }
                 "system" if ev["subtype"] == "thinking_tokens" => { if let Some(n) = ev["estimated_tokens"].as_u64() { think_est = think_est.max(n); thinking_hidden = true; sink.emit(&Event::ThinkingStatus { est_tokens: n, done: false }); } }
                 "system" if ev["subtype"] == "status" => { if ev["status"] == "compacting" { sink.emit(&Event::CompactProgress { fraction: 0.15, phase: "Claude Code is compacting its context…".into() }); } else if ev["compact_result"].is_string() { sink.emit(&Event::CompactProgress { fraction: 1.0, phase: "done".into() }); } }
                 "system" if ev["subtype"] == "compact_boundary" => {
@@ -129,6 +130,17 @@ impl ClaudeCodeSession {
                 }
                 _ => {}
             }
+        }
+    }
+
+    /// Send a built-in slash command (e.g. "/usage", "/cost", "/status") and return the CLI's text reply.
+    pub async fn command(&self, cmd: &str) -> Result<String> {
+        let msg = json!({"type": "user", "message": {"role": "user", "content": [{"type": "text", "text": cmd}]}});
+        { let mut w = self.stdin.lock().await; w.write_all(format!("{}\n", msg).as_bytes()).await?; w.flush().await?; }
+        let mut rx = self.events.lock().await;
+        loop {
+            let ev = match tokio::time::timeout(std::time::Duration::from_secs(120), rx.recv()).await { Ok(Some(e)) => e, Ok(None) => bail!("claude process ended"), Err(_) => bail!("timed out waiting for {cmd}") };
+            if ev["type"] == "result" { return Ok(ev["result"].as_str().unwrap_or("").to_string()); }
         }
     }
 
