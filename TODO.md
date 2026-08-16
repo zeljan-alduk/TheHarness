@@ -47,7 +47,7 @@ Status: ☐ open · ◐ partial · ☑ done.
 `apply_patch`, `diagnostics`, `view_image`, `read_pdf`, `pdf_edit`, `extract_archive`, `download_file`, `memory`,
 `list_dir`, `spawn_agent {read_only}`.
 
-## Coordination — handled by the *other* Claude session on branch `feature/parity-b` (do NOT implement here)
+## Coordination — DONE (merged into main 2026-08-16): feature/parity-b + wt/todo-tools
 The following are being implemented concurrently in a separate git worktree and will be merged into main;
 skip them to avoid conflicts: hooks parity (SessionStart/End, SubagentStop, PreCompact, Notification, matchers),
 permission scopes (project always-rules, /permissions add/remove, directory trust), session picker/fuzzy resume +

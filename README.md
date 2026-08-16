@@ -9,6 +9,10 @@ tools) **and its own source**, but only let it improve itself through an
 **eval-gated loop** — proposals land on git branches and are judged by a benchmark score,
 never by the agent's own opinion.
 
+## Version
+`harness --version` → `1.0.NNN (sha)`; the build number increments on every release build (`build.rs`,
+`.build-number`). Set `HARNESS_NO_BUMP=1` to build without bumping.
+
 ## Backends
 - **Local / OpenAI-compatible** (default): LM Studio, llama.cpp, Ollama, OpenAI, OpenRouter… (`base_url`, `api_key`).
 - **Claude Code (subscription)**: `provider = "claude-code"` or `/backend claude [model]` (default `claude-fable-5`).

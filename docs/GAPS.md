@@ -75,3 +75,14 @@ Closed since: LSP client, workflows, Anthropic adapter, syntax highlighting, pro
 defaults, /context map, compaction progress + map, temps/power in dashboard, Windows build (harness.exe
 links; CI matrix macOS/Linux/Windows). Remaining: container sandbox, MCP resources/prompts/OAuth,
 larger eval corpus, runtime validation on Windows/Linux (CI does unit tests + tool smoke there).
+
+
+## Update 2026-08-16 (afternoon) — parity pass merged
+Added: ask_user (AskUserQuestion), Inbox + wakeups, monitor, schedule, notify, report_findings, mcp_resources,
+plan_mode, agents, run_workflow, todo task graph, worktree tool, sub-agents under the Claude Code backend +
+Agents panel + /agents attach/kill/steer, Claude Code backend (subscription) with /backend, effort, remote
+/compact, context window detection, hooks parity, project-scoped permissions + trust, fuzzy resume + auto
+titles, markdown tables/lists, vim mode + keybindings, cross-session messaging, provider presets, bwrap,
+plugin update-all, versioning 1.0.NNN, 25 eval tasks, 29-tool integration script, 60-step e2e.
+Remaining: mid-turn steering of Claude sub-sessions, hosted/cloud sessions + phone push, MCP OAuth,
+Windows/Linux runtime validation beyond CI, native Gemini/Bedrock/Vertex adapters, marketplace ratings.
