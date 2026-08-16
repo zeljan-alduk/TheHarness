@@ -132,7 +132,7 @@ mod tests {
         let d = std::env::temp_dir().join(format!("harness-search-test-{}-{}", std::process::id(), N.fetch_add(1, Ordering::Relaxed)));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
-        (ToolCtx { workdir: d.clone(), timeout: std::time::Duration::from_secs(30), max_output: 16000, net: crate::config::NetConfig::default(), memory: None, subagent: None, redact_secrets: true, hooks: Default::default(), todos: Default::default() }, d)
+        (ToolCtx { workdir: d.clone(), timeout: std::time::Duration::from_secs(30), max_output: 16000, net: crate::config::NetConfig::default(), memory: None, subagent: None, redact_secrets: true, hooks: Default::default(), todos: Default::default(), lsp_servers: Default::default() }, d)
     }
 
     #[test]
