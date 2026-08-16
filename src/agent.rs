@@ -248,7 +248,7 @@ pub struct PrefixSink { pub inner: std::sync::Arc<dyn Sink>, pub prefix: String,
 impl Sink for PrefixSink {
     fn emit(&self, e: &Event) {
         match e {
-            Event::ToolCall { id, name, args } => { if let Some(i) = &self.info { i.tool_calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed); *i.status.lock().unwrap() = format!("{name}"); } self.inner.emit(&Event::ToolCall { id: format!("{}{id}", self.prefix), name: format!("{}{name}", self.prefix), args: args.clone() }) }
+            Event::ToolCall { id, name, args } => { if let Some(i) = &self.info { i.tool_calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed); *i.status.lock().unwrap() = name.to_string(); } self.inner.emit(&Event::ToolCall { id: format!("{}{id}", self.prefix), name: format!("{}{name}", self.prefix), args: args.clone() }) }
             Event::ToolResult { id, name, result, secs, images } => self.inner.emit(&Event::ToolResult { id: format!("{}{id}", self.prefix), name: format!("{}{name}", self.prefix), result: result.clone(), secs: *secs, images: images.clone() }),
             Event::Assistant { text } => self.inner.emit(&Event::ToolResult { id: format!("{}final", self.prefix), name: format!("{}report", self.prefix), result: text.clone(), secs: 0.0, images: vec![] }),
             Event::Error { message } => self.inner.emit(&Event::Error { message: format!("{}{message}", self.prefix) }),

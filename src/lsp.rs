@@ -158,7 +158,7 @@ impl LspServer {
 
 pub fn server_for(path: &Path, servers: &HashMap<String, LspServerConfig>) -> Option<(String, LspServerConfig)> {
     let ext = path.extension()?.to_str()?.to_ascii_lowercase();
-    servers.iter().find(|(_, c)| c.exts.iter().any(|e| *e == ext)).map(|(n, c)| (n.clone(), c.clone()))
+    servers.iter().find(|(_, c)| c.exts.contains(&ext)).map(|(n, c)| (n.clone(), c.clone()))
 }
 
 pub fn fmt_location(v: &Value, root: &Path) -> String {

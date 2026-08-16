@@ -190,7 +190,7 @@ fn remove_persisted(rule: &str, workdir: Option<&Path>) -> usize {
 
 /// Directory trust: remembered directories the user has accepted working in (non-blocking notice otherwise).
 fn trusted_file() -> PathBuf { crate::setup::config_dir().join("trusted.json") }
-pub fn is_trusted(workdir: &Path) -> bool { let w = workdir.canonicalize().unwrap_or(workdir.to_path_buf()).display().to_string(); std::fs::read_to_string(trusted_file()).ok().and_then(|t| serde_json::from_str::<Vec<String>>(&t).ok()).unwrap_or_default().iter().any(|d| *d == w) }
+pub fn is_trusted(workdir: &Path) -> bool { let w = workdir.canonicalize().unwrap_or(workdir.to_path_buf()).display().to_string(); std::fs::read_to_string(trusted_file()).ok().and_then(|t| serde_json::from_str::<Vec<String>>(&t).ok()).unwrap_or_default().contains(&w) }
 pub fn trust(workdir: &Path) { let w = workdir.canonicalize().unwrap_or(workdir.to_path_buf()).display().to_string(); let mut v: Vec<String> = std::fs::read_to_string(trusted_file()).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default(); if !v.contains(&w) { v.push(w); let _ = std::fs::write(trusted_file(), serde_json::to_string_pretty(&v).unwrap_or_default()); } }
 
 #[cfg(test)]

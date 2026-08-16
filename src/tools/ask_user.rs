@@ -26,7 +26,7 @@ impl Tool for AskUser {
                 if a.timed_out { return Ok("the user did not answer in time — proceed with the most reasonable default and say so.".into()); }
                 let mut s = String::new();
                 if let Some(i) = a.choice { if let Some(o) = options.get(i) { s.push_str(&format!("user chose: {}{}", o.label, if o.description.is_empty() { String::new() } else { format!(" — {}", o.description) })); } }
-                if let Some(t) = &a.text { if !t.trim().is_empty() { if !s.is_empty() { s.push_str("\n"); } s.push_str(&format!("user says: {}", t.trim())); } }
+                if let Some(t) = &a.text { if !t.trim().is_empty() { if !s.is_empty() { s.push('\n'); } s.push_str(&format!("user says: {}", t.trim())); } }
                 if s.is_empty() { s = "user answered without a choice or text".into(); }
                 Ok(s.into())
             }

@@ -119,7 +119,7 @@ pub fn print_report(statuses: &[Status]) {
 pub fn path_with_bin_dir(_cwd: &Path) -> std::ffi::OsString {
     let dir = bin_dir();
     let mut paths: Vec<PathBuf> = std::env::var_os("PATH").map(|p| std::env::split_paths(&p).collect()).unwrap_or_default();
-    if !paths.iter().any(|p| *p == dir) { paths.insert(0, dir); }
+    if !paths.contains(&dir) { paths.insert(0, dir); }
     std::env::join_paths(paths).unwrap_or_else(|_| std::env::var_os("PATH").unwrap_or_default())
 }
 

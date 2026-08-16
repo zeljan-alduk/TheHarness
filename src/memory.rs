@@ -268,7 +268,7 @@ pub fn canonical_name(file: &str) -> Result<&'static str> {
 }
 
 fn shellexpand(p: &str) -> String {
-    if let Some(rest) = p.strip_prefix('~') { format!("{}{}", crate::setup::home_dir().display().to_string(), rest) } else { p.to_string() }
+    if let Some(rest) = p.strip_prefix('~') { format!("{}{}", crate::setup::home_dir().display(), rest) } else { p.to_string() }
 }
 
 /// Compact a transcript for reflection: user text, assistant text, tool names + short args/results.

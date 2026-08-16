@@ -23,7 +23,7 @@ impl ProcOutput {
 }
 
 /// POSIX single-quote shell quoting: safe to interpolate into `sh -c` strings.
-pub fn shq(s: &str) -> String { format!("'{}'", s.replace('\'', "'\\''")) }
+pub fn shq(s: &str) -> String { crate::security::shell_quote(s) }
 
 fn is_secret_env(k: &str) -> bool {
     let u = k.to_ascii_uppercase();

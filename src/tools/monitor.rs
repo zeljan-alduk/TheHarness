@@ -61,7 +61,7 @@ pub async fn start(inbox: Arc<Inbox>, cmd: &str, cwd: &std::path::Path, filter: 
                 partial.push_str(&chunk);
                 let mut rest = String::new();
                 let mut it = partial.split_inclusive('\n').peekable();
-                while let Some(l) = it.next() {
+                for l in it {
                     if !l.ends_with('\n') && !exited { rest = l.to_string(); break; }
                     let line = l.trim_end_matches(['\n', '\r']);
                     if filter.as_ref().map(|r| r.is_match(line)).unwrap_or(true) && !truncated {
