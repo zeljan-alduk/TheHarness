@@ -80,6 +80,9 @@ pub struct LlmConfig {
     pub context_budget_tokens: Option<u64>,
     #[serde(default = "d_compact_frac")]
     pub compact_at_fraction: f64,
+    /// Claude Code backend: reasoning effort passed as `claude --effort` (low | medium | high | max).
+    #[serde(default)]
+    pub effort: Option<String>,
     /// Anthropic API: enable extended thinking with this token budget (summarized thinking is streamed back).
     #[serde(default)]
     pub thinking_budget: Option<u32>,

@@ -858,12 +858,22 @@ impl App {
                     }
                 }
             }
+            "/effort" => {
+                let lvl = arg.trim().to_lowercase();
+                if lvl.is_empty() { self.blocks.push(Block::System(format!("effort: {} (Claude Code backend) — /effort low|medium|high|max", self.cfg.llm.effort.clone().unwrap_or("default".into())))); }
+                else if !matches!(lvl.as_str(), "low" | "medium" | "high" | "max") { self.blocks.push(Block::Error("usage: /effort low|medium|high|max".into())); }
+                else {
+                    self.cfg.llm.effort = Some(lvl.clone());
+                    if let Some(cc) = self.cc.take() { tokio::spawn(async move { cc.stop().await; }); }
+                    self.blocks.push(Block::System(format!("effort → {lvl}{}", if self.cfg.llm.provider.as_deref() == Some("claude-code") { " (Claude session restarts on the next turn, resuming the conversation)" } else { " (applies when the Claude Code backend is used)" })));
+                }
+            }
             "/backend" | "/provider" => {
-                let mut it = arg.split_whitespace(); let which = it.next().unwrap_or("").to_string(); let model = it.next().map(String::from);
+                let mut it = arg.split_whitespace(); let which = it.next().unwrap_or("").to_string(); let model = it.next().map(String::from); let effort = it.next().map(|e| e.to_lowercase());
                 match which.as_str() {
-                    "" => { self.blocks.push(Block::Banner(vec![format!("backend: {} · model {}", self.cfg.llm.provider.clone().unwrap_or("openai (local/compatible server)".into()), self.model), "switch: /backend local [model]  ·  /backend claude [model]   (claude = official Claude Code CLI on your subscription, default claude-fable-5)".into(), "        /backend anthropic <model>  (Anthropic API key from ANTHROPIC_API_KEY)".into()])); }
+                    "" => { self.blocks.push(Block::Banner(vec![format!("backend: {} · model {}", self.cfg.llm.provider.clone().unwrap_or("openai (local/compatible server)".into()), self.model), "switch: /backend local [model]  ·  /backend claude [model] [effort]   (claude = official Claude Code CLI on your subscription, default claude-fable-5; effort low|medium|high|max, also /effort)".into(), "        /backend anthropic <model>  (Anthropic API key from ANTHROPIC_API_KEY)".into()])); }
                     "local" | "openai" | "lmstudio" => { self.cfg.llm.provider = None; if let Some(m) = model { self.cfg.llm.model = m; } self.model = self.cfg.llm.model.clone(); if let Some(cc) = self.cc.take() { tokio::spawn(async move { cc.stop().await; }); } self.cc_last_session = None; self.blocks.push(Block::System(format!("backend → local server {} · model {}", self.cfg.llm.base_url, self.model))); tokio::spawn(fetch_ctx_len(self.cfg.llm.base_url.clone(), self.model.clone(), self.tx.clone())); }
-                    "claude" | "claude-code" | "cc" => { self.cfg.llm.provider = Some("claude-code".into()); self.cfg.llm.model = model.unwrap_or("claude-fable-5".into()); self.model = self.cfg.llm.model.clone(); if let Some(cc) = self.cc.take() { tokio::spawn(async move { cc.stop().await; }); } self.cc_last_session = None; self.metrics.ctx_len = 0; self.blocks.push(Block::System(format!("backend → Claude Code (subscription) · model {} · tools bridged over MCP · context window reported after the first turn", self.model))); }
+                    "claude" | "claude-code" | "cc" => { self.cfg.llm.provider = Some("claude-code".into()); self.cfg.llm.model = model.unwrap_or("claude-fable-5".into()); if let Some(e) = effort { if matches!(e.as_str(), "low" | "medium" | "high" | "max") { self.cfg.llm.effort = Some(e); } } self.model = self.cfg.llm.model.clone(); if let Some(cc) = self.cc.take() { tokio::spawn(async move { cc.stop().await; }); } self.cc_last_session = None; self.metrics.ctx_len = 0; self.blocks.push(Block::System(format!("backend → Claude Code (subscription) · model {} · tools bridged over MCP · context window reported after the first turn", self.model))); }
                     "anthropic" => { self.cfg.llm.provider = Some("anthropic".into()); self.cfg.llm.base_url = "https://api.anthropic.com".into(); if let Some(m) = model { self.cfg.llm.model = m; } self.model = self.cfg.llm.model.clone(); self.metrics.ctx_len = 200_000; if self.cfg.llm.thinking_budget.is_none() { self.cfg.llm.thinking_budget = Some(8000); } self.blocks.push(Block::System(format!("backend → Anthropic API · model {}", self.model))); }
                     other => self.blocks.push(Block::Error(format!("unknown backend '{other}' (local | claude | anthropic)"))),
                 }
@@ -1025,7 +1035,7 @@ impl App {
                     // Claude Code backend: our tools bridged over MCP; the claude CLI drives the loop
                     let cc = match cc_existing { Some(c) => c, None => {
                         let host = Arc::new(harness::mcp_bridge::BridgeHost { registry: registry.clone(), ctx: ctx.clone(), policy: policy.clone(), approver: approver.clone(), sink: sink.clone() });
-                        let c = harness::claude_code::ClaudeCodeSession::start(&workdir, Some(cfg.llm.model.as_str()), &system, host, cc_resume.as_deref()).await.map_err(|e| format!("{e:#}"))?;
+                        let c = harness::claude_code::ClaudeCodeSession::start_with(&workdir, Some(cfg.llm.model.as_str()), cfg.llm.effort.as_deref(), &system, host, cc_resume.as_deref()).await.map_err(|e| format!("{e:#}"))?;
                         let _ = tx.send(Msg::CcSession(c.clone())); c } };
                     if msgs.is_empty() { msgs.push(Message::system(&system)); }
                     msgs.push(user_msg);
@@ -1290,7 +1300,8 @@ const COMMANDS: &[(&str, &str)] = &[
     ("/sessions", "list saved sessions"),
     ("/resume", "resume a saved session: /resume <n|id|last>"),
     ("/model", "show or switch the model: /model <name>"),
-    ("/backend", "switch backend: local (LM Studio etc.) | claude [model] (Claude Code CLI, subscription) | anthropic <model>"),
+    ("/backend", "switch backend: local (LM Studio etc.) | claude [model] [effort] (Claude Code CLI, subscription) | anthropic <model>"),
+    ("/effort", "Claude Code backend reasoning effort: /effort low|medium|high|max"),
     ("/cd", "change working directory"),
     ("/pwd", "print working directory"),
     ("/tools", "list the tools the model can call"),
@@ -1417,7 +1428,7 @@ fn draw(f: &mut Frame, app: &mut App) {
     let dot = || Span::styled(" · ", Style::default().fg(pal().dim));
     let (mode_txt, mode_col) = match app.perm_mode { harness::permissions::Mode::Bypass => ("▶▶ bypass permissions on", pal().pink), harness::permissions::Mode::Auto => ("▶▶ auto permissions", pal().cyan), harness::permissions::Mode::Ask => ("▶▶ ask before changes", pal().orange), harness::permissions::Mode::Plan => ("▶▶ plan mode · read-only", pal().think) };
     let mut st = vec![Span::styled(format!("  {mode_txt}"), Style::default().fg(mode_col)), dot(),
-        Span::styled(app.model.clone(), Style::default().fg(pal().cyan)), dot(),
+        Span::styled(format!("{}{}", app.model, if app.cfg.llm.provider.as_deref() == Some("claude-code") { app.cfg.llm.effort.as_ref().map(|e| format!(" · effort {e}")).unwrap_or_default() } else { String::new() }), Style::default().fg(pal().cyan)), dot(),
         Span::styled(short_path(&app.workdir), Style::default().fg(pal().cyan)), dot(),
         Span::styled(format!("ctx {}", fmt_k(app.last_prompt_tokens)), Style::default().fg(pal().cyan))];
     if !app.net { st.push(dot()); st.push(Span::styled("offline", Style::default().fg(pal().pink))); }

@@ -30,6 +30,9 @@ pub fn claude_bin() -> Option<PathBuf> {
 impl ClaudeCodeSession {
     /// Start `claude` with our tools bridged in. `system` is our full system prompt.
     pub async fn start(workdir: &Path, model: Option<&str>, system: &str, host: Arc<crate::mcp_bridge::BridgeHost>, resume: Option<&str>) -> Result<Arc<Self>> {
+        Self::start_with(workdir, model, None, system, host, resume).await
+    }
+    pub async fn start_with(workdir: &Path, model: Option<&str>, effort: Option<&str>, system: &str, host: Arc<crate::mcp_bridge::BridgeHost>, resume: Option<&str>) -> Result<Arc<Self>> {
         let bin = claude_bin().context("`claude` CLI not found — install Claude Code and log in (https://claude.com/claude-code)")?;
         let (addr, bridge) = crate::mcp_bridge::serve(&crate::mcp_bridge::new_addr(), host).await?;
         let me = std::env::var_os("HARNESS_ORIG_EXE").map(PathBuf::from).unwrap_or(std::env::current_exe()?);
@@ -39,6 +42,7 @@ impl ClaudeCodeSession {
         c.args(["--print", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose", "--include-partial-messages", "--permission-mode", "bypassPermissions", "--strict-mcp-config", "--mcp-config"]).arg(&mcp_cfg)
          .args(["--tools", "", "--system-prompt"]).arg(system);
         if let Some(m) = model { if !m.is_empty() { c.args(["--model", m]); } }
+        if let Some(e) = effort { if !e.is_empty() { c.args(["--effort", e]); } }
         if let Some(r) = resume { c.args(["--resume", r]); }
         c.current_dir(workdir).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
         c.env_remove("CLAUDECODE"); // allow nesting when the harness itself runs inside Claude Code

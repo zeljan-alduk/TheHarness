@@ -39,8 +39,11 @@ impl Tool for PdfEdit {
     fn description(&self) -> &'static str {
         "Edit an existing PDF in place without disturbing the rest of the page. Actions: \
          info (pages, fonts, metadata) · find {text} (occurrences with page/position/font) · \
-         replace {old,new} (removes the old text and writes the new one at the same spot, matching font size/style/color; \
-         new='' deletes; occurrence=N picks one match, else all; shrinks to fit unless there is room to the right) · \
+         replace {old,new} (removes the old text and writes the new one at the same spot in the SAME font, size, style, color and \
+         direction — the PDF's own font resource is reused (falls back to the installed/standard font of the same name if the subset lacks glyphs); \
+         nothing changes unless you pass font_size/color/bold/… explicitly; new='' deletes; occurrence=N picks one match, else all; \
+         matching is case-sensitive, one line at a time; wider text keeps its size and extends right — a note warns if it would overlap \
+         (fit=true shrinks to the old width instead)) · \
          add_text {page,x,y,text} (baseline point in PDF points from top-left) · render {page} (returns a PNG of the page — use it to verify edits). \
          Edits overwrite the file (a .bak.pdf copy is kept unless backup=false) or go to `output`. Text is matched per line as extracted."
     }
@@ -58,7 +61,7 @@ impl Tool for PdfEdit {
             "font_size":{"type":"number","description":"override the font size (default: same as the replaced text / 11 for add_text)"},
             "color":{"type":"string","description":"text color '#rrggbb' (default: same as the replaced text / black)"},
             "bold":{"type":"boolean"},"italic":{"type":"boolean"},"mono":{"type":"boolean"},"serif":{"type":"boolean"},
-            "fit":{"type":"boolean","description":"replace: shrink longer text to the original width (default true; false = keep size, may overlap)"},
+            "fit":{"type":"boolean","description":"replace: shrink longer text to fit the original width (default false = keep the original size; a note warns about overlap)"},
             "align":{"type":"string","enum":["left","center","right"],"description":"replace: where to place shorter text within the old width (default left)"},
             "fill":{"type":"string","description":"replace: paint the old text area with this '#rrggbb' color (default: transparent, background untouched)"},
             "x":{"type":"number"},"y":{"type":"number"},
