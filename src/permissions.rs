@@ -53,7 +53,7 @@ const RISKY: &[&str] = &[
     "del /s", "del /q", "rmdir /s", "rd /s", "format ", "remove-item -recurse", "rm -recurse", "diskpart", "reg delete", "schtasks", "net user",
 ];
 const PLAN_OK: &[&str] = &["git status", "git log", "git diff", "git show", "git branch", "git blame", "ls", "cat ", "head ", "tail ", "grep ", "rg ", "find ", "fd ", "wc ", "tree", "pwd", "echo ", "which ", "file ", "stat ", "du ", "df ", "env", "printenv", "cargo check", "cargo metadata", "cargo tree", "python3 -c \"import", "node -e", "jq ", "sed -n", "awk ", "sort", "uniq", "diff "];
-const MUTATING: &[&str] = &["write_file", "edit_file", "apply_patch", "bash", "download_file", "extract_archive", "memory", "spawn_agent"];
+const MUTATING: &[&str] = &["write_file", "edit_file", "apply_patch", "bash", "download_file", "extract_archive", "pdf_edit", "memory", "spawn_agent"];
 
 pub struct Policy { pub cfg: PermissionsConfig, pub workdir: PathBuf, session_allow: std::sync::Mutex<Vec<String>> }
 
@@ -68,7 +68,7 @@ impl Policy {
         let g = |k: &str| args.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
         match tool {
             "bash" => g("cmd"),
-            "read_file" | "write_file" | "edit_file" | "list_dir" | "view_image" | "read_pdf" | "extract_archive" | "apply_patch" => g("path"),
+            "read_file" | "write_file" | "edit_file" | "list_dir" | "view_image" | "read_pdf" | "pdf_edit" | "extract_archive" | "apply_patch" => g("path"),
             "web_fetch" | "download_file" => g("url"),
             "web_search" => g("query"),
             "memory" => format!("{} {}", g("action"), g("file")),
@@ -90,7 +90,7 @@ impl Policy {
     }
 
     fn outside_workdir(&self, tool: &str, arg: &str) -> bool {
-        if !matches!(tool, "write_file" | "edit_file" | "apply_patch" | "extract_archive" | "download_file") { return false; }
+        if !matches!(tool, "write_file" | "edit_file" | "apply_patch" | "extract_archive" | "pdf_edit" | "download_file") { return false; }
         let p = Path::new(arg);
         if !p.is_absolute() { return false; }
         let root = self.workdir.canonicalize().unwrap_or(self.workdir.clone());

@@ -66,6 +66,7 @@ impl ClaudeCodeSession {
         let mut final_text = String::new();
         let mut cur_text = String::new();
         let mut cur_think = String::new();
+        let mut think_est: u64 = 0; let mut thinking_hidden = false;
         let mut rx = self.events.lock().await;
         loop {
             let Some(ev) = rx.recv().await else { bail!("claude process ended unexpectedly{}", drain_stderr()) };
@@ -77,10 +78,17 @@ impl ClaudeCodeSession {
                         "message_start" => { stats.turns += 1; sink.emit(&Event::Turn { n: stats.turns }); }
                         "content_block_delta" => match e["delta"]["type"].as_str().unwrap_or("") {
                             "text_delta" => { let t = e["delta"]["text"].as_str().unwrap_or(""); cur_text.push_str(t); sink.emit(&Event::AssistantDelta { text: t.to_string() }); }
-                            "thinking_delta" => { let t = e["delta"]["thinking"].as_str().unwrap_or(""); cur_think.push_str(t); sink.emit(&Event::ReasoningDelta { text: t.to_string() }); }
+                            "thinking_delta" => {
+                                let t = e["delta"]["thinking"].as_str().unwrap_or("");
+                                if !t.is_empty() { cur_think.push_str(t); sink.emit(&Event::ReasoningDelta { text: t.to_string() }); }
+                                else { if let Some(n) = e["delta"]["estimated_tokens"].as_u64() { think_est = think_est.max(n); } else { think_est += 40; } thinking_hidden = true; sink.emit(&Event::ThinkingStatus { est_tokens: think_est, done: false }); }
+                            }
                             _ => {}
                         },
-                        "content_block_stop" => { if !cur_think.is_empty() { sink.emit(&Event::Reasoning { text: std::mem::take(&mut cur_think) }); } }
+                        "content_block_stop" => {
+                            if !cur_think.is_empty() { sink.emit(&Event::Reasoning { text: std::mem::take(&mut cur_think) }); }
+                            else if thinking_hidden { sink.emit(&Event::ThinkingStatus { est_tokens: think_est, done: true }); thinking_hidden = false; think_est = 0; }
+                        }
                         "message_delta" => { if let Some(u) = e["usage"].as_object() { let o = u.get("output_tokens").and_then(|x| x.as_u64()).unwrap_or(0); stats.completion_tokens += o; } }
                         _ => {}
                     }

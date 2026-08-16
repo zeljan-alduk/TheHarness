@@ -1193,6 +1193,12 @@ impl App {
                 if let Some(Block::Reasoning { text: t, streaming: true, .. }) = self.blocks.last_mut() { t.push_str(&text); }
                 else { self.blocks.push(Block::Reasoning { text, streaming: true, show: None, started: Instant::now(), ended: None }); }
             }
+            Event::ThinkingStatus { est_tokens, done } => {
+                let label = |n: u64, d: bool| if d { format!("(reasoning hidden by the provider — ~{} tokens)", fmt_k(n)) } else { format!("(reasoning hidden by the provider — thinking… ~{} tokens so far)", fmt_k(n)) };
+                if let Some(Block::Reasoning { text: t, streaming, ended, .. }) = self.blocks.last_mut() { *t = label(est_tokens, done); if done { *streaming = false; if ended.is_none() { *ended = Some(Instant::now()); } } }
+                else { self.blocks.push(Block::Reasoning { text: label(est_tokens, done), streaming: !done, show: None, started: Instant::now(), ended: if done { Some(Instant::now()) } else { None } }); }
+                self.metrics.on_delta(40);
+            }
             Event::Reasoning { text } => {
                 if let Some(Block::Reasoning { text: t, streaming, ended, .. }) = self.blocks.last_mut() { *t = text; *streaming = false; *ended = Some(Instant::now()); }
                 else if !text.trim().is_empty() { let now = Instant::now(); self.blocks.push(Block::Reasoning { text, streaming: false, show: None, started: now, ended: Some(now) }); }
@@ -1752,7 +1758,7 @@ fn args_summary(name: &str, args: &str, max: usize) -> String {
     let v: serde_json::Value = serde_json::from_str(args).unwrap_or(serde_json::Value::Null);
     let s = match name {
         "bash" => v["cmd"].as_str().unwrap_or(args).to_string(),
-        "read_file" | "write_file" | "edit_file" | "list_dir" | "view_image" | "read_pdf" | "extract_archive" => v["path"].as_str().unwrap_or(args).to_string(),
+        "read_file" | "write_file" | "edit_file" | "list_dir" | "view_image" | "read_pdf" | "pdf_edit" | "extract_archive" => v["path"].as_str().unwrap_or(args).to_string(),
         "web_fetch" | "download_file" => v["url"].as_str().unwrap_or(args).to_string(),
         "web_search" => v["query"].as_str().unwrap_or(args).to_string(),
         _ => args.to_string(),

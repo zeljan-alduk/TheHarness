@@ -10,6 +10,8 @@ pub enum Event {
     Turn { n: usize },
     /// Streaming increments (only when the client streams). Final `Reasoning`/`Assistant` still follow.
     ReasoningDelta { text: String },
+    /// Provider hides reasoning text but reports progress (Claude Code): estimated tokens so far.
+    ThinkingStatus { est_tokens: u64, done: bool },
     AssistantDelta { text: String },
     Reasoning { text: String },
     Assistant { text: String },
@@ -43,7 +45,7 @@ impl Sink for StderrSink {
         use crate::llm::truncate_for_log as t;
         match e {
             Event::RunStarted { model, workdir, tools } => eprintln!("model={model} workdir={workdir} tools={tools:?}"),
-            Event::Turn { .. } | Event::ReasoningDelta { .. } | Event::AssistantDelta { .. } => {}
+            Event::Turn { .. } | Event::ReasoningDelta { .. } | Event::AssistantDelta { .. } | Event::ThinkingStatus { .. } => {}
             Event::ModelResponse { prompt_tokens, completion_tokens, ttft_secs, secs, .. } => if self.verbose {
                 let gen = if *secs > *ttft_secs && *completion_tokens > 0 { *completion_tokens as f64 / (*secs - *ttft_secs) } else { 0.0 };
                 eprintln!("⏱ {prompt_tokens}+{completion_tokens} tok · ttft {ttft_secs:.1}s · {gen:.1} tok/s");

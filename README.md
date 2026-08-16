@@ -77,7 +77,7 @@ scrubber (ffmpeg): ←/→, space to select, enter attaches frames with timestam
 - **Sessions**: every turn is saved under `~/.config/harness/sessions/`; `/sessions`, `/resume <n|id|last>`,
   `harness --resume <id>`, `harness -c` (continue latest for this directory).
 - **Tools** (all): bash (+background), process, read/write/edit_file, apply_patch, list_dir, grep, glob,
-  diagnostics, notebook_edit, view_image, read_pdf, extract_archive, memory, load_skill, todo, spawn_agent,
+  diagnostics, notebook_edit, view_image, read_pdf, pdf_edit (in-place PDF text edits via PyMuPDF), extract_archive, memory, load_skill, todo, spawn_agent,
   web_fetch, web_search, download_file, + MCP tools. `[hooks]` run shell hooks around tools; `[security]`
   redacts secrets; `[sandbox] mode = "seatbelt"` confines shell writes (macOS).
 - **Web UI**: `harness serve` (localhost:7878) — same UI as the desktop app, from any browser.
@@ -120,7 +120,7 @@ src/
   agent.rs     the loop: model → tool calls → results → model; budgets; context compaction
   events.rs    structured Event stream + Sink trait (StderrSink, JsonlSink) — core never prints
   sandbox.rs   local process supervision: timeout, process-group kill, env scrub, output caps
-  tools/       bash, read_file, write_file, edit_file, list_dir, view_image, memory, load_skill, read_pdf, extract_archive, web_fetch, web_search, download_file (+ MCP tools)
+  tools/       bash, read_file, write_file, edit_file, list_dir, view_image, memory, load_skill, read_pdf, pdf_edit, extract_archive, web_fetch, web_search, download_file (+ MCP tools)
   memory.rs    MEMORY/WORKFLOWS/BRAIN store, reflection, consolidation, pastes dir
   mcp.rs       MCP stdio client · plugins.rs plugin manager · setup.rs external tools · tui.rs terminal UI
   eval.rs      the fitness function: runs evals/tasks/* in fresh git-initialised workdirs

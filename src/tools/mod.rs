@@ -8,6 +8,7 @@ pub mod lsp;
 pub mod memory;
 pub mod notebook;
 pub mod patch;
+pub mod pdf;
 pub mod process;
 pub mod search;
 pub mod skill;
@@ -118,6 +119,7 @@ impl Registry {
             Arc::new(memory::MemoryTool),
             Arc::new(skill::LoadSkill),
             Arc::new(archive::ReadPdf),
+            Arc::new(pdf::PdfEdit),
             Arc::new(archive::ExtractArchive),
             Arc::new(subagent::SpawnAgent),
             Arc::new(process::Process),
