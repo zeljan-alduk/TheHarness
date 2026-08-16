@@ -36,6 +36,16 @@ fn valid_name(name: &str) -> Result<()> {
     Ok(())
 }
 
+/// Branch names / base refs go straight to git argv: keep them to a safe charset, no `..`, and never
+/// option-like (a leading '-' would be parsed as a git flag).
+fn valid_ref(kind: &str, r: &str) -> Result<()> {
+    if r.is_empty() || r.len() > 200 || r.contains("..") || r.starts_with('-') || r.starts_with('/') || r.ends_with('/') || r.ends_with(".lock")
+        || !r.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '/' | '@' | '~' | '^')) {
+        bail!("invalid {kind} '{r}' (use letters, digits, '-', '_', '.', '/'; no '..', no leading '-')");
+    }
+    Ok(())
+}
+
 pub fn path_of(root: &Path, name: &str) -> PathBuf { root.join(DIR).join(name) }
 
 fn ensure_excluded(root: &Path) {
@@ -59,6 +69,8 @@ pub fn create(cwd: &Path, name: &str, branch: Option<&str>, base: Option<&str>) 
     std::fs::create_dir_all(path.parent().unwrap())?;
     ensure_excluded(&root);
     let branch = branch.map(|s| s.to_string()).unwrap_or_else(|| format!("wt/{name}"));
+    valid_ref("branch", &branch)?;
+    if let Some(b) = base { valid_ref("base", b)?; }
     let exists = git(&root, &["rev-parse", "--verify", "--quiet", &format!("refs/heads/{branch}")]).is_ok();
     let p = path.display().to_string();
     if exists {
@@ -146,5 +158,10 @@ mod tests {
         assert!(m.contains("branch wt/feat"), "{m}");
         assert!(list(d.path()).unwrap().is_empty());
         assert!(create(d.path(), "../x", None, None).is_err());
+        assert!(create(d.path(), "ok", Some("--upload-pack=evil"), None).is_err());
+        assert!(create(d.path(), "ok", Some("a b"), None).is_err());
+        assert!(create(d.path(), "ok", Some("x/../y"), None).is_err());
+        assert!(create(d.path(), "ok", None, Some("-x")).is_err());
+        assert!(valid_ref("branch", "feat/x-1.2_y").is_ok());
     }
 }

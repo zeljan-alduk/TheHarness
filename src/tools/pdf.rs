@@ -3,7 +3,7 @@
 //! `python3` (if pymupdf is importable) or `uv run --with pymupdf`; args travel via a JSON temp file.
 
 use super::{arg_str, Tool, ToolCtx, ToolOutput};
-use crate::sandbox;
+use crate::sandbox::{self, shq};
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use serde_json::{json, Value};
@@ -25,13 +25,14 @@ fn script_path() -> Result<PathBuf> {
 
 /// How to run Python with PyMuPDF: plain python3 if the module is installed, else via uv.
 async fn python_cmd(ctx: &ToolCtx) -> Result<&'static str> {
+    static FOUND: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
+    if let Some(p) = FOUND.get() { return Ok(p); }
     async fn probe(ctx: &ToolCtx, cmd: &str) -> bool { sandbox::run_shell(cmd, &ctx.workdir, ctx.timeout, 64).await.map(|o| o.success()).unwrap_or(false) }
-    if probe(ctx, "python3 -c 'import pymupdf' >/dev/null 2>&1").await { return Ok("python3"); }
-    if probe(ctx, "command -v uv >/dev/null 2>&1").await { return Ok("uv run --quiet --with pymupdf python"); }
+    if probe(ctx, "python3 -c 'import pymupdf' >/dev/null 2>&1").await { return Ok(*FOUND.get_or_init(|| "python3")); }
+    if super::archive::has_cmd(ctx, "uv").await { return Ok(*FOUND.get_or_init(|| "uv run --quiet --with pymupdf python")); }
     bail!("pdf_edit needs PyMuPDF: install `uv` (brew install uv; the tool then fetches pymupdf automatically) or `pip install pymupdf`");
 }
 
-fn sh_quote(s: &str) -> String { format!("'{}'", s.replace('\'', "'\\''")) }
 
 #[async_trait]
 impl Tool for PdfEdit {
@@ -84,7 +85,7 @@ impl Tool for PdfEdit {
         let script = script_path()?;
         let args_file = std::env::temp_dir().join(format!("harness-pdf_edit-args-{}-{}.json", std::process::id(), rand_suffix()));
         std::fs::write(&args_file, serde_json::to_vec(&a)?)?;
-        let cmd = format!("{py} {} {}", sh_quote(&script.display().to_string()), sh_quote(&args_file.display().to_string()));
+        let cmd = format!("{py} {} {}", shq(&script.display().to_string()), shq(&args_file.display().to_string()));
         // long timeout for the first uv run (wheel download); output cap generous for the PNG
         let out = sandbox::run_shell(&cmd, &ctx.workdir, ctx.timeout.max(std::time::Duration::from_secs(300)), 12_000_000)
             .await.with_context(|| format!("running pdf_edit {action} on {}", path.display()));
@@ -121,5 +122,5 @@ mod tests {
         assert!(p.exists());
     }
     #[test]
-    fn quoting() { assert_eq!(sh_quote("a'b"), "'a'\\''b'"); }
+    fn quoting() { assert_eq!(shq("a'b"), "'a'\\''b'"); }
 }

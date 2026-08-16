@@ -19,26 +19,40 @@ fn client(ctx: &ToolCtx) -> Result<reqwest::Client> {
 
 async fn get_text(ctx: &ToolCtx, url: &str) -> Result<(String, String)> {
     if !(url.starts_with("http://") || url.starts_with("https://")) { bail!("only http(s) URLs are allowed"); }
-    let resp = client(ctx)?.get(url).send().await.with_context(|| format!("GET {url}"))?;
+    let mut resp = client(ctx)?.get(url).send().await.with_context(|| format!("GET {url}"))?;
     let status = resp.status();
     let ctype = resp.headers().get(reqwest::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
-    let bytes = resp.bytes().await?;
-    let bytes = if bytes.len() > ctx.net.max_fetch_bytes { &bytes[..ctx.net.max_fetch_bytes] } else { &bytes[..] };
-    let body = String::from_utf8_lossy(bytes).to_string();
+    // stream and stop at max_fetch_bytes: never buffer an arbitrarily large body
+    let max = ctx.net.max_fetch_bytes;
+    let mut bytes: Vec<u8> = Vec::new();
+    while let Some(chunk) = resp.chunk().await? {
+        let room = max.saturating_sub(bytes.len());
+        bytes.extend_from_slice(&chunk[..chunk.len().min(room)]);
+        if bytes.len() >= max { break; }
+    }
+    let body = String::from_utf8_lossy(&bytes).to_string();
     if !status.is_success() { bail!("HTTP {status} for {url}\n{}", crate::sandbox::truncate_middle(&body, 500)); }
     Ok((ctype, body))
 }
 
 /// Very small HTML -> text: drop script/style, turn block tags into newlines, strip tags, unescape a few entities.
 pub fn html_to_text(html: &str) -> String {
-    let mut s = html.to_string();
-    for tag in ["script", "style", "noscript", "svg", "head"] {
-        loop {
-            let lower = s.to_ascii_lowercase();
-            let Some(a) = lower.find(&format!("<{tag}")) else { break };
-            let Some(b) = lower[a..].find(&format!("</{tag}>")) else { s.truncate(a); break; };
-            s.replace_range(a..a + b + tag.len() + 3, "\n");
+    // single pass over a lowercased copy (same byte offsets: ASCII lowering keeps char boundaries)
+    let lower = html.to_ascii_lowercase();
+    let mut s = String::with_capacity(html.len());
+    let mut i = 0;
+    'outer: while i < html.len() {
+        if lower[i..].starts_with('<') {
+            for tag in ["script", "style", "noscript", "svg", "head"] {
+                let open = format!("<{tag}");
+                if lower[i..].starts_with(&open) && !lower[i + open.len()..].starts_with(|c: char| c.is_ascii_alphanumeric()) {
+                    let close = format!("</{tag}>");
+                    match lower[i..].find(&close) { Some(b) => { s.push('\n'); i += b + close.len(); continue 'outer; } None => break 'outer }
+                }
+            }
         }
+        let n = html[i..].chars().next().map(char::len_utf8).unwrap_or(1);
+        s.push_str(&html[i..i + n]); i += n;
     }
     let mut out = String::with_capacity(s.len());
     let mut in_tag = false;
@@ -154,8 +168,9 @@ fn urldecode(s: &str) -> String {
     let mut o = Vec::with_capacity(b.len());
     let mut i = 0;
     while i < b.len() {
-        if b[i] == b'%' && i + 2 < b.len() + 0 && i + 2 <= b.len() - 1 {
-            if let Ok(v) = u8::from_str_radix(&s[i + 1..i + 3], 16) { o.push(v); i += 3; continue; }
+        if b[i] == b'%' {
+            // byte-wise: `%` followed by two ASCII hex digits (never slices into a multibyte char)
+            if let Some(v) = b.get(i + 1..i + 3).filter(|h| h.iter().all(u8::is_ascii_hexdigit)).and_then(|h| u8::from_str_radix(std::str::from_utf8(h).ok()?, 16).ok()) { o.push(v); i += 3; continue; }
         }
         if b[i] == b'+' { o.push(b' '); } else { o.push(b[i]); }
         i += 1;
@@ -170,6 +185,19 @@ mod tests {
     fn html_text() {
         let t = html_to_text("<html><head><title>x</title><style>p{}</style></head><body><h1>Hi</h1><p>a &amp; b</p><script>1</script></body></html>");
         assert_eq!(t, "Hi\n\na & b");
+    }
+    #[test]
+    fn html_text_case_and_unclosed() {
+        assert_eq!(html_to_text("<SCRIPT>x</Script><P>ok</p><scripts>keep</scripts>"), "ok\nkeep");
+        assert_eq!(html_to_text("a<style>never closed"), "a");
+        assert_eq!(html_to_text("é<b>ü</b>"), "éü");
+    }
+    #[test]
+    fn urldecode_multibyte_no_panic() {
+        assert_eq!(urldecode("%e2%82%ac%zz€"), "€%zz€");
+        assert_eq!(urldecode("a+b%2"), "a b%2");
+        assert_eq!(urldecode("%C3%A9%"), "é%");
+        assert_eq!(urldecode("%€"), "%€");
     }
     #[test]
     fn ddg_parse() {

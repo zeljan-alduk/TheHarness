@@ -19,11 +19,9 @@ pub async fn start(cmd: &str, cwd: &std::path::Path) -> Result<(u32, PathBuf)> {
     let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let log = log_dir().join(format!("proc-{}-{id}.log", std::process::id()));
     let f = std::fs::File::create(&log)?;
-    let (prog, flag) = crate::sandbox::shell_program();
-    let mut c = tokio::process::Command::new(prog);
-    c.arg(flag).arg(cmd).current_dir(cwd).stdin(std::process::Stdio::null()).stdout(f.try_clone()?).stderr(f).kill_on_drop(true);
-    c.env("PATH", crate::setup::path_with_bin_dir(cwd)).env("HARNESS", "1").env("CI", "1").env("TERM", "dumb");
-    #[cfg(unix)] unsafe { c.pre_exec(|| { libc::setsid(); Ok(()) }); }
+    // same sandbox / env scrub / own session as foreground `bash` (sandbox::run_shell)
+    let mut c = crate::sandbox::build_shell_command(cmd, cwd);
+    c.stdout(f.try_clone()?).stderr(f);
     let child = c.spawn()?;
     let pid = child.id().unwrap_or(0);
     table().lock().unwrap().insert(id, Proc { id, pid, cmd: cmd.to_string(), log: log.clone(), started: Instant::now(), child });
@@ -41,20 +39,28 @@ pub fn list() -> Vec<(u32, u32, String, String, f64, PathBuf)> {
     out
 }
 
+/// Last `lines` lines of the log (reads only the tail of the file).
 pub fn tail(id: u32, lines: usize) -> Result<String> {
     let log = { let t = table().lock().unwrap(); t.get(&id).map(|p| p.log.clone()) };
     let Some(log) = log else { bail!("no background process #{id}") };
-    let text = std::fs::read_to_string(&log).unwrap_or_default();
-    let v: Vec<&str> = text.lines().collect();
-    let start = v.len().saturating_sub(lines);
-    Ok(v[start..].join("\n"))
+    let bytes = std::fs::read(&log).unwrap_or_default();
+    // read only the end of the log: 4 KiB per requested line is plenty, then keep the last `lines`
+    let keep = lines.max(1).saturating_mul(4096).max(64 * 1024);
+    let start = bytes.len().saturating_sub(keep);
+    let text = String::from_utf8_lossy(&bytes[start..]);
+    let mut v: std::collections::VecDeque<&str> = std::collections::VecDeque::with_capacity(lines.min(10_000) + 1);
+    for l in text.lines() { if v.len() >= lines.max(1) { v.pop_front(); } v.push_back(l); }
+    Ok(v.into_iter().collect::<Vec<_>>().join("\n"))
 }
 
 pub async fn kill(id: u32) -> Result<String> {
     let pid = { let t = table().lock().unwrap(); t.get(&id).map(|p| p.pid) };
     let Some(pid) = pid else { bail!("no background process #{id}") };
-    #[cfg(unix)] { unsafe { libc::kill(-(pid as i32), libc::SIGTERM); } tokio::time::sleep(std::time::Duration::from_millis(500)).await; unsafe { libc::kill(-(pid as i32), libc::SIGKILL); } }
-    #[cfg(windows)] { let _ = tokio::process::Command::new("taskkill").args(["/PID", &pid.to_string(), "/T", "/F"]).output().await; }
+    // never kill(0, …) / kill(-0, …): that would signal our own process group
+    if pid > 0 {
+        #[cfg(unix)] { unsafe { libc::kill(-(pid as i32), libc::SIGTERM); } tokio::time::sleep(std::time::Duration::from_millis(500)).await; unsafe { libc::kill(-(pid as i32), libc::SIGKILL); } }
+        #[cfg(windows)] { let _ = tokio::process::Command::new("taskkill").args(["/PID", &pid.to_string(), "/T", "/F"]).output().await; }
+    }
     let mut t = table().lock().unwrap();
     if let Some(p) = t.get_mut(&id) { let _ = p.child.start_kill(); }
     Ok(format!("sent SIGTERM/SIGKILL to process group of #{id} (pid {pid})"))
