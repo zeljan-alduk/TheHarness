@@ -27,7 +27,7 @@ fn pal() -> Pal {
     if LIGHT.load(std::sync::atomic::Ordering::Relaxed) {
         Pal { orange: Color::Rgb(200, 90, 0), dim: Color::Rgb(110, 116, 130), ok: Color::Rgb(20, 140, 80), err: Color::Rgb(200, 40, 40), think: Color::Rgb(110, 70, 220), blue: Color::Rgb(20, 100, 220), pink: Color::Rgb(200, 40, 90), cyan: Color::Rgb(0, 130, 150), fg: Color::Black, panel_bg: Color::Rgb(225, 228, 235) }
     } else {
-        Pal { orange: Color::Rgb(255, 140, 40), dim: Color::Rgb(128, 136, 152), ok: Color::Rgb(76, 195, 138), err: Color::Rgb(255, 107, 107), think: Color::Rgb(167, 139, 250), blue: Color::Rgb(78, 161, 255), pink: Color::Rgb(255, 110, 130), cyan: Color::Rgb(90, 205, 220), fg: pal().fg, panel_bg: pal().panel_bg }
+        Pal { orange: Color::Rgb(255, 140, 40), dim: Color::Rgb(128, 136, 152), ok: Color::Rgb(76, 195, 138), err: Color::Rgb(255, 107, 107), think: Color::Rgb(167, 139, 250), blue: Color::Rgb(78, 161, 255), pink: Color::Rgb(255, 110, 130), cyan: Color::Rgb(90, 205, 220), fg: Color::White, panel_bg: Color::Rgb(38, 44, 56) }
     }
 }
 const SPINNER: [&str; 10] = ["✻", "✼", "✽", "✾", "✿", "❀", "✿", "✾", "✽", "✼"];
