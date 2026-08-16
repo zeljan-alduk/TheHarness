@@ -44,6 +44,42 @@ fn highlight_line(lang: &str, line: &str, state: &mut Option<syntect::easy::High
     }
 }
 
+// ───────────────────────── custom keybindings ─────────────────────────
+/// ~/.config/harness/keybindings.toml — [bindings] action = "ctrl+x" | "alt+enter" | "shift+tab" | "f5" | "esc" …
+/// Actions: interrupt, next_task, toggle_panel, toggle_thinking, expand_tools, paste, cycle_permissions, newline,
+/// quit, scroll_up, scroll_down, clear_line, jump_bottom, complete
+#[derive(Clone, Default)]
+struct Keymap { map: std::collections::HashMap<String, (KeyCode, KeyModifiers)> }
+impl Keymap {
+    fn load() -> Self {
+        let mut m = std::collections::HashMap::new();
+        let defaults = [("interrupt", "esc"), ("next_task", "ctrl+n"), ("toggle_panel", "ctrl+p"), ("toggle_thinking", "ctrl+t"), ("expand_tools", "ctrl+o"), ("paste", "ctrl+v"), ("cycle_permissions", "shift+tab"), ("newline", "ctrl+j"), ("quit", "ctrl+d"), ("scroll_up", "pageup"), ("scroll_down", "pagedown"), ("clear_line", "ctrl+u"), ("jump_bottom", "ctrl+l"), ("complete", "tab")];
+        for (a, k) in defaults { if let Some(v) = parse_key(k) { m.insert(a.to_string(), v); } }
+        let p = harness::setup::config_dir().join("keybindings.toml");
+        if let Ok(t) = std::fs::read_to_string(&p) { if let Ok(v) = t.parse::<toml::Value>() { if let Some(b) = v.get("bindings").and_then(|b| b.as_table()) { for (a, k) in b { if let Some(ks) = k.as_str() { if let Some(v) = parse_key(ks) { m.insert(a.clone(), v); } } } } } }
+        else { let _ = std::fs::create_dir_all(p.parent().unwrap()); let _ = std::fs::write(&p, "# Custom keybindings — action = \"key\". Keys: ctrl+x, alt+x, shift+tab, f1..f12, esc, enter, tab, pageup, pagedown, up, down, home, end\n[bindings]\n# next_task = \"ctrl+n\"\n# toggle_panel = \"ctrl+p\"\n"); }
+        Self { map: m }
+    }
+    fn is(&self, action: &str, code: KeyCode, mods: KeyModifiers) -> bool {
+        match self.map.get(action) { Some((c, m)) => { let norm = |k: KeyCode| match k { KeyCode::Char(ch) => KeyCode::Char(ch.to_ascii_lowercase()), o => o }; norm(*c) == norm(code) && (m.contains(KeyModifiers::CONTROL) == mods.contains(KeyModifiers::CONTROL)) && (m.contains(KeyModifiers::ALT) == mods.contains(KeyModifiers::ALT)) && (!m.contains(KeyModifiers::SHIFT) || mods.contains(KeyModifiers::SHIFT) || matches!(code, KeyCode::BackTab)) } None => false }
+    }
+}
+fn parse_key(s: &str) -> Option<(KeyCode, KeyModifiers)> {
+    let mut mods = KeyModifiers::NONE; let mut key: Option<KeyCode> = None;
+    for part in s.split('+') {
+        match part.trim().to_lowercase().as_str() {
+            "ctrl" | "control" => mods |= KeyModifiers::CONTROL, "alt" | "opt" | "option" | "meta" => mods |= KeyModifiers::ALT, "shift" => mods |= KeyModifiers::SHIFT,
+            "esc" | "escape" => key = Some(KeyCode::Esc), "enter" | "return" => key = Some(KeyCode::Enter), "tab" => key = Some(if mods.contains(KeyModifiers::SHIFT) { KeyCode::BackTab } else { KeyCode::Tab }),
+            "backtab" => key = Some(KeyCode::BackTab), "pageup" | "pgup" => key = Some(KeyCode::PageUp), "pagedown" | "pgdn" => key = Some(KeyCode::PageDown), "up" => key = Some(KeyCode::Up), "down" => key = Some(KeyCode::Down), "left" => key = Some(KeyCode::Left), "right" => key = Some(KeyCode::Right), "home" => key = Some(KeyCode::Home), "end" => key = Some(KeyCode::End), "space" => key = Some(KeyCode::Char(' ')), "backspace" => key = Some(KeyCode::Backspace), "delete" | "del" => key = Some(KeyCode::Delete),
+            f if f.starts_with('f') && f[1..].parse::<u8>().is_ok() => key = Some(KeyCode::F(f[1..].parse().unwrap())),
+            c if c.chars().count() == 1 => key = Some(KeyCode::Char(c.chars().next().unwrap())),
+            _ => return None,
+        }
+    }
+    if matches!(key, Some(KeyCode::Tab)) && mods.contains(KeyModifiers::SHIFT) { key = Some(KeyCode::BackTab); }
+    key.map(|k| (k, mods))
+}
+
 // ───────────────────────── palette (dark / light) ─────────────────────────
 #[derive(Clone, Copy)]
 struct Pal { orange: Color, dim: Color, ok: Color, err: Color, think: Color, blue: Color, pink: Color, cyan: Color, fg: Color, panel_bg: Color }
@@ -341,6 +377,8 @@ struct App {
     think_scroll: usize,
     toolset: Option<Arc<Toolset>>,
     perm_mode: harness::permissions::Mode,
+    vim: bool, vim_normal: bool,
+    keymap: Keymap,
     live_policy: Option<Arc<harness::permissions::Policy>>,
     extra_roots: Vec<PathBuf>,
     /// worktree enter/exit state (shared with the running agent; persists across turns)
@@ -378,7 +416,7 @@ pub async fn run(cfg: Config, resume: Option<String>) -> Result<()> {
         quit: false, tick: 0, word: 0, models: vec![],
         metrics: Metrics::new(0), panel: None, attachments: vec![], tool_previews: Default::default(),
         picker, images: Default::default(), img_seq: 0,
-        think_scroll: 0, toolset: None, perm_mode: harness::permissions::Mode::Auto, live_policy: None, extra_roots: vec![], wt_cwd: harness::worktree::new_cell(), cc: None, cc_last_session: None, compact_progress: None, session_meta: harness::sessions::Meta::default(), todos: Default::default(), inbox: Default::default(), event_log: None, pending_ask: None, pending_q: None, subenv: None, attached: None, video: None, strip_rects: vec![], tr_rect: Rect::default(), panel_rect: Rect::default(), tr_start: 0, line_map: vec![],
+        think_scroll: 0, toolset: None, perm_mode: harness::permissions::Mode::Auto, vim: false, vim_normal: false, keymap: Keymap::load(), live_policy: None, extra_roots: vec![], wt_cwd: harness::worktree::new_cell(), cc: None, cc_last_session: None, compact_progress: None, session_meta: harness::sessions::Meta::default(), todos: Default::default(), inbox: Default::default(), event_log: None, pending_ask: None, pending_q: None, subenv: None, attached: None, video: None, strip_rects: vec![], tr_rect: Rect::default(), panel_rect: Rect::default(), tr_start: 0, line_map: vec![],
     };
     app.metrics.ctx_len = app.cfg.llm.context_budget_tokens.unwrap_or(0);
     app.perm_mode = app.cfg.permissions.mode;
@@ -539,6 +577,48 @@ impl App {
             CEvent::Key(k) if k.kind == KeyEventKind::Press => {
                 let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
                 let alt = k.modifiers.contains(KeyModifiers::ALT);
+                let km = self.keymap.clone();
+                // 1) global actions (custom keybindings) — take precedence over typing
+                if km.is("next_task", k.code, k.modifiers) { self.next_task(); return; }
+                if km.is("toggle_panel", k.code, k.modifiers) { self.panel = Some(!self.panel_visible(200)); return; }
+                if km.is("toggle_thinking", k.code, k.modifiers) { self.show_thinking = !self.show_thinking; return; }
+                if km.is("expand_tools", k.code, k.modifiers) { self.expand_tools = !self.expand_tools; return; }
+                if km.is("paste", k.code, k.modifiers) { let tx = self.tx.clone(); let store = if self.cfg.memory.enabled { harness::memory::MemoryStore::open(&self.cfg.memory).ok() } else { None }; self.set_status("reading clipboard…"); tokio::spawn(async move { let _ = tx.send(Msg::Pasted(clipboard_image(store).await)); }); return; }
+                if km.is("cycle_permissions", k.code, k.modifiers) { use harness::permissions::Mode::*; let m = match self.perm_mode { Auto => Ask, Ask => Plan, Plan => Bypass, Bypass => Auto }; self.set_perm_mode(m); self.set_status(format!("permissions → {}", self.perm_mode.label())); return; }
+                if km.is("newline", k.code, k.modifiers) || (k.code == KeyCode::Enter && alt) { self.insert_str("\n"); return; }
+                if km.is("quit", k.code, k.modifiers) && self.input.is_empty() { self.quit = true; return; }
+                if km.is("scroll_up", k.code, k.modifiers) || (k.code == KeyCode::Up && ctrl) { self.scroll_up += 10; return; }
+                if km.is("scroll_down", k.code, k.modifiers) || (k.code == KeyCode::Down && ctrl) { self.scroll_up = self.scroll_up.saturating_sub(10); return; }
+                if km.is("clear_line", k.code, k.modifiers) { let c = self.cursor; self.input = self.input.chars().skip(c).collect(); self.cursor = 0; return; }
+                if km.is("jump_bottom", k.code, k.modifiers) { self.scroll_up = 0; return; }
+                if km.is("complete", k.code, k.modifiers) { self.complete_slash(); return; }
+                if km.is("interrupt", k.code, k.modifiers) && self.running.is_some() { self.interrupt(); return; }
+                // 2) vim normal mode
+                if self.vim && self.vim_normal {
+                    let n = self.input.chars().count();
+                    match k.code {
+                        KeyCode::Char('i') => self.vim_normal = false,
+                        KeyCode::Char('a') => { self.cursor = (self.cursor + 1).min(n); self.vim_normal = false; }
+                        KeyCode::Char('A') => { self.cursor = n; self.vim_normal = false; }
+                        KeyCode::Char('I') => { self.cursor = 0; self.vim_normal = false; }
+                        KeyCode::Char('h') | KeyCode::Left => self.cursor = self.cursor.saturating_sub(1),
+                        KeyCode::Char('l') | KeyCode::Right => self.cursor = (self.cursor + 1).min(n),
+                        KeyCode::Char('0') | KeyCode::Home => self.cursor = self.line_start(),
+                        KeyCode::Char('$') | KeyCode::End => self.cursor = self.line_end(),
+                        KeyCode::Char('w') => { let cs: Vec<char> = self.input.chars().collect(); let mut i = self.cursor; while i < cs.len() && !cs[i].is_whitespace() { i += 1; } while i < cs.len() && cs[i].is_whitespace() { i += 1; } self.cursor = i; }
+                        KeyCode::Char('b') => { let cs: Vec<char> = self.input.chars().collect(); let mut i = self.cursor; while i > 0 && cs[i - 1].is_whitespace() { i -= 1; } while i > 0 && !cs[i - 1].is_whitespace() { i -= 1; } self.cursor = i; }
+                        KeyCode::Char('x') => { let mut cs: Vec<char> = self.input.chars().collect(); if self.cursor < cs.len() { cs.remove(self.cursor); self.input = cs.into_iter().collect(); } }
+                        KeyCode::Char('d') => { self.input.clear(); self.cursor = 0; } // dd (single d clears the line — simplification)
+                        KeyCode::Char('u') => { if let Some(prev) = self.history.last() { self.input = prev.clone(); self.cursor = self.input.chars().count(); } }
+                        KeyCode::Enter => self.submit(),
+                        KeyCode::Char('j') | KeyCode::Down => self.history_next(),
+                        KeyCode::Char('k') | KeyCode::Up => self.history_prev(),
+                        KeyCode::Char(':') => { self.insert_str("/"); self.vim_normal = false; }
+                        KeyCode::Esc => { if self.running.is_some() { self.interrupt(); } }
+                        _ => {}
+                    }
+                    return;
+                }
                 match (k.code, ctrl, alt) {
                     (KeyCode::Char('c'), true, _) => {
                         if self.running.is_some() { self.interrupt(); }
@@ -546,29 +626,16 @@ impl App {
                         else if self.last_ctrl_c.map(|t| t.elapsed() < Duration::from_millis(1500)).unwrap_or(false) { self.quit = true; }
                         else { self.last_ctrl_c = Some(Instant::now()); self.set_status("Press ctrl+c again to exit"); }
                     }
-                    (KeyCode::Char('d'), true, _) if self.input.is_empty() => self.quit = true,
-                    (KeyCode::Esc, _, _) => { if self.running.is_some() { self.interrupt(); } else if !self.input.is_empty() { self.input.clear(); self.cursor = 0; } }
-                    (KeyCode::Enter, _, true) | (KeyCode::Char('j'), true, _) => self.insert_str("\n"),
+                    (KeyCode::Esc, _, _) => { if self.running.is_some() { self.interrupt(); } else if self.vim { self.vim_normal = true; } else if !self.input.is_empty() { self.input.clear(); self.cursor = 0; } }
                     (KeyCode::Enter, _, _) => self.submit(),
-                    (KeyCode::Char('o'), true, _) => { self.expand_tools = !self.expand_tools; }
-                    (KeyCode::Char('t'), true, _) => { self.show_thinking = !self.show_thinking; }
-                    (KeyCode::Char('l'), true, _) => { self.scroll_up = 0; }
-                    (KeyCode::Char('p'), true, _) => { self.panel = Some(!self.panel_visible(200)); }
-                    (KeyCode::Char('n'), true, _) => self.next_task(),
-                    (KeyCode::Char('v'), true, _) => { let tx = self.tx.clone(); let store = if self.cfg.memory.enabled { harness::memory::MemoryStore::open(&self.cfg.memory).ok() } else { None }; self.set_status("reading clipboard…"); tokio::spawn(async move { let _ = tx.send(Msg::Pasted(clipboard_image(store).await)); }); }
-                    (KeyCode::Char('u'), true, _) => { let c = self.cursor; self.input = self.input.chars().skip(c).collect(); self.cursor = 0; }
                     (KeyCode::Char('a'), true, _) | (KeyCode::Home, _, _) => self.cursor = self.line_start(),
                     (KeyCode::Char('e'), true, _) | (KeyCode::End, _, _) => self.cursor = self.line_end(),
                     (KeyCode::Backspace, _, _) => { if self.cursor > 0 { let mut cs: Vec<char> = self.input.chars().collect(); cs.remove(self.cursor - 1); self.input = cs.into_iter().collect(); self.cursor -= 1; } }
                     (KeyCode::Delete, _, _) => { let mut cs: Vec<char> = self.input.chars().collect(); if self.cursor < cs.len() { cs.remove(self.cursor); self.input = cs.into_iter().collect(); } }
                     (KeyCode::Left, _, _) => { self.cursor = self.cursor.saturating_sub(1); }
                     (KeyCode::Right, _, _) => { self.cursor = (self.cursor + 1).min(self.input.chars().count()); }
-                    (KeyCode::Up, true, _) | (KeyCode::PageUp, _, _) => { self.scroll_up += 10; }
-                    (KeyCode::Down, true, _) | (KeyCode::PageDown, _, _) => { self.scroll_up = self.scroll_up.saturating_sub(10); }
                     (KeyCode::Up, _, _) => { if !self.input.contains('\n') { self.history_prev(); } }
                     (KeyCode::Down, _, _) => { if !self.input.contains('\n') { self.history_next(); } }
-                    (KeyCode::BackTab, _, _) => { use harness::permissions::Mode::*; let m = match self.perm_mode { Auto => Ask, Ask => Plan, Plan => Bypass, Bypass => Auto }; self.set_perm_mode(m); self.set_status(format!("permissions → {}", self.perm_mode.label())); }
-                    (KeyCode::Tab, _, _) => { self.complete_slash(); }
                     (KeyCode::Char(c), false, false) => { self.insert_str(&c.to_string()); }
                     _ => {}
                 }
@@ -834,6 +901,7 @@ impl App {
                 else { self.blocks.push(Block::Error("usage: /permissions [bypass|auto|ask|plan] · add <rule> [project] · remove <rule>".into())); }
             }
             "/trust" => { harness::permissions::trust(&self.workdir); self.blocks.push(Block::System(format!("{} is now a trusted directory", short_path(&self.workdir)))); }
+            "/vim" => { self.vim = !self.vim; self.vim_normal = false; self.blocks.push(Block::System(format!("vim mode {} — esc → NORMAL (h/l/w/b/0/$ move, x delete, d clear, i/a/A/I insert, j/k history, : starts a /command, enter sends)", if self.vim { "on" } else { "off" }))); }
             "/theme" => { let light = match arg.as_str() { "light" => true, "dark" => false, _ => !LIGHT.load(std::sync::atomic::Ordering::Relaxed) }; LIGHT.store(light, std::sync::atomic::Ordering::Relaxed); self.blocks.push(Block::System(format!("theme → {}", if light { "light" } else { "dark" }))); }
             "/plan" => { let m = if self.perm_mode == harness::permissions::Mode::Plan { harness::permissions::Mode::Auto } else { harness::permissions::Mode::Plan }; self.set_perm_mode(m); self.blocks.push(Block::System(format!("permissions → {}", self.perm_mode.label()))); }
             "/context" | "/ctx" => {
@@ -1535,6 +1603,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ("/plan", "toggle plan mode (read-only)"),
     ("/trust", "remember this directory as trusted (no first-time notice)"),
     ("/theme", "switch theme: /theme light|dark"),
+    ("/vim", "toggle vim-style modal editing in the prompt"),
     ("/workflow", "run a workflow: /workflow <name> [args]  (list with /workflow)"),
     ("/queue", "show queued tasks (/queue clear)"),
     ("/next", "stop the current task and start the next queued one (ctrl+n)"),
@@ -1670,6 +1739,7 @@ fn draw(f: &mut Frame, app: &mut App) {
     if !app.net { st.push(dot()); st.push(Span::styled("offline", Style::default().fg(pal().pink))); }
     if !app.queued.is_empty() { st.push(dot()); st.push(Span::styled(format!("{} queued", app.queued.len()), Style::default().fg(pal().cyan))); }
     if let Some(id) = app.attached { st.push(dot()); st.push(Span::styled(format!("attached #{id}"), Style::default().fg(pal().orange))); }
+    if app.vim { st.push(dot()); st.push(Span::styled(if app.vim_normal { "-- NORMAL --" } else { "-- INSERT --" }, Style::default().fg(if app.vim_normal { pal().orange } else { pal().ok }).bold())); }
     if let Some(wt) = app.wt_cwd.lock().unwrap().as_ref() { st.push(dot()); st.push(Span::styled(format!("worktree {}", wt.name), Style::default().fg(pal().orange))); }
     let lw: usize = st.iter().map(|s| s.content.chars().count()).sum();
     let right = if app.running.is_none() { "? for shortcuts · /help" } else { "esc to interrupt" };
