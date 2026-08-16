@@ -91,7 +91,8 @@ impl Config {
         let mut candidates: Vec<PathBuf> = Vec::new();
         if let Some(p) = explicit { candidates.push(p.to_path_buf()); }
         candidates.push(PathBuf::from("harness.toml"));
-        if let Ok(exe) = std::env::current_exe() {
+        let exe = std::env::var_os("HARNESS_ORIG_EXE").map(PathBuf::from).or_else(|| std::env::current_exe().ok());
+        if let Some(exe) = exe {
             if let Some(dir) = exe.parent() { candidates.push(dir.join("harness.toml")); }
             // cargo run: target/{debug,release}/harness -> project root
             if let Some(root) = exe.ancestors().nth(3) { candidates.push(root.join("harness.toml")); }

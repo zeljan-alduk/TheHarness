@@ -2,6 +2,7 @@ use harness::{agent, config, eval, events, llm, sandbox, tools};
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
+use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -93,6 +94,7 @@ async fn main() -> Result<()> {
             if report.passed < report.total { std::process::exit(1); }
         }
         Cmd::SelfImprove { branch, task } => {
+            reexec_from_temp_copy()?;
             let repo = repo_root()?;
             let branch = branch.unwrap_or_else(|| format!("proposal/{}", slug(&task)));
             let o = sandbox::run_shell("git rev-parse --is-inside-work-tree && git status --porcelain", &repo, Duration::from_secs(10), 4000).await?;
@@ -130,10 +132,26 @@ async fn run_agent(cfg: &config::Config, client: &llm::Client, workdir: &std::pa
     a.run(&system, task).await
 }
 
+/// `self` mode rebuilds the harness while it runs. Never run from the binary being edited:
+/// copy ourselves to a temp path and exec that copy (once).
+fn reexec_from_temp_copy() -> Result<()> {
+    if std::env::var_os("HARNESS_SELF_EXEC").is_some() { return Ok(()); }
+    let exe = std::env::current_exe()?;
+    let tmp = std::env::temp_dir().join(format!("harness-self-{}", std::process::id()));
+    std::fs::copy(&exe, &tmp).context("copying harness binary to temp")?;
+    let err = std::process::Command::new(&tmp)
+        .args(std::env::args_os().skip(1))
+        .env("HARNESS_SELF_EXEC", "1")
+        .env("HARNESS_ORIG_EXE", &exe)
+        .exec();
+    bail!("failed to re-exec {}: {err}", tmp.display())
+}
+
 fn repo_root() -> Result<PathBuf> {
     // The harness's own repo: the directory containing Cargo.toml, found from cwd or the exe.
     let mut cands = vec![std::env::current_dir()?];
-    if let Ok(exe) = std::env::current_exe() { if let Some(r) = exe.ancestors().nth(3) { cands.push(r.to_path_buf()); } }
+    let exe = std::env::var_os("HARNESS_ORIG_EXE").map(PathBuf::from).or_else(|| std::env::current_exe().ok());
+    if let Some(exe) = exe { if let Some(r) = exe.ancestors().nth(3) { cands.push(r.to_path_buf()); } }
     for c in cands { if c.join("Cargo.toml").is_file() && c.join("harness.toml").is_file() { return Ok(c.canonicalize()?); } }
     bail!("could not locate the harness repo (Cargo.toml + harness.toml); run from the repo root")
 }
