@@ -40,6 +40,10 @@ pub struct ToolCtx {
 }
 
 impl ToolCtx {
+    /// A context with defaults (no memory/sub-agents/hooks) — tests, `harness tool`, sub-processes.
+    pub fn basic(workdir: PathBuf) -> Self {
+        Self { workdir, timeout: Duration::from_secs(120), max_output: 16000, net: crate::config::NetConfig::default(), memory: None, subagent: None, redact_secrets: true, hooks: Default::default(), todos: Default::default(), lsp_servers: Default::default() }
+    }
     /// Resolve a model-supplied path against workdir and refuse escapes.
     /// Symlinks are resolved on the deepest existing ancestor.
     pub fn resolve(&self, p: &str) -> Result<PathBuf> {
@@ -198,7 +202,7 @@ mod tests {
     fn ctx() -> ToolCtx {
         let d = std::env::temp_dir().join(format!("harness-test-{}", std::process::id()));
         std::fs::create_dir_all(&d).unwrap();
-        ToolCtx { workdir: d, timeout: Duration::from_secs(5), max_output: 1000, net: crate::config::NetConfig::default(), memory: None, subagent: None, redact_secrets: true, hooks: Default::default(), todos: Default::default(), lsp_servers: Default::default() }
+        ToolCtx { timeout: Duration::from_secs(5), max_output: 1000, ..ToolCtx::basic(d) }
     }
     #[test]
     fn resolve_rejects_escape() {
