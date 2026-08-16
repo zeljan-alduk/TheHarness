@@ -1,0 +1,5 @@
+name = "py_dataclass_refactor"
+tags = ["python", "refactor", "medium"]
+prompt = "inventory.py represents items as plain dicts. Refactor it to use a `@dataclass` named `Item` (fields: name: str, qty: int, price: float) with a method `total()` returning qty*price, and update `inventory_total(items)` to accept Item objects. Update the tests in tests/test_inventory.py to construct Item objects. `python3 -m unittest -q` must pass."
+check = "python3 -m unittest -q 2>&1 | grep -q '^OK' && grep -q '@dataclass' inventory.py && grep -q 'class Item' inventory.py && grep -q 'def total' inventory.py"
+max_turns = 15

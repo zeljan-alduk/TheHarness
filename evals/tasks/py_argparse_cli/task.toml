@@ -1,0 +1,5 @@
+name = "py_argparse_cli"
+tags = ["python", "cli", "greenfield", "easy"]
+prompt = "Write tool.py, a CLI using argparse with a `greet` subcommand: `python3 tool.py greet --name Bob --times 2` prints `Hello, Bob!` on two lines; `--upper` prints it upper-cased; `--times` defaults to 1. Exit code 0. Test it."
+check = "test \"$(python3 tool.py greet --name Bob --times 2 | tr '\\n' '|')\" = 'Hello, Bob!|Hello, Bob!|' && test \"$(python3 tool.py greet --name Ann --upper)\" = 'HELLO, ANN!'"
+max_turns = 12

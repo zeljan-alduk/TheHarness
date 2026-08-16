@@ -1,0 +1,5 @@
+name = "rs_stats_module"
+tags = ["rust", "feature", "multi-file", "medium"]
+prompt = "In this Rust binary crate add a module `stats` (src/stats.rs) with `pub fn mean(v: &[f64]) -> Option<f64>` and `pub fn median(v: &[f64]) -> Option<f64>` (None for empty input; median of an even count is the average of the two middle values). Make main parse its arguments as f64 and print `mean=<m> median=<md>` with 2 decimals, e.g. `cargo run -q -- 1 2 3 4` prints `mean=2.50 median=2.50`. Add unit tests for both functions in stats.rs and make `cargo test` pass."
+check = "test \"$(cargo run -q -- 1 2 3 4 2>/dev/null)\" = 'mean=2.50 median=2.50' && test \"$(cargo run -q -- 5 1 3 2>/dev/null)\" = 'mean=3.00 median=3.00' && cargo test 2>&1 | grep -q 'test result: ok' && grep -q 'fn median' src/stats.rs"
+max_turns = 20

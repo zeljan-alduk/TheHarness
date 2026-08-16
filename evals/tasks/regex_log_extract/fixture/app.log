@@ -1,0 +1,4 @@
+2026-01-01 login ok user=Alice@example.com
+2026-01-01 login fail user=bob@test.org ip=1.2.3.4
+2026-01-02 mail sent to carol@example.com and alice@example.com
+2026-01-02 nothing here

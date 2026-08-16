@@ -1,0 +1,5 @@
+name = "regex_log_extract"
+tags = ["python", "text", "easy"]
+prompt = "Write extract.py that reads app.log and prints every distinct email address found in it, one per line, sorted alphabetically (case-insensitive match, print lower-cased). Run it."
+check = "test \"$(python3 extract.py | tr '\\n' '|')\" = 'alice@example.com|bob@test.org|carol@example.com|'"
+max_turns = 10

@@ -1,0 +1,5 @@
+name = "js_async_bug"
+tags = ["javascript", "debug", "async", "medium"]
+prompt = "`node total.js` should print `total: 60` but prints something else. Find and fix the bug(s) in total.js (keep the simulated async delays; do not hardcode the answer)."
+check = "test \"$(node total.js)\" = 'total: 60' && ! grep -q '60' total.js"
+max_turns = 12

@@ -1,0 +1,5 @@
+name = "make_target"
+tags = ["c", "build", "easy"]
+prompt = "This directory has hello.c and a Makefile with a `build` target. Add a `test` target that builds (depending on build) and runs the program, and make the program print `hello 42` (currently prints `hello 0`) by fixing main. `make -s test` must print exactly `hello 42`."
+check = "test \"$(make -s test 2>/dev/null | tail -1)\" = 'hello 42'"
+max_turns = 12
