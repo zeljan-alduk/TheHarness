@@ -12,6 +12,9 @@ pub struct Meta {
     pub title: String,
     pub workdir: String,
     pub model: String,
+    /// Backend at save time ("claude-code" | "anthropic" | "" = local/OpenAI-compatible) and Claude effort — restored on resume/restart.
+    #[serde(default)] pub provider: Option<String>,
+    #[serde(default)] pub effort: Option<String>,
     pub created: u64,
     pub updated: u64,
     #[serde(default)] pub turns: usize,

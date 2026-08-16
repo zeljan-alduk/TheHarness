@@ -94,7 +94,7 @@ fn pal() -> Pal {
 const SPINNER: [&str; 10] = ["✻", "✼", "✽", "✾", "✿", "❀", "✿", "✾", "✽", "✼"];
 const WORDS: [&str; 12] = ["Thinking", "Pondering", "Working", "Reasoning", "Cooking", "Tinkering", "Brewing", "Mulling", "Crunching", "Percolating", "Noodling", "Computing"];
 
-enum Msg { Title(String), Question(harness::permissions::Question, tokio::sync::oneshot::Sender<harness::permissions::Answer>), SubEnv(Arc<harness::agent::SubAgentEnv>), Policy(Arc<harness::permissions::Policy>), CcSession(Arc<harness::claude_code::ClaudeCodeSession>), CcSid(String), Block(Block), Ask(harness::permissions::ApprovalRequest, tokio::sync::oneshot::Sender<harness::permissions::Approval>), Ev(Event), Done(Result<(String, harness::agent::RunStats), String>), Sys(SysSample), CtxLen(u64), Pasted(Result<PathBuf, String>), Frames(Result<(PathBuf, f64, Vec<(f64, PathBuf)>), String>), Toolset(Arc<Toolset>), Catalog(Result<harness::plugins::Catalog, String>), Notice(String) }
+enum Msg { Title(String), Question(harness::permissions::Question, tokio::sync::oneshot::Sender<harness::permissions::Answer>), SubEnv(Arc<harness::agent::SubAgentEnv>), Policy(Arc<harness::permissions::Policy>), CcSession(Arc<harness::claude_code::ClaudeCodeSession>), CcSid(String), Block(Block), Ask(harness::permissions::ApprovalRequest, tokio::sync::oneshot::Sender<harness::permissions::Approval>), Ev(Event), Done(Result<(String, harness::agent::RunStats), String>), Sys(SysSample), CtxLen(u64), Pasted(Result<PathBuf, String>), Frames(Result<(PathBuf, f64, Vec<(f64, PathBuf)>), String>), Toolset(Arc<Toolset>), Catalog(Result<harness::plugins::Catalog, String>), Notice(String), Improve(harness::selfimprove::Stage) }
 
 /// Video scrubber state (modal over the transcript).
 struct VideoPicker { path: PathBuf, duration: f64, frames: Vec<(f64, PathBuf, String)>, cur: usize, selected: std::collections::BTreeSet<usize>, loading: bool, error: Option<String> }
@@ -366,6 +366,11 @@ struct App {
     quit: bool,
     /// /restart: after quitting, exec the (possibly rebuilt) harness binary with `--resume <this session>`
     restart: bool,
+    /// /improve: background self-improvement job + its cancel flag
+    improve: Option<tokio::task::JoinHandle<()>>,
+    improve_cancel: Arc<std::sync::atomic::AtomicBool>,
+    /// Automatic restart scheduled after an improvement was installed (esc or /cancel aborts it)
+    restart_at: Option<Instant>,
     tick: u64,
     word: usize,
     models: Vec<String>,
@@ -416,7 +421,7 @@ pub async fn run(cfg: Config, resume: Option<String>) -> Result<()> {
         scroll_up: 0, running: None, run_started: Instant::now(), queued: vec![], expand_tools: false, show_thinking: false,
         session: Arc::new(tokio::sync::Mutex::new(Vec::new())), tx: tx.clone(),
         total_prompt: 0, total_completion: 0, last_prompt_tokens: 0, turn_tokens: 0, last_ctrl_c: None, status_msg: None,
-        quit: false, restart: false, tick: 0, word: 0, models: vec![],
+        quit: false, restart: false, improve: None, improve_cancel: Default::default(), restart_at: None, tick: 0, word: 0, models: vec![],
         metrics: Metrics::new(0), panel: None, attachments: vec![], tool_previews: Default::default(),
         picker, images: Default::default(), img_seq: 0,
         think_scroll: 0, toolset: None, perm_mode: harness::permissions::Mode::Auto, vim: false, vim_normal: false, keymap: Keymap::load(), live_policy: None, cc_rate: None, extra_roots: vec![], wt_cwd: harness::worktree::new_cell(), cc: None, cc_last_session: None, compact_progress: None, session_meta: harness::sessions::Meta::default(), todos: Default::default(), inbox: Default::default(), event_log: None, pending_ask: None, pending_q: None, subenv: None, attached: None, video: None, strip_rects: vec![], tr_rect: Rect::default(), panel_rect: Rect::default(), tr_start: 0, line_map: vec![],
@@ -428,6 +433,11 @@ pub async fn run(cfg: Config, resume: Option<String>) -> Result<()> {
     app.banner();
     if let Ok(p) = harness::plugins::Plugins::open() { let st = p.stale(7); if !st.is_empty() { app.blocks.push(Block::System(format!("plugins not updated for 7+ days: {} — /plugin update all", st.join(", ")))); } }
     if !harness::permissions::is_trusted(&app.workdir) && app.perm_mode != harness::permissions::Mode::Plan { app.blocks.push(Block::System(format!("first time in {} — tools run here in '{}' mode. /trust remembers this directory; /plan for read-only.", short_path(&app.workdir), app.perm_mode.label()))); }
+    // after /restart (or an automatic restart following /improve): restore the previously picked backend/model/effort
+    if let Ok(m) = std::env::var("HARNESS_RESTORE_MODEL") { if !m.is_empty() { app.model = m.clone(); app.cfg.llm.model = m; } }
+    if let Ok(p) = std::env::var("HARNESS_RESTORE_PROVIDER") { app.cfg.llm.provider = if p.is_empty() { None } else { Some(p) }; }
+    if let Ok(e) = std::env::var("HARNESS_RESTORE_EFFORT") { if !e.is_empty() { app.cfg.llm.effort = Some(e); } }
+    for k in ["HARNESS_RESTORE_MODEL", "HARNESS_RESTORE_PROVIDER", "HARNESS_RESTORE_EFFORT"] { std::env::remove_var(k); }
     if let Some(r) = resume { app.resume_session(&r); }
     { let h = app.cfg.hooks.clone(); let wd = app.workdir.clone(); if !h.session_start.is_empty() { let tx = app.tx.clone(); tokio::spawn(async move { for o in harness::hooks::run_event(&h, "session_start", "", serde_json::json!({}), &wd).await { let _ = tx.send(Msg::Notice(format!("session_start hook: {}", o.trim()))); } }); } }
     app.reload_toolset();
@@ -456,6 +466,7 @@ pub async fn run(cfg: Config, resume: Option<String>) -> Result<()> {
                     if app.tick % 25 == 0 && !app.session_meta.id.is_empty() { for m in harness::mailbox::take(&app.session_meta.id) { app.blocks.push(Block::System(format!("✉ message from session {}: {}", m.from, truncate(&m.text, 200)))); app.inbox.push(format!("message from session {}", m.from), m.text); } }
                     // wakeups: inbox events (monitor lines, scheduled prompts, messages) start a turn when idle
                     if app.running.is_none() && app.pending_ask.is_none() && app.pending_q.is_none() && !app.inbox.is_empty() && app.tick % 12 == 0 { if let Some(m) = app.inbox.take_message() { app.set_status("inbox event → waking the agent"); app.start_run(m); } }
+                    if let Some(at) = app.restart_at { if Instant::now() >= at { if app.running.is_none() && app.pending_ask.is_none() && app.pending_q.is_none() { app.restart_at = None; app.blocks.push(Block::System("↻ restarting into the improved harness — resuming this session".into())); app.restart = true; app.quit = true; } } }
                     let cap = app.cfg.agent.max_task_secs;
                     if cap > 0 && app.running.is_some() && app.run_started.elapsed().as_secs() > cap { app.blocks.push(Block::Error(format!("task exceeded max_task_secs ({cap}s) — stopping and moving on"))); app.next_task(); }
                 }
@@ -485,6 +496,7 @@ async fn restart_process(app: &mut App) -> Result<()> {
         if app.session_meta.id.is_empty() { app.session_meta.id = harness::sessions::SessionStore::new_id(); }
         app.session_meta.workdir = app.workdir.display().to_string();
         app.session_meta.model = app.model.clone();
+        app.session_meta.provider = app.cfg.llm.provider.clone(); app.session_meta.effort = app.cfg.llm.effort.clone();
         let store = harness::sessions::SessionStore::open()?;
         store.save(&mut app.session_meta, &msgs)?;
         resume = Some(app.session_meta.id.clone());
@@ -502,7 +514,9 @@ async fn restart_process(app: &mut App) -> Result<()> {
     if let Some(id) = &resume { args.push("--resume".into()); args.push(id.into()); }
     eprintln!("· restarting {} {}", exe.display(), args.iter().map(|a| a.to_string_lossy().to_string()).collect::<Vec<_>>().join(" "));
     let mut cmd = std::process::Command::new(&exe);
-    cmd.args(&args).env_remove("HARNESS_SELF_EXEC").current_dir(&app.workdir);
+    // the picked backend/model/effort survive the restart even when the session was too short to be saved
+    cmd.args(&args).env_remove("HARNESS_SELF_EXEC").current_dir(&app.workdir)
+        .env("HARNESS_RESTORE_MODEL", &app.model).env("HARNESS_RESTORE_PROVIDER", app.cfg.llm.provider.clone().unwrap_or_default()).env("HARNESS_RESTORE_EFFORT", app.cfg.llm.effort.clone().unwrap_or_default());
     #[cfg(unix)] { use std::os::unix::process::CommandExt; let err = cmd.exec(); anyhow::bail!("failed to re-exec {}: {err}", exe.display()) }
     #[cfg(not(unix))] { let st = cmd.status().with_context(|| format!("failed to run {}", exe.display()))?; std::process::exit(st.code().unwrap_or(1)); }
 }
@@ -655,7 +669,7 @@ impl App {
                         KeyCode::Char('j') | KeyCode::Down => self.history_next(),
                         KeyCode::Char('k') | KeyCode::Up => self.history_prev(),
                         KeyCode::Char(':') => { self.insert_str("/"); self.vim_normal = false; }
-                        KeyCode::Esc => { if self.running.is_some() { self.interrupt(); } }
+                        KeyCode::Esc => { if self.restart_at.is_some() { self.cancel_restart(); } else if self.running.is_some() { self.interrupt(); } }
                         _ => {}
                     }
                     return;
@@ -667,7 +681,7 @@ impl App {
                         else if self.last_ctrl_c.map(|t| t.elapsed() < Duration::from_millis(1500)).unwrap_or(false) { self.quit = true; }
                         else { self.last_ctrl_c = Some(Instant::now()); self.set_status("Press ctrl+c again to exit"); }
                     }
-                    (KeyCode::Esc, _, _) => { if self.running.is_some() { self.interrupt(); } else if self.vim { self.vim_normal = true; } else if !self.input.is_empty() { self.input.clear(); self.cursor = 0; } }
+                    (KeyCode::Esc, _, _) => { if self.restart_at.is_some() { self.cancel_restart(); } else if self.running.is_some() { self.interrupt(); } else if self.vim { self.vim_normal = true; } else if !self.input.is_empty() { self.input.clear(); self.cursor = 0; } }
                     (KeyCode::Enter, _, _) => self.submit(),
                     (KeyCode::Char('a'), true, _) | (KeyCode::Home, _, _) => self.cursor = self.line_start(),
                     (KeyCode::Char('e'), true, _) | (KeyCode::End, _, _) => self.cursor = self.line_end(),
@@ -1198,6 +1212,12 @@ impl App {
                 if self.running.is_some() { self.set_status("finish or interrupt the current task first (esc)"); }
                 else { self.restart = true; self.quit = true; }
             }
+            "/improve" => self.start_improve(arg.clone()),
+            "/cancel" => {
+                if self.restart_at.is_some() { self.cancel_restart(); }
+                else if let Some(h) = self.improve.take() { self.improve_cancel.store(true, std::sync::atomic::Ordering::Relaxed); h.abort(); self.blocks.push(Block::System("⚙ self-improvement cancelled (branches/worktrees under $TMPDIR/harness-proposals are kept)".into())); }
+                else { self.set_status("nothing to cancel"); }
+            }
             _ => {
                 let name = cmd.trim_start_matches('/');
                 let found = harness::plugins::Plugins::open().ok().and_then(|p| p.commands().into_iter().find(|c| c.name == name));
@@ -1415,11 +1435,64 @@ impl App {
         else { self.set_status("no queued task"); }
     }
 
+    // ───────────────────────── /improve (smart self-improvement) ─────────────────────────
+    fn start_improve(&mut self, hint: String) {
+        if self.improve.as_ref().map(|h| !h.is_finished()).unwrap_or(false) { self.set_status("an /improve job is already running — /cancel to stop it"); return; }
+        if self.running.is_some() { self.set_status("finish or interrupt the current task first (esc)"); return; }
+        let mut cfg = self.cfg.clone(); cfg.llm.model = self.model.clone(); cfg.permissions.mode = self.perm_mode;
+        let smart = harness::selfimprove::is_smart(&cfg);
+        let repo = match harness::selfimprove::locate_repo(&cfg) { Ok(r) => r, Err(e) => { self.blocks.push(Block::Error(format!("/improve: {e:#}"))); return; } };
+        self.blocks.push(Block::Banner(vec![
+            format!("⚙ self-improvement · source {} · backend {}{}", short_path(&repo), self.model, if self.cfg.llm.provider.as_deref() == Some("claude-code") { format!(" (effort {})", self.cfg.llm.effort.clone().unwrap_or("medium".into())) } else { String::new() }),
+            if smart { "  gate 1: frontier backend → the plan is implemented automatically; you will be informed of what is planned".into() } else { "  gate 1: you will be asked to confirm the plan before anything is implemented".into() },
+            format!("  then: proposal/* branch per item → arbiter ({} eval run/side{}) → merge → install → restart with {}s to cancel", cfg.selfimprove.arbiter_runs, if cfg.selfimprove.skip_arbiter { ", SKIPPED" } else { "" }, cfg.selfimprove.restart_grace_secs),
+            if hint.is_empty() { "  focus: agent's choice (README roadmap, docs/GAPS.md, TODO.md, BRAIN lessons) · /cancel stops the job".into() } else { format!("  focus: {hint} · /cancel stops the job") },
+        ]));
+        if let Ok(exe) = harness::selfimprove::installed_exe() { if exe.starts_with(repo.join("target")) { self.blocks.push(Block::System("⚙ note: this harness runs from the repo's target/ dir, which the arbiter rebuilds — prefer the installed binary (cargo install --path .) for /improve".into())); } }
+        let tx = self.tx.clone();
+        let sink: Arc<dyn Sink> = Arc::new(harness::agent::PrefixSink { inner: Arc::new(TuiSink(tx.clone())), prefix: "⚙ ".into(), info: None });
+        let approver: Arc<dyn harness::permissions::Approver> = Arc::new(TuiApprover(tx.clone()));
+        let tx2 = tx.clone();
+        let report: Arc<dyn Fn(harness::selfimprove::Stage) + Send + Sync> = Arc::new(move |s| { let _ = tx2.send(Msg::Improve(s)); });
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false)); self.improve_cancel = cancel.clone();
+        let job = harness::selfimprove::Job { cfg, hint, sink, approver, report, cancel, assume_yes: false, no_install: false };
+        let tx3 = tx.clone();
+        self.improve = Some(tokio::spawn(async move {
+            if let Err(e) = harness::selfimprove::run(job).await { let _ = tx3.send(Msg::Improve(harness::selfimprove::Stage::Failed(format!("{e:#}")))); }
+        }));
+    }
+    fn on_improve(&mut self, st: harness::selfimprove::Stage) {
+        use harness::selfimprove::Stage::*;
+        match st {
+            Log(l) => self.blocks.push(Block::System(format!("⚙ {l}"))),
+            Plan { items, auto } => {
+                let mut lines = vec![if auto { format!("⚙ improvements planned ({}) — will be implemented automatically (frontier backend); /cancel to stop", items.len()) } else { format!("⚙ improvements proposed ({}) — confirm below", items.len()) }];
+                for (i, p) in items.iter().enumerate() { lines.push(format!("  {}. {} — {}", i + 1, p.title, p.rationale)); if !p.files.is_empty() { lines.push(format!("     files: {}", p.files.join(", "))); } }
+                self.blocks.push(Block::Banner(lines));
+                if auto && self.cfg.ui.notify { desktop_notify("Harness: improvements planned", &format!("{} improvement(s) will be implemented automatically", items.len())); }
+            }
+            Approved(v) => self.blocks.push(Block::System(format!("⚙ implementing {} item(s): {}", v.len(), v.iter().map(|p| p.title.clone()).collect::<Vec<_>>().join(" · ")))),
+            Item { title, branch, merged, note } => self.blocks.push(if merged { Block::System(format!("⚙ ✓ {title} [{branch}] — {note}")) } else { Block::Error(format!("⚙ ✗ {title} [{branch}] — {note}")) }),
+            Installed { summary, exe, grace_secs } => {
+                self.blocks.push(Block::Banner(vec![format!("⚙ improved harness installed at {}", short_path(&exe)), format!("  {summary}"), format!("  restarting in {grace_secs}s — the session and the picked model/effort are restored · esc or /cancel keeps the current version until you /restart")]));
+                self.restart_at = Some(Instant::now() + Duration::from_secs(grace_secs.max(5)));
+                if self.cfg.ui.notify { desktop_notify("Harness: improvement installed", &format!("restarting in {grace_secs}s — esc or /cancel to keep the current version")); }
+            }
+            Done { summary } => { self.blocks.push(Block::System(format!("⚙ self-improvement finished: {summary}"))); self.improve = None; }
+            Failed(e) => { self.blocks.push(Block::Error(format!("⚙ self-improvement failed: {e}"))); self.improve = None; }
+        }
+    }
+    fn cancel_restart(&mut self) {
+        self.restart_at = None;
+        self.blocks.push(Block::System("↻ automatic restart cancelled — the improved binary is installed; /restart when convenient".into()));
+    }
+
     /// Persist the transcript (called after every turn and on interrupt).
     fn save_session(&mut self) {
         if self.session_meta.id.is_empty() { self.session_meta.id = harness::sessions::SessionStore::new_id(); }
         self.session_meta.workdir = self.workdir.display().to_string();
         self.session_meta.model = self.model.clone();
+        self.session_meta.provider = self.cfg.llm.provider.clone(); self.session_meta.effort = self.cfg.llm.effort.clone();
         let session = self.session.clone(); let mut meta = self.session_meta.clone(); let tx = self.tx.clone();
         tokio::spawn(async move {
             let msgs = session.lock().await.clone();
@@ -1444,7 +1517,10 @@ impl App {
                 self.blocks.push(Block::System(format!("resumed session {} — {} · {} · {} turns", meta.id, meta.title, short_path(std::path::Path::new(&meta.workdir)), meta.turns)));
                 self.replay(&msgs);
                 if std::path::Path::new(&meta.workdir).is_dir() { self.workdir = PathBuf::from(&meta.workdir); let _ = std::env::set_current_dir(&self.workdir); }
-                if !meta.model.is_empty() { self.model = meta.model.clone(); }
+                if !meta.model.is_empty() { self.model = meta.model.clone(); self.cfg.llm.model = meta.model.clone(); }
+                if meta.provider.is_some() { self.cfg.llm.provider = meta.provider.clone().filter(|p| !p.is_empty()); }
+                if let Some(e) = &meta.effort { if !e.is_empty() { self.cfg.llm.effort = Some(e.clone()); } }
+                if let Some(cc) = self.cc.take() { tokio::spawn(async move { cc.stop().await; }); }
                 self.session_meta = meta;
                 let s = self.session.clone(); tokio::spawn(async move { *s.lock().await = msgs; });
                 self.reload_toolset();
@@ -1489,6 +1565,7 @@ impl App {
     fn on_msg(&mut self, m: Msg) {
         match m {
             Msg::Block(b) => self.blocks.push(b),
+            Msg::Improve(st) => self.on_improve(st),
             Msg::CcSession(s) => { self.cc = Some(s); }
             Msg::Policy(p) => { p.set_mode(self.perm_mode); self.live_policy = Some(p); }
             Msg::SubEnv(e) => { self.subenv = Some(e); }
@@ -1677,6 +1754,8 @@ const COMMANDS: &[(&str, &str)] = &[
     ("/mcp", "show configured MCP servers and live MCP tools"),
     ("/reload", "restart tools, MCP servers and plugins"),
     ("/restart", "restart the harness (re-exec the installed binary) and resume this session"),
+    ("/improve", "self-improvement loop: /improve [focus] — propose → confirm (auto with a frontier backend) → implement → arbiter → merge → install → restart (60s to cancel)"),
+    ("/cancel", "cancel the pending automatic restart or the running /improve job"),
     ("/permissions", "show or set permission mode: bypass|auto|ask|plan"),
     ("/plan", "toggle plan mode (read-only)"),
     ("/trust", "remember this directory as trusted (no first-time notice)"),
@@ -1733,6 +1812,9 @@ fn draw(f: &mut Frame, app: &mut App) {
         Some(vec![Span::styled(" 🔒 ", Style::default().fg(Color::Black).bg(pal().orange)), Span::styled(format!(" {}({}) ", req.tool, truncate(&req.summary, 240)), Style::default().fg(Color::Black).bg(pal().orange).bold()),
                   Span::styled(format!("  {} · ", req.reason), Style::default().fg(pal().orange)),
                   Span::styled("[y] once  ", Style::default().fg(pal().ok).bold()), Span::styled(format!("[a] always ({})  ", req.suggested_rule), Style::default().fg(pal().cyan)), Span::styled("[p] always in this project  ", Style::default().fg(pal().cyan)), Span::styled("[n] deny", Style::default().fg(pal().err).bold())])
+    } else if let Some(at) = app.restart_at {
+        let left = at.saturating_duration_since(Instant::now()).as_secs();
+        Some(vec![Span::styled(format!("↻ improved harness installed — restarting in {left}s and resuming this session  "), Style::default().fg(pal().ok).bold()), Span::styled(if app.running.is_some() { "(waits for the current task) · esc or /cancel to keep the running version".to_string() } else { "esc or /cancel to keep the running version".to_string() }, Style::default().fg(pal().dim))])
     } else if let Some((f, phase, _)) = &app.compact_progress {
         let barw = 30usize; let filled = ((f * barw as f64) as usize).min(barw);
         Some(vec![Span::styled("⟲ compacting context ", Style::default().fg(pal().orange)), Span::styled("█".repeat(filled), Style::default().fg(pal().orange)), Span::styled("░".repeat(barw - filled), Style::default().fg(pal().dim)), Span::styled(format!(" {:>3.0}%  {phase}", f * 100.0), Style::default().fg(pal().dim))])
@@ -2273,4 +2355,13 @@ fn cursor_pos(input: &str, cursor: usize, width: usize) -> (usize, usize) {
 
 fn truncate(s: &str, n: usize) -> String { if s.chars().count() <= n { s.to_string() } else { format!("{}…", s.chars().take(n.saturating_sub(1)).collect::<String>()) } }
 fn fmt_k(n: u64) -> String { if n < 1000 { n.to_string() } else if n < 100_000 { format!("{:.1}k", n as f64 / 1000.0) } else { format!("{}k", n / 1000) } }
+/// Best-effort desktop notification (macOS osascript / Linux notify-send).
+fn desktop_notify(title: &str, body: &str) {
+    if std::env::var_os("HARNESS_NO_NOTIFY").is_some() { return; }
+    let (title, body) = (title.to_string(), body.replace('"', "'"));
+    tokio::spawn(async move {
+        if cfg!(target_os = "macos") { let script = format!("display notification \"{body}\" with title \"{title}\" sound name \"Glass\""); let _ = tokio::process::Command::new("osascript").arg("-e").arg(script).output().await; }
+        else if cfg!(target_os = "linux") { let _ = tokio::process::Command::new("notify-send").arg(&title).arg(&body).output().await; }
+    });
+}
 fn short_path(p: &std::path::Path) -> String { let s = p.display().to_string(); let h = harness::setup::home_dir().display().to_string(); if let Some(r) = s.strip_prefix(&h) { return format!("~{r}"); } s }

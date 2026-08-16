@@ -83,3 +83,16 @@ event_log = true       # ~/.config/harness/logs/<date>/tui-<pid>.jsonl
 mode = "none"
 deny_network = false
 allow_write = []
+
+[self]
+# Smart self-improvement loop (`harness improve`, `/improve` in the TUI).
+# Who approves the proposed plan: "smart" = automatic with a frontier backend (provider claude-code/anthropic
+# or a model matching smart_models), otherwise the user confirms; "always" | "never" force it.
+auto = "smart"
+smart_models = ["claude*", "*opus*", "*sonnet*", "*fable*", "gpt-5*", "o3*", "o4*"]
+# Proposals per round, eval runs per side for the arbiter, seconds to cancel the automatic restart after install
+max_items = 3
+arbiter_runs = 1
+restart_grace_secs = 60
+# skip_arbiter = true      # gate merges on build + tests only (faster, less safe)
+# repo = "/path/to/TheHarness"   # default: located from cwd / the binary / HARNESS_REPO

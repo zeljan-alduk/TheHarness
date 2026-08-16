@@ -118,6 +118,17 @@ enum Cmd {
         #[arg(long, default_value = "127.0.0.1:7878")]
         bind: String,
     },
+    /// Smart self-improvement loop: propose → confirm (auto for frontier models) → implement on proposal/* branches → arbiter → merge → install
+    Improve {
+        /// Optional focus for the proposals (default: the agent picks from README/GAPS/TODO/BRAIN)
+        hint: Vec<String>,
+        /// Do not install the new binary after merging
+        #[arg(long)]
+        no_install: bool,
+        /// Skip the eval-based arbiter (build + tests only gate the merge)
+        #[arg(long)]
+        skip_arbiter: bool,
+    },
     /// Workflows: list | run <name|path> [args]
     Workflow {
         #[command(subcommand)]
@@ -181,6 +192,29 @@ async fn main() -> Result<()> {
             if !v.green { std::process::exit(1); }
         }
         Cmd::Serve { bind } => { harness::serve::serve(cfg, &bind).await?; }
+        Cmd::Improve { hint, no_install, skip_arbiter } => {
+            // the loop rebuilds/installs the harness: never run it from the binary being replaced
+            reexec_from_temp_copy()?;
+            let mut cfg = cfg; if skip_arbiter { cfg.selfimprove.skip_arbiter = true; }
+            let sink: std::sync::Arc<dyn events::Sink> = if cli.json { std::sync::Arc::new(events::JsonlSink) } else { std::sync::Arc::new(events::StderrSink { verbose: cli.verbose }) };
+            let approver: std::sync::Arc<dyn harness::permissions::Approver> = std::sync::Arc::new(harness::permissions::AutoApprover { yes: cli.yes });
+            let json = cli.json;
+            let report: std::sync::Arc<dyn Fn(harness::selfimprove::Stage) + Send + Sync> = std::sync::Arc::new(move |s| {
+                use harness::selfimprove::Stage::*;
+                match s {
+                    Log(l) => eprintln!("· {l}"),
+                    Plan { items, auto } => { eprintln!("══ plan ({}) — {}", items.len(), if auto { "auto-approved (frontier backend)" } else { "needs confirmation (pass -y headless)" }); for (i, p) in items.iter().enumerate() { eprintln!("  {}. {} — {}", i + 1, p.title, p.rationale); } }
+                    Approved(v) => eprintln!("══ implementing {} item(s)", v.len()),
+                    Item { title, branch, merged, note } => eprintln!("══ {} {title} [{branch}] — {note}", if merged { "✓" } else { "✗" }),
+                    Installed { summary, exe, .. } => eprintln!("══ installed {} — {summary}", exe.display()),
+                    Done { summary } => { eprintln!("══ {summary}"); if json { println!("{}", serde_json::json!({"summary": summary})); } }
+                    Failed(e) => eprintln!("══ failed: {e}"),
+                }
+            });
+            let job = harness::selfimprove::Job { cfg, hint: hint.join(" "), sink, approver, report, cancel: Default::default(), assume_yes: cli.yes, no_install };
+            let out = harness::selfimprove::run(job).await?;
+            if out.items.iter().any(|r| !r.2) && out.items.iter().all(|r| !r.2) { std::process::exit(1); }
+        }
         Cmd::Workflow { action } => match action {
             WorkflowCmd::List => { for (n, d, p) in harness::workflow::list(&std::env::current_dir()?) { println!("{:<16} {:<70} {}", n, llm::truncate_for_log(&d, 70), p.display()); } }
             WorkflowCmd::Run { dir, name, args } => {

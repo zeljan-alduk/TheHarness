@@ -86,8 +86,25 @@ pub async fn prepare(setup: RunSetup) -> Result<Prepared> {
     Ok(Prepared { client, toolset, store, policy, approver, sink, env, ctx, system, budget, max_turns: cfg.agent.max_turns })
 }
 
+impl Prepared {
+    /// Run one task to completion on whichever backend is configured (Claude Code drives its own loop
+    /// with our tools bridged over MCP; everything else goes through `Agent`). Returns (final text, stats).
+    pub async fn run_once(&self, prompt: &str, workdir: &std::path::Path) -> Result<(String, crate::agent::RunStats)> {
+        if self.client.provider() == crate::llm::Provider::ClaudeCode {
+            let host = Arc::new(crate::mcp_bridge::BridgeHost { registry: self.toolset.registry.clone(), ctx: self.ctx.clone(), policy: self.policy.clone(), approver: self.approver.clone(), sink: self.sink.clone() });
+            let session = crate::claude_code::ClaudeCodeSession::start_with(workdir, Some(self.client.model()), self.env.cc_effort.as_deref().or(Some("medium")), &self.system, host, None).await?;
+            let r = session.run_turn(prompt, &[], self.sink.as_ref()).await;
+            session.stop().await;
+            r
+        } else {
+            self.agent().run(&self.system, prompt).await
+        }
+    }
+}
+
 /// One-shot: prepare and run `prompt` to completion, returning the final answer text.
 pub async fn start_run(setup: RunSetup, prompt: String) -> Result<String> {
     let p = prepare(setup).await?;
-    p.agent().run(&p.system, &prompt).await.map(|(t, _)| t)
+    let wd = p.ctx.workdir.clone();
+    p.run_once(&prompt, &wd).await.map(|(t, _)| t)
 }
