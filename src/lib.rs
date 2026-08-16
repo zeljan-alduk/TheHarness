@@ -20,6 +20,7 @@ pub mod plugins;
 pub mod procs;
 pub mod runner;
 pub mod sandbox;
+pub mod selfimprove;
 pub mod serve;
 pub mod security;
 pub mod sessions;

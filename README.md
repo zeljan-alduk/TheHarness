@@ -128,6 +128,7 @@ src/
   memory.rs    MEMORY/WORKFLOWS/BRAIN store, reflection, consolidation, pastes dir
   mcp.rs       MCP stdio client · plugins.rs plugin manager · setup.rs external tools · tui.rs terminal UI
   eval.rs      the fitness function: runs evals/tasks/* in fresh git-initialised workdirs
+  arbiter.rs   proposal-vs-main verdict · selfimprove.rs  smart self-improvement loop (propose → gates → implement → arbiter → install)
   lib.rs       exposes all of the above as the `harness` library
 evals/tasks/<name>/task.toml  (+ fixture/)  — prompt + `check` shell command (exit 0 = pass)
 ui/src-tauri   Tauri 2 desktop app (Rust) · ui/dist  vanilla web frontend
@@ -152,6 +153,24 @@ per-task table and a verdict (tests pass ∧ mean score not lower ∧ no always-
 2. Agent reads README + relevant source, edits, must pass `cargo build --release` + `cargo test`.
 3. Agent runs `harness eval` and reports score before/after, commits on the branch.
 4. A human (or, later, an arbiter process) diffs `main..proposal/x`, reruns eval, merges or discards.
+
+### Smart self-improvement loop (`harness improve`, `/improve` in the TUI)
+The automated version of the protocol above, with two human gates that adapt to how smart the backend is:
+1. **Propose** — a read-only agent run on the harness source (README roadmap, `docs/GAPS.md`, `TODO.md`,
+   BRAIN lessons, optional focus `/improve <hint>`) returns a ranked JSON plan (`[self] max_items`).
+2. **Gate 1** — `[self] auto = "smart"` (default): with a frontier backend (`provider = claude-code|anthropic`
+   or a model matching `smart_models`, e.g. `claude*`) the plan is approved automatically and you are
+   *informed* of what will be done; with a small local model you are *asked* to confirm (all / pick numbers /
+   cancel). `auto = "always" | "never"` overrides.
+3. **Implement** — each item gets its own `proposal/<slug>` branch + worktree; the agent must build, test and commit.
+4. **Arbiter** — `harness arbiter`-style verdict (`arbiter_runs` eval runs per side vs the cached `main` baseline);
+   green → merged into `main`. `skip_arbiter = true` gates on build + tests only.
+5. **Install** — release build in a separate target dir, atomically renamed over the installed binary.
+6. **Gate 2** — the TUI shows *"improved harness installed — restarting in 60s"* (`restart_grace_secs`); `esc` or
+   `/cancel` keeps the running version (`/restart` later). Otherwise it re-execs the new binary and **resumes the
+   session with the previously picked backend, model and effort** (also true for a plain `/restart`).
+
+`harness improve [hint] [-y] [--no-install] [--skip-arbiter]` runs the same loop headless (`-y` answers gate 1).
 
 Nothing self-modifies in place: the running binary is never the one being edited, and
 `git` is the undo button (`git log`, `git diff`, `git revert`, branches) — for the harness

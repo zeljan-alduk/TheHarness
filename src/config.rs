@@ -24,7 +24,35 @@ pub struct Config {
     pub sandbox: SandboxConfig,
     #[serde(default)]
     pub lsp: LspConfig,
+    /// Smart self-improvement loop (`harness improve`, `/improve`).
+    #[serde(default, rename = "self")]
+    pub selfimprove: SelfConfig,
 }
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct SelfConfig {
+    /// Who approves the plan: "smart" (auto when the backend is a frontier model, otherwise ask the user),
+    /// "always" (never ask), "never" (always ask).
+    #[serde(default = "d_self_auto")] pub auto: String,
+    /// Model-name globs counted as "smart" (provider claude-code/anthropic always counts).
+    #[serde(default = "d_smart_models")] pub smart_models: Vec<String>,
+    /// Eval runs per side for the arbiter verdict (baseline for main is cached).
+    #[serde(default = "d_one")] pub arbiter_runs: usize,
+    /// Seconds the user gets to cancel the automatic restart after an improvement was installed.
+    #[serde(default = "d_grace")] pub restart_grace_secs: u64,
+    /// Max proposals per round.
+    #[serde(default = "d_three")] pub max_items: usize,
+    /// Harness source checkout to improve (default: located from cwd / the binary / HARNESS_REPO).
+    #[serde(default)] pub repo: Option<String>,
+    /// Skip the eval-based arbiter (only build + tests gate the merge). Faster, less safe.
+    #[serde(default)] pub skip_arbiter: bool,
+}
+fn d_self_auto() -> String { "smart".into() }
+fn d_smart_models() -> Vec<String> { ["claude*", "*opus*", "*sonnet*", "*fable*", "gpt-5*", "o3*", "o4*"].iter().map(|s| s.to_string()).collect() }
+fn d_one() -> usize { 1 }
+fn d_three() -> usize { 3 }
+fn d_grace() -> u64 { 60 }
+impl Default for SelfConfig { fn default() -> Self { Self { auto: d_self_auto(), smart_models: d_smart_models(), arbiter_runs: 1, restart_grace_secs: 60, max_items: 3, repo: None, skip_arbiter: false } } }
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct LspConfig {
