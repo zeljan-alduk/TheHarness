@@ -2,13 +2,13 @@
 //! Everything here is presentation; the agent loop lives in the `harness` library.
 
 use anyhow::Result;
-use crossterm::event::{Event as CEvent, EventStream, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::event::{Event as CEvent, EventStream, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind};
 use futures_util::StreamExt;
-use harness::agent::{system_prompt, Agent};
+use harness::agent::Agent;
 use harness::config::Config;
 use harness::events::{Event, Sink};
 use harness::llm::{Client, Content, Message};
-use harness::tools::{Registry, ToolCtx};
+use harness::tools::{Registry, ToolCtx, Toolset};
 use ratatui::prelude::*;
 use ratatui::widgets::{Axis, Chart, Dataset, Gauge, GraphType, Paragraph, Sparkline};
 use ratatui_image::{picker::Picker, protocol::StatefulProtocol, StatefulImage};
@@ -31,10 +31,37 @@ const CYAN: Color = Color::Rgb(90, 205, 220);
 const SPINNER: [&str; 10] = ["✻", "✼", "✽", "✾", "✿", "❀", "✿", "✾", "✽", "✼"];
 const WORDS: [&str; 12] = ["Thinking", "Pondering", "Working", "Reasoning", "Cooking", "Tinkering", "Brewing", "Mulling", "Crunching", "Percolating", "Noodling", "Computing"];
 
-enum Msg { Ev(Event), Done(Result<String, String>), Sys(SysSample), CtxLen(u64), Pasted(Result<PathBuf, String>) }
+enum Msg { Ev(Event), Done(Result<String, String>), Sys(SysSample), CtxLen(u64), Pasted(Result<PathBuf, String>), Frames(Result<(PathBuf, f64, Vec<(f64, PathBuf)>), String>), Toolset(Arc<Toolset>), Catalog(Result<harness::plugins::Catalog, String>), Notice(String) }
+
+/// Video scrubber state (modal over the transcript).
+struct VideoPicker { path: PathBuf, duration: f64, frames: Vec<(f64, PathBuf, String)>, cur: usize, selected: std::collections::BTreeSet<usize>, loading: bool, error: Option<String> }
+
+fn video_ext(p: &std::path::Path) -> bool {
+    matches!(p.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase()).as_deref(), Some("mp4" | "mov" | "m4v" | "webm" | "mkv" | "avi" | "gif" | "mpg" | "mpeg"))
+}
+
+/// Probe duration and extract up to `n` evenly spaced JPEG frames (max width 640) with ffmpeg.
+async fn extract_frames(video: PathBuf, out_dir: PathBuf, n: usize) -> Result<(PathBuf, f64, Vec<(f64, PathBuf)>), String> {
+    let probe = tokio::process::Command::new("ffprobe").args(["-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1"]).arg(&video).output().await.map_err(|e| format!("ffprobe: {e} (install ffmpeg: brew install ffmpeg)"))?;
+    let duration: f64 = String::from_utf8_lossy(&probe.stdout).trim().parse().unwrap_or(0.0);
+    std::fs::create_dir_all(&out_dir).map_err(|e| e.to_string())?;
+    let n = n.max(2);
+    let step = if duration > 0.0 { duration / n as f64 } else { 1.0 };
+    // one ffmpeg call: fps filter to n frames across the duration
+    let vf = if duration > 0.0 { format!("fps=1/{:.4},scale='min(640,iw)':-2", step) } else { "fps=1,scale='min(640,iw)':-2".to_string() };
+    let pattern = out_dir.join("frame-%03d.jpg");
+    let o = tokio::process::Command::new("ffmpeg").args(["-hide_banner", "-loglevel", "error", "-y", "-i"]).arg(&video).args(["-vf", &vf, "-frames:v", &(n + 1).to_string(), "-q:v", "4"]).arg(&pattern).output().await.map_err(|e| format!("ffmpeg: {e}"))?;
+    if !o.status.success() { return Err(format!("ffmpeg failed: {}", String::from_utf8_lossy(&o.stderr).trim())); }
+    let mut frames: Vec<(f64, PathBuf)> = Vec::new();
+    let mut entries: Vec<PathBuf> = std::fs::read_dir(&out_dir).map_err(|e| e.to_string())?.flatten().map(|e| e.path()).filter(|p| p.extension().map(|e| e == "jpg").unwrap_or(false)).collect();
+    entries.sort();
+    for (i, p) in entries.into_iter().enumerate() { frames.push((i as f64 * step, p)); }
+    if frames.is_empty() { return Err("no frames extracted".into()); }
+    Ok((video, duration, frames))
+}
 
 /// An image attached to the next prompt.
-struct Attachment { path: PathBuf, mime: String, b64: String, dims: (u32, u32), img: image::DynamicImage }
+struct Attachment { path: PathBuf, mime: String, b64: String, dims: (u32, u32), img: image::DynamicImage, label: Option<String> }
 
 /// A rendered image slot in the transcript: which key, and its cell size.
 struct ImgSlot { key: String, cols: u16, rows: u16 }
@@ -51,7 +78,7 @@ fn load_attachment(path: &std::path::Path) -> Result<Attachment, String> {
     let img = image::load_from_memory(&bytes).map_err(|e| format!("could not decode image: {e}"))?;
     let dims = (img.width(), img.height());
     use base64::Engine;
-    Ok(Attachment { path: path.to_path_buf(), mime: mime.into(), b64: base64::engine::general_purpose::STANDARD.encode(&bytes), dims, img })
+    Ok(Attachment { path: path.to_path_buf(), mime: mime.into(), b64: base64::engine::general_purpose::STANDARD.encode(&bytes), dims, img, label: None })
 }
 
 /// Terminals that implement an inline-image protocol (and answer capability queries).
@@ -64,13 +91,25 @@ fn graphics_terminal() -> bool {
         || std::env::var_os("WEZTERM_PANE").is_some() || std::env::var_os("ITERM_SESSION_ID").is_some()
 }
 
-/// macOS: dump a clipboard image (PNG) to a temp file via AppleScript. Returns Err if no image on the clipboard.
-async fn clipboard_image() -> Result<PathBuf, String> {
-    let out = std::env::temp_dir().join(format!("harness-paste-{}.png", std::process::id() as u64 * 1000 + (Instant::now().elapsed().as_millis() as u64 % 1000)));
-    let script = format!("set f to open for access POSIX file \"{}\" with write permission\nset eof of f to 0\nwrite (the clipboard as «class PNGf») to f\nclose access f", out.display());
+/// macOS clipboard → a file we can attach. Images are saved as PNG under the pastes dir; copied
+/// files (Finder ⌘C) resolve to their existing path. Returns Err if the clipboard has neither.
+async fn clipboard_image(store: Option<harness::memory::MemoryStore>) -> Result<PathBuf, String> {
+    // 1) image data
+    let tmp = std::env::temp_dir().join(format!("harness-paste-{}.png", std::process::id()));
+    let script = format!("set f to open for access POSIX file \"{}\" with write permission\nset eof of f to 0\nwrite (the clipboard as «class PNGf») to f\nclose access f", tmp.display());
     let o = tokio::process::Command::new("osascript").arg("-e").arg(&script).output().await.map_err(|e| e.to_string())?;
-    if !o.status.success() { let _ = std::fs::remove_file(&out); return Err("no image on the clipboard (copy an image, then ctrl+v; or type/drag an image path)".into()); }
-    Ok(out)
+    if o.status.success() {
+        let bytes = std::fs::read(&tmp).map_err(|e| e.to_string())?; let _ = std::fs::remove_file(&tmp);
+        return match &store { Some(st) => st.save_paste("png", &bytes).map_err(|e| e.to_string()), None => { std::fs::write(&tmp, &bytes).map_err(|e| e.to_string())?; Ok(tmp) } };
+    }
+    let _ = std::fs::remove_file(&tmp);
+    // 2) a file reference (copied in Finder)
+    let o = tokio::process::Command::new("osascript").arg("-e").arg("POSIX path of (the clipboard as «class furl»)").output().await.map_err(|e| e.to_string())?;
+    if o.status.success() {
+        let p = PathBuf::from(String::from_utf8_lossy(&o.stdout).trim());
+        if p.exists() { return Ok(p); }
+    }
+    Err("clipboard has no image or file (copy an image or a file, then ctrl+v; or type/drag a path)".into())
 }
 
 /// One system sample (1 Hz) from the background sampler.
@@ -167,18 +206,11 @@ fn grab_num(s: &str, key: &str) -> Option<u64> {
     digits.parse().ok()
 }
 
-/// Ask LM Studio for the loaded context length (best effort; falls back to the config budget).
+/// Detect the model's context length at start (LM Studio / llama.cpp / Ollama).
 async fn fetch_ctx_len(base_url: String, model: String, tx: mpsc::UnboundedSender<Msg>) {
-    let root = base_url.trim_end_matches("/v1").trim_end_matches('/').to_string();
-    let Ok(http) = reqwest::Client::builder().timeout(Duration::from_secs(3)).build() else { return };
-    if let Ok(r) = http.get(format!("{root}/api/v0/models")).send().await {
-        if let Ok(v) = r.json::<serde_json::Value>().await {
-            for m in v["data"].as_array().cloned().unwrap_or_default() {
-                if m["id"].as_str() == Some(model.as_str()) {
-                    if let Some(n) = m["loaded_context_length"].as_u64().or_else(|| m["max_context_length"].as_u64()) { let _ = tx.send(Msg::CtxLen(n)); }
-                }
-            }
-        }
+    match harness::llm::detect_context_length(&base_url, &model).await {
+        Some((n, src)) => { let _ = tx.send(Msg::CtxLen(n)); let _ = tx.send(Msg::Notice(format!("context window: {} tokens ({src})", fmt_k(n)))); }
+        None => { let _ = tx.send(Msg::Notice("context window: unknown (server did not report it) — using 60k compaction threshold".into())); }
     }
 }
 
@@ -188,12 +220,13 @@ impl Sink for TuiSink { fn emit(&self, e: &Event) { let _ = self.0.send(Msg::Ev(
 enum Block {
     Banner(Vec<String>),
     User(String, Vec<String>),
-    Assistant { text: String, streaming: bool },
-    Reasoning { text: String, streaming: bool },
-    Tool { id: String, name: String, args: String, result: Option<String>, secs: f64, images: usize, interrupted: bool },
+    Assistant { text: String, streaming: bool, folded: bool },
+    Reasoning { text: String, streaming: bool, show: Option<bool> },
+    Tool { id: String, name: String, args: String, result: Option<String>, secs: f64, images: usize, interrupted: bool, fold: Option<bool> },
     System(String),
     Error(String),
     Finished(String),
+    Memory(String),
 }
 
 struct App {
@@ -232,6 +265,13 @@ struct App {
     picker: Picker,
     images: std::collections::HashMap<String, (StatefulProtocol, (u32, u32))>,
     img_seq: u64,
+    think_scroll: usize,
+    toolset: Option<Arc<Toolset>>,
+    video: Option<VideoPicker>,
+    strip_rects: Vec<(Rect, usize)>,
+    // geometry from the last draw, for mouse hit-testing
+    tr_rect: Rect, panel_rect: Rect, tr_start: usize,
+    line_map: Vec<(usize, usize, usize)>, // (first line, last line exclusive, block index)
 }
 
 pub async fn run(cfg: Config) -> Result<()> {
@@ -249,9 +289,11 @@ pub async fn run(cfg: Config) -> Result<()> {
         quit: false, tick: 0, word: 0, models: vec![],
         metrics: Metrics::new(0), panel: None, attachments: vec![], tool_previews: Default::default(),
         picker, images: Default::default(), img_seq: 0,
+        think_scroll: 0, toolset: None, video: None, strip_rects: vec![], tr_rect: Rect::default(), panel_rect: Rect::default(), tr_start: 0, line_map: vec![],
     };
-    app.metrics.ctx_len = app.cfg.llm.context_budget_tokens;
+    app.metrics.ctx_len = app.cfg.llm.context_budget_tokens.unwrap_or(0);
     app.banner();
+    app.reload_toolset();
     tokio::spawn(sampler(tx.clone()));
     tokio::spawn(fetch_ctx_len(app.cfg.llm.base_url.clone(), app.cfg.llm.model.clone(), tx.clone()));
     // model list in the background
@@ -263,7 +305,7 @@ pub async fn run(cfg: Config) -> Result<()> {
     }
 
     let mut terminal = ratatui::init();
-    let _ = crossterm::execute!(std::io::stdout(), crossterm::event::EnableBracketedPaste);
+    let _ = crossterm::execute!(std::io::stdout(), crossterm::event::EnableBracketedPaste, crossterm::event::EnableMouseCapture);
     let mut events = EventStream::new();
     let mut ticker = tokio::time::interval(Duration::from_millis(80));
     let res: Result<()> = async {
@@ -278,7 +320,7 @@ pub async fn run(cfg: Config) -> Result<()> {
         }
         Ok(())
     }.await;
-    let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableBracketedPaste);
+    let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableMouseCapture, crossterm::event::DisableBracketedPaste);
     ratatui::restore();
     if let Some(h) = app.running.take() { h.abort(); }
     res
@@ -293,17 +335,75 @@ impl App {
             format!("  model  {}", self.model),
             format!("  server {}", self.cfg.llm.base_url),
             format!("  cwd    {}", wd),
+            {
+                let st = harness::setup::check();
+                let ok = st.iter().filter(|s| s.ok()).count();
+                let miss: Vec<&str> = st.iter().filter(|s| !s.ok()).map(|s| s.name).collect();
+                format!("  tools  {ok}/{} available{}", st.len(), if miss.is_empty() { String::new() } else { format!(" · missing {} → harness setup --install", miss.join(", ")) })
+            },
             String::new(),
-            "  /help for commands · esc interrupts · ctrl+o expands tool output · ctrl+t shows thinking".into(),
+            "  /help for commands · esc interrupts · ctrl+o expands tool output · ctrl+t shows thinking · ctrl+p panel".into(),
         ]));
     }
 
     fn set_status(&mut self, s: impl Into<String>) { self.status_msg = Some((s.into(), Instant::now())); }
+
+    /// (Re)build tools: built-ins + MCP servers from global/project/plugin configs. Async; swaps in when ready.
+    fn reload_toolset(&mut self) {
+        let tx = self.tx.clone(); let net = self.net; let wd = self.workdir.clone();
+        tokio::spawn(async move {
+            let ts = harness::tools::build_toolset(net, &wd, true).await;
+            for n in &ts.notes { let _ = tx.send(Msg::Notice(n.clone())); }
+            let _ = tx.send(Msg::Toolset(Arc::new(ts)));
+        });
+    }
     fn panel_visible(&self, width: u16) -> bool { self.panel.unwrap_or(width >= 120) }
 
     fn on_term(&mut self, ev: CEvent) {
         match ev {
             CEvent::Paste(s) => { self.insert_str(&s.replace("\r\n", "\n").replace('\r', "\n")); }
+            CEvent::Mouse(m) if self.video.is_some() => {
+                match m.kind {
+                    MouseEventKind::ScrollUp => { if let Some(v) = &mut self.video { v.cur = v.cur.saturating_sub(1); } }
+                    MouseEventKind::ScrollDown => { if let Some(v) = &mut self.video { let n = v.frames.len(); if n > 0 { v.cur = (v.cur + 1).min(n - 1); } } }
+                    MouseEventKind::Down(MouseButton::Left) => {
+                        if let Some(&(_, idx)) = self.strip_rects.iter().find(|(r, _)| m.column >= r.x && m.column < r.x + r.width && m.row >= r.y && m.row < r.y + r.height) {
+                            if let Some(v) = &mut self.video { if v.cur == idx { if !v.selected.remove(&idx) { v.selected.insert(idx); } } else { v.cur = idx; } }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            CEvent::Mouse(m) => {
+                let in_panel = self.panel_rect.width > 0 && m.column >= self.panel_rect.x && m.column < self.panel_rect.x + self.panel_rect.width;
+                match m.kind {
+                    MouseEventKind::ScrollUp => { if in_panel { self.think_scroll += 3; } else { self.scroll_up += 3; } }
+                    MouseEventKind::ScrollDown => { if in_panel { self.think_scroll = self.think_scroll.saturating_sub(3); } else { self.scroll_up = self.scroll_up.saturating_sub(3); } }
+                    MouseEventKind::Down(MouseButton::Left) if !in_panel => {
+                        let r = self.tr_rect;
+                        if m.row >= r.y && m.row < r.y + r.height && m.column >= r.x && m.column < r.x + r.width {
+                            let line = self.tr_start + (m.row - r.y) as usize;
+                            if let Some(&(_, _, idx)) = self.line_map.iter().find(|(a, b, _)| line >= *a && line < *b) { self.toggle_fold(idx); }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            CEvent::Key(k) if k.kind == KeyEventKind::Press && self.video.is_some() => {
+                let n = self.video.as_ref().map(|v| v.frames.len()).unwrap_or(0);
+                match k.code {
+                    KeyCode::Esc => { self.video = None; self.set_status("video cancelled"); }
+                    KeyCode::Enter => self.video_confirm(),
+                    KeyCode::Left | KeyCode::Char('h') => { if let Some(v) = &mut self.video { v.cur = v.cur.saturating_sub(1); } }
+                    KeyCode::Right | KeyCode::Char('l') => { if let Some(v) = &mut self.video { if n > 0 { v.cur = (v.cur + 1).min(n - 1); } } }
+                    KeyCode::Home => { if let Some(v) = &mut self.video { v.cur = 0; } }
+                    KeyCode::End => { if let Some(v) = &mut self.video { v.cur = n.saturating_sub(1); } }
+                    KeyCode::Char(' ') => { if let Some(v) = &mut self.video { if !v.selected.remove(&v.cur) { v.selected.insert(v.cur); } } }
+                    KeyCode::Char('a') => { if let Some(v) = &mut self.video { if v.selected.len() == n { v.selected.clear(); } else { v.selected = (0..n).collect(); } } }
+                    KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => { self.video = None; }
+                    _ => {}
+                }
+            }
             CEvent::Key(k) if k.kind == KeyEventKind::Press => {
                 let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
                 let alt = k.modifiers.contains(KeyModifiers::ALT);
@@ -322,7 +422,7 @@ impl App {
                     (KeyCode::Char('t'), true, _) => { self.show_thinking = !self.show_thinking; }
                     (KeyCode::Char('l'), true, _) => { self.scroll_up = 0; }
                     (KeyCode::Char('p'), true, _) => { self.panel = Some(!self.panel_visible(200)); }
-                    (KeyCode::Char('v'), true, _) => { let tx = self.tx.clone(); self.set_status("reading clipboard image…"); tokio::spawn(async move { let _ = tx.send(Msg::Pasted(clipboard_image().await)); }); }
+                    (KeyCode::Char('v'), true, _) => { let tx = self.tx.clone(); let store = if self.cfg.memory.enabled { harness::memory::MemoryStore::open(&self.cfg.memory).ok() } else { None }; self.set_status("reading clipboard…"); tokio::spawn(async move { let _ = tx.send(Msg::Pasted(clipboard_image(store).await)); }); }
                     (KeyCode::Char('u'), true, _) => { let c = self.cursor; self.input = self.input.chars().skip(c).collect(); self.cursor = 0; }
                     (KeyCode::Char('a'), true, _) | (KeyCode::Home, _, _) => self.cursor = self.line_start(),
                     (KeyCode::Char('e'), true, _) | (KeyCode::End, _, _) => self.cursor = self.line_end(),
@@ -378,6 +478,34 @@ impl App {
         key
     }
 
+    /// Open the frame scrubber for a video file.
+    fn open_video(&mut self, p: &std::path::Path) {
+        let path = p.to_path_buf();
+        let store = if self.cfg.memory.enabled { harness::memory::MemoryStore::open(&self.cfg.memory).ok() } else { None };
+        let base = store.as_ref().map(|s| s.pastes_dir()).unwrap_or(std::env::temp_dir());
+        let stem = path.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or("video".into());
+        let out_dir = base.join(format!("{stem}-frames"));
+        self.video = Some(VideoPicker { path: path.clone(), duration: 0.0, frames: vec![], cur: 0, selected: Default::default(), loading: true, error: None });
+        let tx = self.tx.clone();
+        tokio::spawn(async move { let _ = tx.send(Msg::Frames(extract_frames(path, out_dir, 32).await)); });
+    }
+    /// Attach the selected frames (or the current one) as images with timestamps.
+    fn video_confirm(&mut self) {
+        let Some(v) = self.video.take() else { return };
+        let mut idxs: Vec<usize> = v.selected.iter().cloned().collect();
+        if idxs.is_empty() && !v.frames.is_empty() { idxs.push(v.cur); }
+        let mut n = self.attachments.len();
+        for i in idxs {
+            let (ts, p, _) = &v.frames[i];
+            if let Ok(mut a) = load_attachment(p) {
+                a.label = Some(format!("frame at {:.1}s of {} (duration {:.1}s)", ts, v.path.display(), v.duration));
+                n += 1; self.attachments.push(a);
+                self.insert_str(&format!("[image #{n} @{:.1}s] ", ts));
+            }
+        }
+        self.set_status(format!("attached {} frame(s) from {}", n, short_path(&v.path)));
+    }
+
     fn attach(&mut self, p: &std::path::Path) {
         match load_attachment(p) {
             Ok(a) => { let n = self.attachments.len() + 1; self.set_status(format!("attached image #{n}: {} ({}×{})", short_path(&a.path), a.dims.0, a.dims.1)); self.attachments.push(a); if !self.input.is_empty() && !self.input.ends_with(' ') { self.insert_str(" "); } self.insert_str(&format!("[image #{n}] ")); }
@@ -399,6 +527,12 @@ impl App {
     fn submit(&mut self) {
         let text = self.input.trim().to_string();
         if text.is_empty() && self.attachments.is_empty() { return; }
+        // a bare video path (or one among the words) opens the scrubber first
+        for t in text.split_whitespace() {
+            let t = t.trim_matches(|c| c == '"' || c == '\'');
+            let p = if t.starts_with('~') { PathBuf::from(t.replacen('~', &std::env::var("HOME").unwrap_or_default(), 1)) } else if PathBuf::from(t).is_absolute() { PathBuf::from(t) } else { self.workdir.join(t) };
+            if video_ext(&p) && p.is_file() && !self.input.contains("@") { self.open_video(&p); return; }
+        }
         let text = if text.is_empty() { "Look at the attached image(s).".to_string() } else { text };
         self.input.clear(); self.cursor = 0; self.hist_idx = None;
         if self.history.last() != Some(&text) { self.history.push(text.clone()); }
@@ -417,6 +551,8 @@ impl App {
                 for (c, d) in COMMANDS { lines.push(format!("  {c:<14} {d}")); }
                 lines.push(String::new());
                 lines.push("Keys: enter send · alt+enter/ctrl+j newline · esc interrupt · ctrl+c clear/exit · ctrl+o expand tools · ctrl+t thinking · ctrl+p panel · ctrl+v paste image · pgup/pgdn scroll · ↑/↓ history".into());
+                lines.push("Mouse: wheel/trackpad scrolls the transcript and the thinking panel; click a tool call, answer or thought to fold/unfold it. Hold shift (or fn/option in Terminal) to select text.".into());
+                lines.push("Video: paste/drag a video (mp4/mov/webm/mkv/gif) or /video <path> → frame scrubber; select frames, enter attaches them as images with timestamps.".into());
                 lines.push("Images: ctrl+v pastes from the clipboard; typing or dragging an image path attaches it. Previews render as a color mosaic; the model sees the full image.".into());
                 self.blocks.push(Block::Banner(lines));
             }
@@ -431,7 +567,7 @@ impl App {
                     for m in &self.models { lines.push(format!("  {}{}", if *m == self.model { "● " } else { "  " }, m)); }
                     lines.push("usage: /model <name>".into());
                     self.blocks.push(Block::Banner(lines));
-                } else { self.model = arg.clone(); self.blocks.push(Block::System(format!("model → {arg}"))); }
+                } else { self.model = arg.clone(); self.cfg.llm.model = arg.clone(); self.blocks.push(Block::System(format!("model → {arg}"))); tokio::spawn(fetch_ctx_len(self.cfg.llm.base_url.clone(), arg.clone(), self.tx.clone())); }
             }
             "/cd" => {
                 let p = if arg.is_empty() { std::env::var("HOME").unwrap_or_default() } else { arg.clone() };
@@ -443,27 +579,200 @@ impl App {
             "/pwd" => self.blocks.push(Block::System(self.workdir.display().to_string())),
             "/net" => { match arg.as_str() { "on" => self.net = true, "off" => self.net = false, _ => {} } self.blocks.push(Block::System(format!("internet tools: {}", if self.net { "on" } else { "off" }))); }
             "/tools" => {
-                let r = Registry::defaults(self.net);
-                self.blocks.push(Block::Banner(std::iter::once("Tools".to_string()).chain(r.defs().into_iter().map(|d| format!("  {:<14} {}", d.function.name, truncate(&d.function.description, 90)))).collect()));
+                let defs = match &self.toolset { Some(ts) => ts.registry.defs(), None => Registry::defaults(self.net).defs() };
+                self.blocks.push(Block::Banner(std::iter::once(format!("Tools ({})", defs.len())).chain(defs.into_iter().map(|d| format!("  {:<28} {}", d.function.name, truncate(&d.function.description, 80)))).collect()));
             }
+            "/mcp" => {
+                let wd = self.workdir.clone();
+                let plugins = harness::plugins::Plugins::open().ok();
+                let extra = plugins.as_ref().map(|p| p.mcp_files()).unwrap_or_default();
+                let servers = harness::mcp::discover(&wd, &extra);
+                let mut lines = vec![format!("MCP servers configured: {}  (edit ~/.config/harness/mcp.json or <project>/.mcp.json, then /reload)", servers.len())];
+                for (n, c, f) in servers { lines.push(format!("  {:<18} {} {}   ← {}", n, c.command, c.args.join(" "), short_path(&f))); }
+                let live: Vec<String> = self.toolset.as_ref().map(|ts| ts.registry.names().into_iter().filter(|n| n.starts_with("mcp__")).map(String::from).collect()).unwrap_or_default();
+                lines.push(format!("live MCP tools: {}", live.len()));
+                for t in live.iter().take(40) { lines.push(format!("  {t}")); }
+                self.blocks.push(Block::Banner(lines));
+            }
+            "/reload" => { self.reload_toolset(); self.blocks.push(Block::System("reloading tools, MCP servers and plugins…".into())); }
+            "/compact" => {
+                if self.running.is_some() { self.set_status("wait for the current turn to finish"); }
+                else {
+                    let tx = self.tx.clone(); let session = self.session.clone(); let cfg = self.cfg.clone(); let focus = if arg.is_empty() { None } else { Some(arg.clone()) };
+                    self.blocks.push(Block::System("compacting context…".into()));
+                    tokio::spawn(async move {
+                        let sink = TuiSink(tx.clone());
+                        let res: Result<(), String> = async {
+                            let client = Client::new(&cfg.llm).map_err(|e| e.to_string())?;
+                            let mut msgs = session.lock().await;
+                            let (n, summary) = harness::agent::compact_llm(&client, &mut msgs, 4, focus.as_deref()).await.map_err(|e| format!("{e:#}"))?;
+                            sink.emit(&Event::Compacted { count: n, prompt_tokens: 0, summary });
+                            Ok(())
+                        }.await;
+                        if let Err(e) = res { sink.emit(&Event::Error { message: format!("compact: {e}") }); }
+                    });
+                }
+            }
+            "/plugin" | "/plugins" => self.plugin_command(&arg),
             "/thinking" => { self.show_thinking = !self.show_thinking; self.blocks.push(Block::System(format!("thinking {}", if self.show_thinking { "shown" } else { "hidden" }))); }
             "/expand" => { self.expand_tools = !self.expand_tools; }
             "/panel" => { self.panel = Some(!self.panel_visible(200)); }
             "/cost" | "/stats" => self.blocks.push(Block::System(format!("session tokens: {} prompt + {} completion · last context {} · turns in history {}", self.total_prompt, self.total_completion, self.last_prompt_tokens, self.history.len()))),
-            "/config" => self.blocks.push(Block::Banner(vec![format!("server  {}", self.cfg.llm.base_url), format!("model   {}", self.model), format!("ctx budget {} tokens · max_turns {} · tool timeout {}s", self.cfg.llm.context_budget_tokens, self.cfg.agent.max_turns, self.cfg.agent.tool_timeout_secs), format!("net {} · segments {}", self.net, self.cfg.net.download_segments)])),
+            "/config" => self.blocks.push(Block::Banner(vec![format!("server  {}", self.cfg.llm.base_url), format!("model   {}", self.model), format!("context {} · compaction at {} tokens · max_turns {} · tool timeout {}s", fmt_k(self.metrics.ctx_len), fmt_k(self.cfg.llm.effective_budget(if self.metrics.ctx_len > 0 { Some(self.metrics.ctx_len) } else { None })), self.cfg.agent.max_turns, self.cfg.agent.tool_timeout_secs), format!("net {} · segments {}", self.net, self.cfg.net.download_segments)])),
+            "/memory" | "/brain" | "/workflows" => {
+                let file = match cmd { "/memory" => "MEMORY", "/brain" => "BRAIN", _ => "WORKFLOWS" };
+                match harness::memory::MemoryStore::open(&self.cfg.memory).and_then(|s| Ok((s.path(file)?, s.read(file)?))) {
+                    Ok((p, doc)) => { let mut lines = vec![format!("{} — edit with any editor", p.display()), String::new()]; lines.extend(doc.lines().map(String::from)); self.blocks.push(Block::Banner(lines)); }
+                    Err(e) => self.blocks.push(Block::Error(format!("memory: {e:#}"))),
+                }
+            }
+            "/remember" => {
+                if arg.is_empty() { self.blocks.push(Block::Error("usage: /remember <text>   (adds to MEMORY.md › Preferences; use `/remember brain: <text>` or `workflows:` to target another file)".into())); }
+                else {
+                    let (file, section, text) = if let Some(t) = arg.strip_prefix("brain:") { ("BRAIN", "Lessons", t.trim()) } else if let Some(t) = arg.strip_prefix("workflows:") { ("WORKFLOWS", "Notes", t.trim()) } else { ("MEMORY", "Preferences", arg.as_str()) };
+                    match harness::memory::MemoryStore::open(&self.cfg.memory).and_then(|s| s.append(file, section, text)) {
+                        Ok(true) => self.blocks.push(Block::Memory(format!("{file} › {section}: {text}"))),
+                        Ok(false) => self.blocks.push(Block::System("already in memory".into())),
+                        Err(e) => self.blocks.push(Block::Error(format!("memory: {e:#}"))),
+                    }
+                }
+            }
+            "/reflect" => {
+                if self.running.is_some() { self.set_status("wait for the current turn to finish"); }
+                else {
+                    let tx = self.tx.clone(); let session = self.session.clone(); let cfg = self.cfg.clone();
+                    self.blocks.push(Block::System("reflecting on this session…".into()));
+                    tokio::spawn(async move {
+                        let sink = TuiSink(tx.clone());
+                        let res: Result<(), String> = async {
+                            let store = harness::memory::MemoryStore::open(&cfg.memory).map_err(|e| e.to_string())?;
+                            let client = Client::new(&cfg.llm).map_err(|e| e.to_string())?;
+                            let msgs = session.lock().await.clone();
+                            let items = store.reflect(&client, &msgs).await.map_err(|e| e.to_string())?;
+                            if items.is_empty() { sink.emit(&Event::Error { message: "reflection: nothing new worth remembering".into() }); }
+                            for (f, s, t) in items { sink.emit(&Event::Memory { file: f, section: s, text: t }); }
+                            Ok(())
+                        }.await;
+                        if let Err(e) = res { sink.emit(&Event::Error { message: format!("reflection failed: {e}") }); }
+                    });
+                }
+            }
+            "/video" => { if arg.is_empty() { self.blocks.push(Block::Error("usage: /video <path>".into())); } else { let p = if arg.starts_with('~') { PathBuf::from(arg.replacen('~', &std::env::var("HOME").unwrap_or_default(), 1)) } else { PathBuf::from(&arg) }; if p.is_file() { self.open_video(&p); } else { self.blocks.push(Block::Error(format!("no such file: {arg}"))); } } }
             "/exit" | "/quit" | "/q" => self.quit = true,
-            _ => self.blocks.push(Block::Error(format!("unknown command {cmd} — /help"))),
+            _ => {
+                let name = cmd.trim_start_matches('/');
+                let found = harness::plugins::Plugins::open().ok().and_then(|p| p.commands().into_iter().find(|c| c.name == name));
+                match found {
+                    Some(c) => { let prompt = c.template.replace("$ARGUMENTS", &arg); self.blocks.push(Block::System(format!("/{} (plugin {})", c.name, c.plugin))); if self.running.is_some() { self.queued.push(prompt); } else { self.start_run(prompt); } }
+                    None => self.blocks.push(Block::Error(format!("unknown command {cmd} — /help"))),
+                }
+            }
         }
     }
 
+    fn plugin_command(&mut self, arg: &str) {
+        let mut parts = arg.splitn(2, ' ');
+        let sub = parts.next().unwrap_or("").trim().to_string();
+        let rest = parts.next().unwrap_or("").trim().to_string();
+        let tx = self.tx.clone();
+        match sub.as_str() {
+            "" | "list" | "ls" | "refresh" => {
+                let refresh = sub == "refresh";
+                self.blocks.push(Block::System(if refresh { "refreshing plugin catalog from GitHub…".into() } else { "loading plugin catalog…".into() }));
+                tokio::spawn(async move {
+                    let res = async { harness::plugins::Plugins::open()?.catalog(refresh).await }.await.map_err(|e| format!("{e:#}"));
+                    let _ = tx.send(Msg::Catalog(res));
+                });
+            }
+            "install" | "add" => {
+                if rest.is_empty() { self.blocks.push(Block::Error("usage: /plugin install <owner/repo | git url | local dir>".into())); return; }
+                self.blocks.push(Block::System(format!("installing {rest}…")));
+                tokio::spawn(async move {
+                    let res = async { let p = harness::plugins::Plugins::open()?; let name = p.install(&rest).await?; let info = p.inspect(&p.dir.join(&name)); Ok::<_, anyhow::Error>((name, info)) }.await;
+                    match res {
+                        Ok((name, info)) => {
+                            let mut msg = format!("installed {name}: {} skill(s), {} command(s), {} MCP server(s){}", info.skills.len(), info.commands.len(), info.mcp_servers.len(), if info.ts_only { " — NOTE: TypeScript-only DSH plugin; its code needs the DSH runtime and cannot run here" } else { "" });
+                            if !info.skills.is_empty() { msg.push_str(&format!(" · skills: {}", info.skills.iter().map(|s| s.name.clone()).collect::<Vec<_>>().join(", "))); }
+                            if !info.commands.is_empty() { msg.push_str(&format!(" · commands: {}", info.commands.iter().map(|c| format!("/{}", c.name)).collect::<Vec<_>>().join(", "))); }
+                            let _ = tx.send(Msg::Notice(msg));
+                        }
+                        Err(e) => { let _ = tx.send(Msg::Notice(format!("install failed: {e:#}"))); }
+                    }
+                });
+                // reload after a short delay so MCP servers from the plugin start
+                let tx2 = self.tx.clone(); let net = self.net; let wd = self.workdir.clone();
+                tokio::spawn(async move { tokio::time::sleep(Duration::from_secs(8)).await; let ts = harness::tools::build_toolset(net, &wd, true).await; let _ = tx2.send(Msg::Toolset(Arc::new(ts))); });
+            }
+            "enable" | "disable" | "remove" | "rm" | "update" => {
+                if rest.is_empty() { self.blocks.push(Block::Error(format!("usage: /plugin {sub} <name>"))); return; }
+                let res: Result<String, String> = (|| {
+                    let mut p = harness::plugins::Plugins::open().map_err(|e| e.to_string())?;
+                    match sub.as_str() {
+                        "enable" => { p.set_enabled(&rest, true).map_err(|e| e.to_string())?; Ok(format!("enabled {rest}")) }
+                        "disable" => { p.set_enabled(&rest, false).map_err(|e| e.to_string())?; Ok(format!("disabled {rest}")) }
+                        "remove" | "rm" => { p.remove(&rest).map_err(|e| e.to_string())?; Ok(format!("removed {rest}")) }
+                        _ => { let tx = tx.clone(); let name = rest.clone(); tokio::spawn(async move { let r = async { harness::plugins::Plugins::open()?.update(&name).await }.await; let _ = tx.send(Msg::Notice(match r { Ok(m) => m, Err(e) => format!("update failed: {e:#}") })); }); Ok(format!("updating {rest}…")) }
+                    }
+                })();
+                match res { Ok(m) => { self.blocks.push(Block::System(m)); self.reload_toolset(); } Err(e) => self.blocks.push(Block::Error(e)) }
+            }
+            "info" | "show" => {
+                match harness::plugins::Plugins::open() {
+                    Ok(p) => match p.installed().into_iter().find(|x| x.name == rest || x.path.file_name().map(|n| n.to_string_lossy() == rest).unwrap_or(false)) {
+                        Some(pl) => {
+                            let mut lines = vec![format!("{} {} — {}", pl.name, pl.version, pl.description), format!("path: {}  origin: {}  enabled: {}", pl.path.display(), pl.origin.clone().unwrap_or_default(), pl.enabled)];
+                            for s in &pl.skills { lines.push(format!("  skill   {} — {}", s.name, truncate(&s.description, 90))); }
+                            for c in &pl.commands { lines.push(format!("  command /{} — {}", c.name, truncate(&c.description, 90))); }
+                            for m in &pl.mcp_servers { lines.push(format!("  mcp     {m}")); }
+                            if pl.ts_only { lines.push("  (TypeScript-only DSH plugin: code not runnable here)".into()); }
+                            self.blocks.push(Block::Banner(lines));
+                        }
+                        None => self.blocks.push(Block::Error(format!("no installed plugin '{rest}'"))),
+                    },
+                    Err(e) => self.blocks.push(Block::Error(e.to_string())),
+                }
+            }
+            _ => self.blocks.push(Block::Error("usage: /plugin [list|refresh] · install <owner/repo|url|dir> · enable|disable|remove|update|info <name>".into())),
+        }
+    }
+
+    fn show_catalog(&mut self, c: &harness::plugins::Catalog) {
+        let plugins = harness::plugins::Plugins::open().ok();
+        let installed = plugins.as_ref().map(|p| p.installed()).unwrap_or_default();
+        let mut lines = vec![format!("Plugins — ● enabled  ◐ installed (disabled)  ○ downloadable   ({} in catalog from topics {}; /plugin refresh to refetch)", c.entries.len(), harness::plugins::TOPICS.join(", "))];
+        lines.push(String::new());
+        if !installed.is_empty() {
+            lines.push("Installed:".into());
+            for p in &installed {
+                let dirname = p.path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+                let mark = if p.enabled { "●" } else { "◐" };
+                let what = format!("{}sk {}cmd {}mcp{}", p.skills.len(), p.commands.len(), p.mcp_servers.len(), if p.ts_only { " ts-only" } else { "" });
+                lines.push(format!("  {mark} {:<28} {:<22} {}", dirname, what, truncate(&p.description, 70)));
+            }
+            lines.push(String::new());
+        }
+        lines.push("Downloadable (/plugin install <owner/repo>):".into());
+        for e in c.entries.iter().take(60) {
+            let repo = e.full_name.rsplit('/').next().unwrap_or("");
+            let inst = installed.iter().find(|p| p.origin.as_deref().map(|o| o.contains(&e.full_name)).unwrap_or(false) || p.path.file_name().map(|n| n.to_string_lossy() == repo).unwrap_or(false));
+            let mark = match inst { Some(p) if p.enabled => "●", Some(_) => "◐", None => "○" };
+            lines.push(format!("  {mark} {:<40} ★{:<6} {:<10} {}", e.full_name, e.stars, e.language, truncate(&e.description, 60)));
+        }
+        lines.push(String::new());
+        lines.push("Note: DSH plugins are TypeScript modules; this harness loads their skills, commands and MCP servers. Pure-code plugins are marked ts-only after install.".into());
+        self.blocks.push(Block::Banner(lines));
+    }
+
     fn start_run(&mut self, text: String) {
+        self.fold_previous();
+        self.think_scroll = 0;
         self.harvest_image_paths(&text);
         let atts: Vec<Attachment> = std::mem::take(&mut self.attachments);
         let keys: Vec<String> = atts.iter().map(|a| self.register_image(a.img.clone())).collect();
         self.blocks.push(Block::User(text.clone(), keys));
         let user_msg = if atts.is_empty() { Message::user(text.clone()) } else {
             let mut parts = vec![Content::text_part(&text)];
-            for (i, a) in atts.iter().enumerate() { parts.push(Content::text_part(&format!("[image #{}: {} {}×{}]", i + 1, a.path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default(), a.dims.0, a.dims.1))); parts.push(Content::image_part(&a.mime, &a.b64)); }
+            for (i, a) in atts.iter().enumerate() { parts.push(Content::text_part(&format!("[image #{}: {} ({}×{}){}]", i + 1, a.path.display(), a.dims.0, a.dims.1, a.label.as_ref().map(|l| format!(" — {l}")).unwrap_or_default()))); parts.push(Content::image_part(&a.mime, &a.b64)); }
             Message::user_parts(parts)
         };
         self.scroll_up = 0;
@@ -471,18 +780,25 @@ impl App {
         let tx = self.tx.clone(); let session = self.session.clone();
         let mut cfg = self.cfg.clone(); cfg.llm.model = self.model.clone(); cfg.net.enabled = self.net;
         let workdir = self.workdir.clone();
+        let toolset = self.toolset.clone();
+        let budget = self.cfg.llm.effective_budget(if self.metrics.ctx_len > 0 { Some(self.metrics.ctx_len) } else { None });
         self.run_started = Instant::now();
         self.metrics.turn_start = Some(Instant::now()); self.metrics.live_peak = 0.0; self.metrics.live_chars.clear();
         let handle = tokio::spawn(async move {
             let res: Result<String, String> = async {
                 let client = Client::new(&cfg.llm).map_err(|e| e.to_string())?;
-                let ctx = ToolCtx { workdir: workdir.clone(), timeout: Duration::from_secs(cfg.agent.tool_timeout_secs), max_output: cfg.agent.max_tool_output_chars, net: cfg.net.clone() };
-                let registry = Registry::defaults(cfg.net.enabled);
+                let store = if cfg.memory.enabled { harness::memory::MemoryStore::open(&cfg.memory).ok() } else { None };
+                let ctx = ToolCtx { workdir: workdir.clone(), timeout: Duration::from_secs(cfg.agent.tool_timeout_secs), max_output: cfg.agent.max_tool_output_chars, net: cfg.net.clone(), memory: store.clone() };
+                let fallback = Registry::defaults(cfg.net.enabled);
+                let (registry, extra_prompt): (&Registry, String) = match &toolset { Some(ts) => (&ts.registry, ts.prompt_extra.clone()), None => (&fallback, String::new()) };
                 let sink = TuiSink(tx.clone());
-                let agent = Agent { client: &client, registry: &registry, ctx: &ctx, max_turns: cfg.agent.max_turns, context_budget: cfg.llm.context_budget_tokens, sink: &sink, stream: true };
-                let system = system_prompt(&workdir.display().to_string(), &registry.names(), Some("You are in an interactive session: the user can see everything and will reply; keep final answers concise."));
+                let agent = Agent { client: &client, registry, ctx: &ctx, max_turns: cfg.agent.max_turns, context_budget: budget, sink: &sink, stream: true };
+                let extra = format!("You are in an interactive session: the user can see everything and will reply; keep final answers concise.{extra_prompt}");
+                let system = harness::agent::system_prompt_with_memory(&workdir.display().to_string(), &registry.names(), Some(&extra), store.as_ref());
                 let mut msgs = session.lock().await;
-                agent.run_turn_message(&mut msgs, &system, user_msg).await.map(|(t, _)| t).map_err(|e| format!("{e:#}"))
+                let out = agent.run_turn_message(&mut msgs, &system, user_msg).await.map_err(|e| format!("{e:#}"))?;
+                if let Some(m) = &store { harness::agent::reflect_after_run(&client, m, &msgs, &out.1, &sink).await; }
+                Ok(out.0)
             }.await;
             let _ = tx.send(Msg::Done(res));
         });
@@ -508,8 +824,18 @@ impl App {
         match m {
             Msg::Ev(e) => self.on_event(e),
             Msg::Sys(s) => self.metrics.on_sys(s),
-            Msg::CtxLen(n) => { self.metrics.ctx_len = n; }
-            Msg::Pasted(Ok(p)) => self.attach(&p),
+            Msg::CtxLen(n) => { self.metrics.ctx_len = n; self.blocks.push(Block::System(format!("auto-compaction at {} tokens ({}% of context); /compact to force", fmt_k(self.cfg.llm.effective_budget(Some(n))), (self.cfg.llm.compact_at_fraction * 100.0) as u64))); }
+            Msg::Toolset(ts) => { let n = ts.registry.len(); self.toolset = Some(ts); self.set_status(format!("tools ready: {n}")); }
+            Msg::Notice(t) => self.blocks.push(Block::System(t)),
+            Msg::Catalog(Ok(c)) => self.show_catalog(&c),
+            Msg::Catalog(Err(e)) => self.blocks.push(Block::Error(format!("plugin catalog: {e}"))),
+            Msg::Pasted(Ok(p)) => { if image_mime(&p).is_some() { self.attach(&p) } else if video_ext(&p) { self.open_video(&p) } else { let t = format!("{} ", p.display()); self.insert_str(&t); self.set_status(format!("inserted file path {}", short_path(&p))); } }
+            Msg::Frames(Ok((path, duration, frames))) => {
+                let mut fr = Vec::new();
+                for (ts, p) in frames { if let Ok(bytes) = std::fs::read(&p) { if let Ok(img) = image::load_from_memory(&bytes) { let key = self.register_image(img); fr.push((ts, p, key)); } } }
+                if let Some(v) = &mut self.video { if v.path == path { v.frames = fr; v.duration = duration; v.loading = false; v.cur = 0; } }
+            }
+            Msg::Frames(Err(e)) => { if let Some(v) = &mut self.video { v.loading = false; v.error = Some(e); } }
             Msg::Pasted(Err(e)) => self.set_status(e),
             Msg::Done(res) => {
                 self.running = None;
@@ -526,23 +852,23 @@ impl App {
             Event::ModelResponse { prompt_tokens, completion_tokens, ttft_secs, secs, .. } => { self.metrics.on_call(prompt_tokens, completion_tokens, ttft_secs, secs); self.last_prompt_tokens = prompt_tokens; }
             Event::ReasoningDelta { text } => {
                 self.metrics.on_delta(text.chars().count());
-                if let Some(Block::Reasoning { text: t, streaming: true }) = self.blocks.last_mut() { t.push_str(&text); }
-                else { self.blocks.push(Block::Reasoning { text, streaming: true }); }
+                if let Some(Block::Reasoning { text: t, streaming: true, .. }) = self.blocks.last_mut() { t.push_str(&text); }
+                else { self.blocks.push(Block::Reasoning { text, streaming: true, show: None }); }
             }
             Event::Reasoning { text } => {
-                if let Some(Block::Reasoning { text: t, streaming }) = self.blocks.last_mut() { *t = text; *streaming = false; }
-                else if !text.trim().is_empty() { self.blocks.push(Block::Reasoning { text, streaming: false }); }
+                if let Some(Block::Reasoning { text: t, streaming, .. }) = self.blocks.last_mut() { *t = text; *streaming = false; }
+                else if !text.trim().is_empty() { self.blocks.push(Block::Reasoning { text, streaming: false, show: None }); }
             }
             Event::AssistantDelta { text } => {
                 self.metrics.on_delta(text.chars().count());
-                if let Some(Block::Assistant { text: t, streaming: true }) = self.blocks.last_mut() { t.push_str(&text); }
-                else { self.finish_streaming(); self.blocks.push(Block::Assistant { text, streaming: true }); }
+                if let Some(Block::Assistant { text: t, streaming: true, .. }) = self.blocks.last_mut() { t.push_str(&text); }
+                else { self.finish_streaming(); self.blocks.push(Block::Assistant { text, streaming: true, folded: false }); }
             }
             Event::Assistant { text } => {
-                if let Some(Block::Assistant { text: t, streaming }) = self.blocks.last_mut() { *t = text; *streaming = false; }
-                else if !text.trim().is_empty() { self.blocks.push(Block::Assistant { text, streaming: false }); }
+                if let Some(Block::Assistant { text: t, streaming, .. }) = self.blocks.last_mut() { *t = text; *streaming = false; }
+                else if !text.trim().is_empty() { self.blocks.push(Block::Assistant { text, streaming: false, folded: false }); }
             }
-            Event::ToolCall { id, name, args } => { self.finish_streaming(); self.blocks.push(Block::Tool { id, name, args, result: None, secs: 0.0, images: 0, interrupted: false }); }
+            Event::ToolCall { id, name, args } => { self.finish_streaming(); self.blocks.push(Block::Tool { id, name, args, result: None, secs: 0.0, images: 0, interrupted: false, fold: None }); }
             Event::ToolResult { id, result, secs, images, .. } => {
                 if !images.is_empty() {
                     use base64::Engine;
@@ -552,7 +878,10 @@ impl App {
                 }
                 if let Some(Block::Tool { result: r, secs: s, images: im, .. }) = self.blocks.iter_mut().rev().find(|b| matches!(b, Block::Tool { id: i, .. } if *i == id)) { *r = Some(result); *s = secs; *im = images.len(); }
             }
-            Event::Compacted { count, prompt_tokens } => self.blocks.push(Block::System(format!("compacted {count} old tool results (context was {prompt_tokens} tokens)"))),
+            Event::Compacted { count, prompt_tokens, summary } => {
+                self.blocks.push(Block::System(format!("⟲ context compacted: {count} messages → handoff note (context was {} tokens)", fmt_k(prompt_tokens))));
+                if !summary.is_empty() { self.blocks.push(Block::Assistant { text: format!("Handoff note (context compaction)\n{summary}"), streaming: false, folded: true }); }
+            }
             Event::RunFinished { stop_reason, turns, tool_calls, prompt_tokens, completion_tokens, wall_secs } => {
                 self.finish_streaming();
                 self.total_prompt += prompt_tokens; self.total_completion += completion_tokens; self.turn_tokens = completion_tokens;
@@ -560,8 +889,33 @@ impl App {
                 self.blocks.push(Block::Finished(s));
             }
             Event::Error { message } => { self.finish_streaming(); self.blocks.push(Block::Error(message)); }
+            Event::Memory { file, section, text } => { self.blocks.push(Block::Memory(format!("{} › {section}: {text}", file.trim_end_matches(".md")))); }
         }
     }
+    /// Click on a block: fold/unfold it.
+    fn toggle_fold(&mut self, idx: usize) {
+        let global_tools = self.expand_tools; let global_think = self.show_thinking;
+        if let Some(b) = self.blocks.get_mut(idx) {
+            match b {
+                Block::Assistant { folded, .. } => *folded = !*folded,
+                Block::Reasoning { show, .. } => { let cur = show.unwrap_or(global_think); *show = Some(!cur); }
+                Block::Tool { fold, .. } => { let cur = fold.map(|f| !f).unwrap_or(global_tools); *fold = Some(cur); } // cur = expanded? → fold it
+                _ => {}
+            }
+        }
+    }
+    /// When a new turn starts, collapse the previous turn's outputs (click to expand again).
+    fn fold_previous(&mut self) {
+        for b in self.blocks.iter_mut() {
+            match b {
+                Block::Assistant { text, folded, .. } => { if text.lines().count() > 6 { *folded = true; } }
+                Block::Reasoning { show, .. } => *show = Some(false),
+                Block::Tool { fold, .. } => *fold = Some(true),
+                _ => {}
+            }
+        }
+    }
+
     fn finish_streaming(&mut self) {
         for b in self.blocks.iter_mut().rev().take(3) {
             match b { Block::Assistant { streaming, .. } | Block::Reasoning { streaming, .. } => *streaming = false, _ => {} }
@@ -581,7 +935,17 @@ const COMMANDS: &[(&str, &str)] = &[
     ("/expand", "toggle expanded tool output (ctrl+o)"),
     ("/panel", "toggle the dashboard panel (ctrl+p)"),
     ("/cost", "token usage for this session"),
+    ("/compact", "compact the context into a precise handoff note: /compact [focus]"),
     ("/config", "effective configuration"),
+    ("/memory", "show MEMORY.md (settings · preferences · ideas)"),
+    ("/brain", "show BRAIN.md (what the agent learned)"),
+    ("/workflows", "show WORKFLOWS.md (recipes)"),
+    ("/remember", "add a note: /remember <text> | brain: <text> | workflows: <text>"),
+    ("/reflect", "ask the model what to remember from this session"),
+    ("/video", "open the frame scrubber for a video: /video <path>"),
+    ("/plugin", "plugins: list · install <owner/repo> · enable|disable|remove|update|info <name>"),
+    ("/mcp", "show configured MCP servers and live MCP tools"),
+    ("/reload", "restart tools, MCP servers and plugins"),
     ("/exit", "quit"),
 ];
 
@@ -616,19 +980,24 @@ fn draw(f: &mut Frame, app: &mut App) {
     let chunks = Layout::vertical([Constraint::Min(1), Constraint::Length(notice_h), Constraint::Length(1), Constraint::Length(input_h), Constraint::Length(1), Constraint::Length(1)]).split(area);
     let (tr_area, no_area, top_area, in_area, bot_area, st_area) = (chunks[0], chunks[1], chunks[2], chunks[3], chunks[4], chunks[5]);
 
+    if app.video.is_some() { draw_video(f, app, tr_area); }
     // transcript
     let mut lines: Vec<Line> = Vec::new();
     let mut ph: Vec<Placeholder> = Vec::new();
-    for b in &app.blocks { render_block(b, app, width, &mut lines, &mut ph); }
+    let mut line_map: Vec<(usize, usize, usize)> = Vec::new();
+    for (i, b) in app.blocks.iter().enumerate() { let a = lines.len(); render_block(b, app, width, &mut lines, &mut ph); line_map.push((a, lines.len(), i)); }
     let total = lines.len();
     let h = tr_area.height as usize;
     let max_up = total.saturating_sub(h);
     if app.scroll_up > max_up { app.scroll_up = max_up; }
     let start = max_up - app.scroll_up;
+    app.line_map = line_map; app.tr_rect = tr_area; app.tr_start = start;
+    app.panel_rect = panel_area.map(|(_, pa)| pa).unwrap_or_default();
     let visible: Vec<Line> = lines.into_iter().skip(start).take(h).collect();
-    f.render_widget(Paragraph::new(visible), tr_area);
+    if app.video.is_none() { f.render_widget(Paragraph::new(visible), tr_area); }
     // images: draw those whose slot is fully inside the visible window
     for p in ph {
+        if app.video.is_some() { break; }
         let rows = p.slot.rows as usize;
         if p.line >= start && p.line + rows <= start + h {
             let indent = if p.slot.key.is_empty() { 0 } else { 0 };
@@ -681,6 +1050,54 @@ fn draw(f: &mut Frame, app: &mut App) {
     f.render_widget(Paragraph::new(Line::from(st)), st_area);
 }
 
+// ───────────────────────── video scrubber ─────────────────────────
+fn draw_video(f: &mut Frame, app: &mut App, area: Rect) {
+    let dim = Style::default().fg(DIM);
+    f.render_widget(ratatui::widgets::Clear, area);
+    let Some(v) = &app.video else { return };
+    let title = format!(" 🎞  {}  ·  {:.1}s  ·  {} frames  ·  {} selected ", short_path(&v.path), v.duration, v.frames.len(), v.selected.len());
+    let rows = Layout::vertical([Constraint::Length(1), Constraint::Min(8), Constraint::Length(1), Constraint::Length(7), Constraint::Length(2)]).split(area);
+    f.render_widget(Paragraph::new(Line::from(vec![Span::styled(title, Style::default().fg(Color::Black).bg(ORANGE).bold())])), rows[0]);
+    if v.loading { f.render_widget(Paragraph::new(Span::styled("  extracting frames with ffmpeg…", Style::default().fg(ORANGE))), rows[1]); }
+    else if let Some(e) = &v.error { f.render_widget(Paragraph::new(Span::styled(format!("  {e}"), Style::default().fg(ERR))), rows[1]); }
+    // main frame
+    let cur = v.cur; let frames: Vec<(f64, String)> = v.frames.iter().map(|(t, _, k)| (*t, k.clone())).collect();
+    let selected = v.selected.clone();
+    let (cw, ch) = app.picker.font_size();
+    if let Some((ts, key)) = frames.get(cur).cloned() {
+        if let Some((proto, (iw, ih))) = app.images.get_mut(&key) {
+            let (iw, ih) = (*iw as f64, *ih as f64);
+            let max_cols = rows[1].width.saturating_sub(4) as f64; let max_rows = rows[1].height.saturating_sub(1) as f64;
+            let scale = f64::min(max_cols * cw as f64 / iw, max_rows * ch as f64 / ih);
+            let cols = ((iw * scale / cw as f64).floor() as u16).max(1); let rws = ((ih * scale / ch as f64).floor() as u16).max(1);
+            let x = rows[1].x + (rows[1].width.saturating_sub(cols)) / 2;
+            f.render_stateful_widget(StatefulImage::default(), Rect { x, y: rows[1].y + 1, width: cols, height: rws }, proto);
+        }
+        let mark = if selected.contains(&cur) { "● selected" } else { "○ not selected" };
+        f.render_widget(Paragraph::new(Line::from(vec![Span::styled(format!("  frame {}/{}  ·  t = {:.1}s  ·  ", cur + 1, frames.len(), ts), dim), Span::styled(mark, Style::default().fg(if selected.contains(&cur) { OK } else { DIM }))])), rows[2]);
+    }
+    // strip: thumbnails around cur
+    app.strip_rects.clear();
+    let tw: u16 = 14; let th: u16 = 6; let gap = 1;
+    let per = ((rows[3].width as usize) / (tw as usize + gap)).max(1);
+    let first = cur.saturating_sub(per / 2).min(frames.len().saturating_sub(per));
+    let mut x = rows[3].x;
+    for i in first..(first + per).min(frames.len()) {
+        let r = Rect { x, y: rows[3].y, width: tw, height: th };
+        let (_, key) = &frames[i];
+        if let Some((proto, _)) = app.images.get_mut(key) { f.render_stateful_widget(StatefulImage::default(), Rect { x: r.x + 1, y: r.y, width: tw - 2, height: th - 1 }, proto); }
+        let lbl = format!("{}{:.1}s", if selected.contains(&i) { "●" } else { " " }, frames[i].0);
+        let st = if i == cur { Style::default().fg(Color::Black).bg(ORANGE).bold() } else if selected.contains(&i) { Style::default().fg(OK) } else { dim };
+        f.render_widget(Paragraph::new(Span::styled(format!("{:^w$}", lbl, w = tw as usize), st)), Rect { x: r.x, y: r.y + th - 1, width: tw, height: 1 });
+        app.strip_rects.push((r, i));
+        x += tw + gap as u16;
+    }
+    f.render_widget(Paragraph::new(vec![
+        Line::from(Span::styled("  ←/→ or wheel: move · space or click: select · a: all · enter: attach selected (or current) frames · esc: cancel", dim)),
+        Line::from(Span::styled("  Selected frames are sent to the model as images with their timestamps; frame files are kept in the pastes folder.", dim)),
+    ]), rows[4]);
+}
+
 // ───────────────────────── dashboard panel ─────────────────────────
 fn draw_panel(f: &mut Frame, app: &App, area: Rect) {
     let m = &app.metrics;
@@ -695,14 +1112,16 @@ fn draw_panel(f: &mut Frame, app: &App, area: Rect) {
     ]).split(area);
 
     // ── Thinking ──
-    f.render_widget(Paragraph::new(title(if running { "Thinking · live" } else { "Thinking · last" })), rows[0]);
+    f.render_widget(Paragraph::new(title(&format!("{}{}", if running { "Thinking · live" } else { "Thinking · last" }, if app.think_scroll > 0 { " ↑" } else { "" }))), rows[0]);
     let think = app.blocks.iter().rev().find_map(|b| if let Block::Reasoning { text, .. } = b { Some(text.clone()) } else { None }).unwrap_or_default();
     let tw = rows[1].width as usize;
     let mut tl: Vec<Line> = Vec::new();
     for l in think.lines().filter(|l| !l.trim().is_empty()) { push_wrapped(&mut tl, vec![Span::styled(l.trim().to_string(), Style::default().fg(THINK))], tw, 0); }
     let th = rows[1].height as usize;
-    let skip = tl.len().saturating_sub(th);
-    let tail: Vec<Line> = tl.into_iter().skip(skip).collect();
+    let max_up = tl.len().saturating_sub(th);
+    let up = app.think_scroll.min(max_up);
+    let skip = max_up - up;
+    let tail: Vec<Line> = tl.into_iter().skip(skip).take(th).collect();
     if tail.is_empty() { f.render_widget(Paragraph::new(Span::styled("(reasoning will stream here)", dim)), rows[1]); } else { f.render_widget(Paragraph::new(tail), rows[1]); }
 
     // ── Tokens ──
@@ -793,7 +1212,14 @@ fn render_block(b: &Block, app: &App, width: usize, out: &mut Vec<Line<'static>>
             for k in imgs { image_slot(app, k, (w.saturating_sub(4)).min(60) as u16, 12, 2, out, ph); out.push(Line::raw("")); }
             out.push(Line::raw(""));
         }
-        Block::Assistant { text, streaming } => {
+        Block::Assistant { text, streaming, folded } => {
+            if *folded && !*streaming {
+                let n = text.lines().count();
+                let first = text.lines().find(|l| !l.trim().is_empty()).unwrap_or("").to_string();
+                push_wrapped(out, vec![Span::styled("⏺ ", Style::default().fg(Color::White)), Span::raw(truncate(&first, w.saturating_sub(30))), Span::styled(format!("  … +{} lines (click)", n.saturating_sub(1)), Style::default().fg(DIM).italic())], w, 2);
+                out.push(Line::raw(""));
+                return;
+            }
             let mut first = true;
             for l in text.lines() {
                 let bullet = if first { Span::styled("⏺ ", Style::default().fg(Color::White)) } else { Span::raw("  ") };
@@ -804,9 +1230,9 @@ fn render_block(b: &Block, app: &App, width: usize, out: &mut Vec<Line<'static>>
             if text.is_empty() && *streaming { out.push(Line::from(vec![Span::styled("⏺ ", Style::default().fg(Color::White)), Span::styled("▍", Style::default().fg(ORANGE))])); }
             out.push(Line::raw(""));
         }
-        Block::Reasoning { text, streaming } => {
+        Block::Reasoning { text, streaming, show } => {
             let st = Style::default().fg(THINK).italic();
-            if app.show_thinking {
+            if show.unwrap_or(app.show_thinking) {
                 let mut first = true;
                 for l in text.lines().filter(|l| !l.trim().is_empty()) { push_wrapped(out, vec![Span::styled(if first { "✻ " } else { "  " }, st), Span::styled(l.to_string(), st)], w, 2); first = false; }
                 if *streaming { if let Some(last) = out.last_mut() { last.spans.push(Span::styled("▍", st)); } }
@@ -814,11 +1240,12 @@ fn render_block(b: &Block, app: &App, width: usize, out: &mut Vec<Line<'static>>
                 let firstline = text.lines().find(|l| !l.trim().is_empty()).unwrap_or("").trim().to_string();
                 let n = text.chars().count();
                 let lbl = if *streaming { format!("✻ Thinking… {}", truncate(&firstline, w.saturating_sub(40))) } else { format!("✻ Thought for {} chars: {}", n, truncate(&firstline, w.saturating_sub(40))) };
-                push_wrapped(out, vec![Span::styled(lbl, st), Span::styled("  (ctrl+t)", Style::default().fg(DIM))], w, 2);
+                push_wrapped(out, vec![Span::styled(lbl, st), Span::styled("  (click · ctrl+t)", Style::default().fg(DIM))], w, 2);
             }
             out.push(Line::raw(""));
         }
-        Block::Tool { id, name, args, result, secs, images, interrupted } => {
+        Block::Tool { id, name, args, result, secs, images, interrupted, fold } => {
+            let expanded = fold.map(|f| !f).unwrap_or(app.expand_tools);
             let (bullet_style, done) = match (result, interrupted) {
                 (Some(r), _) if r.starts_with("error:") => (Style::default().fg(ERR), true),
                 (Some(_), _) => (Style::default().fg(OK), true),
@@ -833,11 +1260,11 @@ fn render_block(b: &Block, app: &App, width: usize, out: &mut Vec<Line<'static>>
                 Some(r) => {
                     let is_err = r.starts_with("error:");
                     let lines: Vec<&str> = r.lines().collect();
-                    let show = if app.expand_tools { lines.len().min(60) } else { 1 };
+                    let show = if expanded { lines.len().min(60) } else { 1 };
                     for (i, l) in lines.iter().take(show).enumerate() {
                         let pre = if i == 0 { "  ⎿  " } else { "     " };
                         let mut spans = vec![Span::styled(pre, Style::default().fg(DIM)), Span::styled(l.to_string(), Style::default().fg(if is_err { ERR } else { DIM }))];
-                        if i == show - 1 && lines.len() > show { spans.push(Span::styled(format!("  … +{} lines (ctrl+o)", lines.len() - show), Style::default().fg(DIM).italic())); }
+                        if i == show - 1 && lines.len() > show { spans.push(Span::styled(format!("  … +{} lines (click · ctrl+o)", lines.len() - show), Style::default().fg(DIM).italic())); }
                         push_wrapped(out, spans, w, 5);
                     }
                     if lines.is_empty() { out.push(Line::from(vec![Span::styled("  ⎿  ", Style::default().fg(DIM)), Span::styled("(no output)", Style::default().fg(DIM))])); }
@@ -850,6 +1277,7 @@ fn render_block(b: &Block, app: &App, width: usize, out: &mut Vec<Line<'static>>
             }
         }
         Block::System(t) => { push_wrapped(out, vec![Span::styled("· ", Style::default().fg(DIM)), Span::styled(t.clone(), Style::default().fg(DIM))], w, 2); }
+        Block::Memory(t) => { push_wrapped(out, vec![Span::styled("🧠 ", Style::default()), Span::styled(t.clone(), Style::default().fg(OK))], w, 3); }
         Block::Error(t) => { for (i, l) in t.lines().enumerate() { push_wrapped(out, vec![Span::styled(if i == 0 { "✗ " } else { "  " }, Style::default().fg(ERR)), Span::styled(l.to_string(), Style::default().fg(ERR))], w, 2); } out.push(Line::raw("")); }
         Block::Finished(t) => { push_wrapped(out, vec![Span::styled("  ✓ ", Style::default().fg(OK)), Span::styled(t.clone(), Style::default().fg(DIM))], w, 4); }
     }

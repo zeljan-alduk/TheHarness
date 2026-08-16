@@ -1,7 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use base64::Engine;
-use harness::agent::{system_prompt, Agent};
+use harness::agent::Agent;
 use harness::config::Config;
 use harness::events::{Event, Sink};
 use harness::llm::Client;
@@ -61,11 +61,14 @@ async fn start_run(app: AppHandle, state: State<'_, RunState>, task: String, wor
     let handle = tauri::async_runtime::spawn(async move {
         let result: Result<String, String> = async {
             let client = Client::new(&cfg.llm).map_err(|e| e.to_string())?;
-            let ctx = ToolCtx { workdir: workdir.clone(), timeout: Duration::from_secs(cfg.agent.tool_timeout_secs), max_output: cfg.agent.max_tool_output_chars, net: cfg.net.clone() };
+            let store = if cfg.memory.enabled { harness::memory::MemoryStore::open(&cfg.memory).ok() } else { None };
+            if let Some(m) = &store { let _ = m.touch_project(&workdir); }
+            let ctx = ToolCtx { workdir: workdir.clone(), timeout: Duration::from_secs(cfg.agent.tool_timeout_secs), max_output: cfg.agent.max_tool_output_chars, net: cfg.net.clone(), memory: store.clone() };
             let registry = Registry::defaults(cfg.net.enabled);
-            let system = system_prompt(&workdir.display().to_string(), &registry.names(), None);
+            let system = harness::agent::system_prompt_with_memory(&workdir.display().to_string(), &registry.names(), None, store.as_ref());
             let sink = TauriSink { app: app2.clone() };
-            let agent = Agent { client: &client, registry: &registry, ctx: &ctx, max_turns: cfg.agent.max_turns, context_budget: cfg.llm.context_budget_tokens, sink: &sink, stream: true };
+            let budget = cfg.llm.effective_budget(harness::llm::detect_context_length(&cfg.llm.base_url, &cfg.llm.model).await.map(|d| d.0));
+            let agent = Agent { client: &client, registry: &registry, ctx: &ctx, max_turns: cfg.agent.max_turns, context_budget: budget, sink: &sink, stream: true };
             agent.run(&system, &task).await.map(|(t, _)| t).map_err(|e| format!("{e:#}"))
         }.await;
         let payload = match result {

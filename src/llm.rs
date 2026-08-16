@@ -265,6 +265,35 @@ impl Client {
     }
 }
 
+/// Detect the loaded context length of `model` from the server. Tries LM Studio (`/api/v0/models`),
+/// llama.cpp server (`/props`), Ollama (`/api/show`). Returns (tokens, source).
+pub async fn detect_context_length(base_url: &str, model: &str) -> Option<(u64, &'static str)> {
+    let root = base_url.trim_end_matches('/').trim_end_matches("/v1").to_string();
+    let http = reqwest::Client::builder().timeout(std::time::Duration::from_secs(4)).build().ok()?;
+    // LM Studio
+    if let Ok(r) = http.get(format!("{root}/api/v0/models")).send().await {
+        if let Ok(v) = r.json::<Value>().await {
+            for m in v["data"].as_array().cloned().unwrap_or_default() {
+                if m["id"].as_str() == Some(model) {
+                    if let Some(n) = m["loaded_context_length"].as_u64() { return Some((n, "LM Studio (loaded)")); }
+                    if let Some(n) = m["max_context_length"].as_u64() { return Some((n, "LM Studio (max)")); }
+                }
+            }
+        }
+    }
+    // llama.cpp server
+    if let Ok(r) = http.get(format!("{root}/props")).send().await {
+        if let Ok(v) = r.json::<Value>().await { if let Some(n) = v["default_generation_settings"]["n_ctx"].as_u64().or_else(|| v["n_ctx"].as_u64()) { return Some((n, "llama.cpp")); } }
+    }
+    // Ollama
+    if let Ok(r) = http.post(format!("{root}/api/show")).json(&json!({"model": model})).send().await {
+        if let Ok(v) = r.json::<Value>().await {
+            if let Some(obj) = v["model_info"].as_object() { for (k, val) in obj { if k.ends_with(".context_length") { if let Some(n) = val.as_u64() { return Some((n, "Ollama (model max)")); } } } }
+        }
+    }
+    None
+}
+
 fn split_think(s: &str) -> (Option<String>, String) {
     if let (Some(a), Some(b)) = (s.find("<think>"), s.find("</think>")) {
         if a < b {

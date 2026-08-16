@@ -42,6 +42,7 @@ pub async fn run_shell(cmd: &str, cwd: &Path, timeout: Duration, max_output: usi
         if !is_secret_env(&k) { c.env(k, v); }
     }
     c.env("HARNESS", "1").env("CI", "1").env("GIT_TERMINAL_PROMPT", "0").env("TERM", "dumb");
+    c.env("PATH", crate::setup::path_with_bin_dir(cwd));
     // New session => own process group, so we can kill the whole tree on timeout.
     unsafe { c.pre_exec(|| { libc::setsid(); Ok(()) }); }
 

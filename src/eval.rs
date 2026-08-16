@@ -91,10 +91,13 @@ pub async fn run_task(cfg: &Config, client: &Client, task_dir: &Path, spec: &Tas
         timeout: Duration::from_secs(cfg.agent.tool_timeout_secs),
         max_output: cfg.agent.max_tool_output_chars,
         net: cfg.net.clone(),
+        // evals get a throwaway memory store so the fitness function never depends on (or pollutes) the user's memory
+        memory: crate::memory::MemoryStore::scratch(&workdir.join(".harness-memory"), &cfg.memory).ok(),
     };
     let registry = Registry::defaults(cfg.net.enabled);
     let sink = crate::events::StderrSink { verbose };
-    let agent = Agent { client, registry: &registry, ctx: &ctx, max_turns: spec.max_turns.unwrap_or(cfg.agent.max_turns), context_budget: cfg.llm.context_budget_tokens, sink: &sink, stream: true };
+    let budget = cfg.llm.effective_budget(crate::llm::detect_context_length(&cfg.llm.base_url, &cfg.llm.model).await.map(|d| d.0));
+    let agent = Agent { client, registry: &registry, ctx: &ctx, max_turns: spec.max_turns.unwrap_or(cfg.agent.max_turns), context_budget: budget, sink: &sink, stream: true };
     let system = crate::agent::system_prompt(&ctx.workdir.display().to_string(), &registry.names(), None);
     let timeout = Duration::from_secs(spec.timeout_secs.unwrap_or(cfg.eval.task_timeout_secs));
 

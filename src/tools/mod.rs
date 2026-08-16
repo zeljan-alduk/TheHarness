@@ -2,6 +2,8 @@ pub mod bash;
 pub mod download;
 pub mod fs;
 pub mod image;
+pub mod memory;
+pub mod skill;
 pub mod web;
 
 use crate::llm::ToolDef;
@@ -16,6 +18,8 @@ pub struct ToolCtx {
     pub timeout: Duration,
     pub max_output: usize,
     pub net: crate::config::NetConfig,
+    /// Persistent memory store (None = memory tool disabled, e.g. in evals).
+    pub memory: Option<crate::memory::MemoryStore>,
 }
 
 impl ToolCtx {
@@ -77,6 +81,8 @@ impl Registry {
             Box::new(fs::EditFile),
             Box::new(fs::ListDir),
             Box::new(image::ViewImage),
+            Box::new(memory::MemoryTool),
+            Box::new(skill::LoadSkill),
         ];
         if net_enabled {
             tools.push(Box::new(web::WebFetch));
@@ -85,6 +91,11 @@ impl Registry {
         }
         Self { tools }
     }
+
+    /// Add tools at runtime (MCP servers, plugins).
+    pub fn extend(&mut self, extra: Vec<Box<dyn Tool>>) { self.tools.extend(extra); }
+    pub fn len(&self) -> usize { self.tools.len() }
+    pub fn is_empty(&self) -> bool { self.tools.is_empty() }
 
     pub fn defs(&self) -> Vec<ToolDef> {
         self.tools.iter().map(|t| ToolDef::new(t.name(), t.description(), t.parameters())).collect()
@@ -112,6 +123,28 @@ impl Registry {
     }
 }
 
+/// Everything a session needs: built-in tools + MCP servers (global, project, plugins). Servers stay
+/// alive as long as the returned handles are kept.
+pub struct Toolset { pub registry: Registry, pub notes: Vec<String>, pub servers: Vec<std::sync::Arc<tokio::sync::Mutex<crate::mcp::McpServer>>>, pub prompt_extra: String }
+
+pub async fn build_toolset(net_enabled: bool, workdir: &Path, with_mcp: bool) -> Toolset {
+    let mut registry = Registry::defaults(net_enabled);
+    let mut notes = Vec::new();
+    let mut servers = Vec::new();
+    let mut prompt_extra = String::new();
+    let plugins = crate::plugins::Plugins::open().ok();
+    if let Some(p) = &plugins { prompt_extra.push_str(&p.prompt_block()); }
+    if with_mcp {
+        let extra = plugins.as_ref().map(|p| p.mcp_files()).unwrap_or_default();
+        let (tools, errs, srv) = crate::mcp::start_all(workdir, &extra).await;
+        if !tools.is_empty() { notes.push(format!("MCP: {} tool(s) from {} server(s)", tools.len(), srv.len())); }
+        for e in errs { notes.push(format!("MCP: {e}")); }
+        registry.extend(tools);
+        servers = srv;
+    }
+    Toolset { registry, notes, servers, prompt_extra }
+}
+
 pub fn arg_str<'a>(args: &'a Value, key: &str) -> Result<&'a str> {
     args.get(key).and_then(|v| v.as_str()).ok_or_else(|| anyhow::anyhow!("missing required string argument '{key}'"))
 }
@@ -122,7 +155,7 @@ mod tests {
     fn ctx() -> ToolCtx {
         let d = std::env::temp_dir().join(format!("harness-test-{}", std::process::id()));
         std::fs::create_dir_all(&d).unwrap();
-        ToolCtx { workdir: d, timeout: Duration::from_secs(5), max_output: 1000, net: crate::config::NetConfig::default() }
+        ToolCtx { workdir: d, timeout: Duration::from_secs(5), max_output: 1000, net: crate::config::NetConfig::default(), memory: None }
     }
     #[test]
     fn resolve_rejects_escape() {

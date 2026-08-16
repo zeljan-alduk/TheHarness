@@ -10,6 +10,8 @@ pub struct Config {
     pub eval: EvalConfig,
     #[serde(default)]
     pub net: NetConfig,
+    #[serde(default)]
+    pub memory: crate::memory::MemoryConfig,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -22,8 +24,11 @@ pub struct LlmConfig {
     pub temperature: f32,
     #[serde(default = "d_max_tokens")]
     pub max_tokens: u32,
-    #[serde(default = "d_ctx_budget")]
-    pub context_budget_tokens: u64,
+    /// Prompt-token threshold for auto-compaction. If unset, derived at start: compact_at_fraction × detected context.
+    #[serde(default)]
+    pub context_budget_tokens: Option<u64>,
+    #[serde(default = "d_compact_frac")]
+    pub compact_at_fraction: f64,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -68,7 +73,7 @@ pub struct NetConfig {
 
 fn d_temp() -> f32 { 0.2 }
 fn d_max_tokens() -> u32 { 16384 }
-fn d_ctx_budget() -> u64 { 24000 }
+fn d_compact_frac() -> f64 { 0.75 }
 fn d_max_turns() -> usize { 40 }
 fn d_tool_timeout() -> u64 { 120 }
 fn d_max_out() -> usize { 16000 }
@@ -90,6 +95,14 @@ impl Default for EvalConfig {
 impl Default for NetConfig {
     fn default() -> Self {
         Self { enabled: true, timeout_secs: d_fetch_timeout(), max_fetch_bytes: d_fetch_bytes(), user_agent: d_ua(), download_segments: d_dl_segments(), download_timeout_secs: d_dl_timeout() }
+    }
+}
+
+impl LlmConfig {
+    /// The compaction threshold given a detected context length (if any).
+    pub fn effective_budget(&self, detected_ctx: Option<u64>) -> u64 {
+        if let Some(b) = self.context_budget_tokens { return b; }
+        match detected_ctx { Some(n) => ((n as f64) * self.compact_at_fraction) as u64, None => 60_000 }
     }
 }
 

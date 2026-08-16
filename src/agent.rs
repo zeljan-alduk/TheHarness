@@ -28,7 +28,89 @@ pub struct Agent<'a> {
     pub stream: bool,
 }
 
+/// Precise LLM compaction: summarize everything but the last `keep_last` messages into a dense,
+/// exact handoff note (paths, commands, results, decisions, next steps) and replace them with it.
+/// Returns (messages removed, summary). Falls back to Err if the model call fails.
+pub async fn compact_llm(client: &Client, msgs: &mut Vec<Message>, keep_last: usize, focus: Option<&str>) -> Result<(usize, String)> {
+    if msgs.len() < 6 { bail!("nothing to compact"); }
+    // choose the cut so the kept tail starts at a user message (never splits tool_calls from results)
+    let mut cut = msgs.len().saturating_sub(keep_last).max(1);
+    while cut > 1 && msgs[cut].role != "user" { cut -= 1; }
+    if cut <= 1 { cut = msgs.len().saturating_sub(2).max(1); while cut > 1 && msgs[cut].role == "tool" { cut -= 1; } }
+    if cut <= 1 { bail!("nothing to compact"); }
+    let old: Vec<Message> = msgs[1..cut].to_vec();
+    let transcript = render_for_summary(&old, 60_000);
+    let system = "You compact the working context of an autonomous coding agent mid-session. Write a HANDOFF NOTE so the agent can continue seamlessly without the original messages. Be precise and dense; never invent; keep exact file paths, function/identifier names, commands, numbers, URLs, and error messages verbatim. Use this structure with markdown headings:
+## Goal & constraints (the user's requests, key phrases verbatim)
+## Done so far (files created/edited with paths and what changed; commands run and their outcomes; tests/eval results)
+## Key facts & findings (config values, APIs, gotchas, exact errors)
+## Decisions & reasons
+## Current state & remaining work (ordered next steps; open questions)
+## Notes for the user (anything promised or to report)
+Max ~900 words. Output only the note.";
+    let mut user = format!("Transcript to compact ({} messages):
+
+{transcript}", old.len());
+    if let Some(f) = focus { user.push_str(&format!("
+
+Focus especially on: {f}")); }
+    let (reply, _) = client.chat(&[Message::system(system), Message::user(user)], &[]).await?;
+    let summary = reply.text().trim().to_string();
+    if summary.chars().count() < 80 { bail!("compaction summary too short"); }
+    let mut new_msgs = vec![msgs[0].clone(), Message::user(format!("[Context compacted — handoff note replacing {} earlier messages]
+
+{summary}
+
+[Continue from the state above; the most recent messages follow verbatim.]", old.len()))];
+    new_msgs.extend_from_slice(&msgs[cut..]);
+    let removed = old.len();
+    *msgs = new_msgs;
+    Ok((removed, summary))
+}
+
+fn render_for_summary(msgs: &[Message], max_chars: usize) -> String {
+    let mut out = String::new();
+    for m in msgs {
+        match m.role.as_str() {
+            "user" => out.push_str(&format!("### USER
+{}
+", m.text())),
+            "assistant" => {
+                let t = m.text(); if !t.trim().is_empty() { out.push_str(&format!("### ASSISTANT
+{}
+", t)); }
+                if let Some(calls) = &m.tool_calls { for c in calls { out.push_str(&format!("### CALL {}
+{}
+", c.function.name, crate::llm::truncate_for_log(&c.function.arguments, 1500))); } }
+            }
+            "tool" => out.push_str(&format!("### RESULT {}
+{}
+", m.name.clone().unwrap_or_default(), crate::llm::truncate_for_log(&m.text(), 2500))),
+            _ => {}
+        }
+    }
+    let n = out.chars().count();
+    if n > max_chars { let head: String = out.chars().take(max_chars / 3).collect(); let tail: String = out.chars().skip(n - max_chars * 2 / 3).collect(); return format!("{head}
+…[{} chars elided]…
+{tail}", n - max_chars); }
+    out
+}
+
+/// After a finished turn: reflect into BRAIN/MEMORY/WORKFLOWS and consolidate if files got long.
+pub async fn reflect_after_run(client: &Client, store: &crate::memory::MemoryStore, msgs: &[Message], stats: &RunStats, sink: &dyn Sink) {
+    if !store.cfg.auto_reflect || stats.tool_calls < store.cfg.reflect_min_tool_calls || stats.stop_reason != "done" { return; }
+    match store.reflect(client, msgs).await {
+        Ok(items) => for (file, section, text) in items { sink.emit(&Event::Memory { file, section, text }); },
+        Err(e) => sink.emit(&Event::Error { message: format!("memory reflection skipped: {e:#}") }),
+    }
+    if let Ok(done) = store.maybe_consolidate(client).await { for f in done { sink.emit(&Event::Memory { file: f, section: "consolidated".into(), text: "file was long; merged and de-duplicated".into() }); } }
+}
+
 pub fn system_prompt(workdir: &str, tools: &[&str], extra: Option<&str>) -> String {
+    system_prompt_with_memory(workdir, tools, extra, None)
+}
+
+pub fn system_prompt_with_memory(workdir: &str, tools: &[&str], extra: Option<&str>, memory: Option<&crate::memory::MemoryStore>) -> String {
     let mut s = format!(
 "You are an autonomous software engineering agent running locally with a real toolchain.
 Working directory: {workdir}
@@ -44,6 +126,8 @@ Rules:
 - When done, your final message (with no tool calls) must state what changed and how you verified it.",
         tools = tools.join(", "));
     if let Some(e) = extra { s.push_str("\n\n"); s.push_str(e); }
+    s.push_str("\n\n"); s.push_str(&crate::setup::summary_line());
+    if let Some(m) = memory { s.push_str(&m.prompt_block(std::path::Path::new(workdir))); }
     s
 }
 
@@ -106,8 +190,12 @@ impl<'a> Agent<'a> {
                 return Ok((last_text(msgs).unwrap_or_else(|| "(stopped: max turns reached)".into()), stats));
             }
             if last_usage.prompt_tokens > self.context_budget {
-                let n = compact(msgs, 6);
-                if n > 0 { stats.compactions += 1; self.sink.emit(&Event::Compacted { count: n, prompt_tokens: last_usage.prompt_tokens }); }
+                let before = last_usage.prompt_tokens;
+                match compact_llm(self.client, msgs, 8, None).await {
+                    Ok((n, summary)) => { stats.compactions += 1; self.sink.emit(&Event::Compacted { count: n, prompt_tokens: before, summary }); }
+                    Err(_) => { let n = compact(msgs, 6); if n > 0 { stats.compactions += 1; self.sink.emit(&Event::Compacted { count: n, prompt_tokens: before, summary: String::new() }); } }
+                }
+                last_usage = Usage::default(); // re-measured on the next call
             }
             stats.turns += 1;
             self.sink.emit(&Event::Turn { n: stats.turns });

@@ -68,10 +68,36 @@ enum Cmd {
         /// JSON arguments (default: {})
         args: Option<String>,
     },
+    /// Audit external tools; gather them in ~/.config/harness/bin; --install adds missing ones via Homebrew
+    Setup {
+        #[arg(long)]
+        install: bool,
+    },
+    /// Manage plugins: list | install <spec> | enable|disable|remove|update <name>
+    Plugin {
+        #[command(subcommand)]
+        action: PluginCmd,
+    },
+    /// Show configured MCP servers, start them, and list the tools they expose
+    Mcp {
+        #[arg(short = 'C', long)]
+        dir: Option<PathBuf>,
+    },
     /// List models on the configured server
     Models,
     /// Print the effective configuration
     Config,
+}
+
+#[derive(Subcommand)]
+enum PluginCmd {
+    /// Show installed plugins and the downloadable catalog (● enabled ◐ disabled ○ downloadable)
+    List { #[arg(long)] refresh: bool },
+    Install { spec: String },
+    Enable { name: String },
+    Disable { name: String },
+    Remove { name: String },
+    Update { name: String },
 }
 
 #[tokio::main]
@@ -86,12 +112,55 @@ async fn main() -> Result<()> {
         }
         Cmd::Tool { dir, name, args } => {
             let workdir = dir.unwrap_or(std::env::current_dir()?).canonicalize().context("workdir does not exist")?;
-            let ctx = tools::ToolCtx { workdir, timeout: Duration::from_secs(cfg.agent.tool_timeout_secs), max_output: cfg.agent.max_tool_output_chars, net: cfg.net.clone() };
-            let registry = tools::Registry::defaults(cfg.net.enabled);
-            let out = registry.call(&name, args.as_deref().unwrap_or("{}"), &ctx).await;
+            let store = if cfg.memory.enabled { harness::memory::MemoryStore::open(&cfg.memory).ok() } else { None };
+            let ctx = tools::ToolCtx { workdir: workdir.clone(), timeout: Duration::from_secs(cfg.agent.tool_timeout_secs), max_output: cfg.agent.max_tool_output_chars, net: cfg.net.clone(), memory: store };
+            let ts = tools::build_toolset(cfg.net.enabled, &workdir, name.starts_with("mcp__")).await;
+            let out = ts.registry.call(&name, args.as_deref().unwrap_or("{}"), &ctx).await;
             println!("{}", out.text);
             if !out.images.is_empty() { eprintln!("({} image(s) attached)", out.images.len()); }
             if out.text.starts_with("error:") { std::process::exit(1); }
+        }
+        Cmd::Setup { install } => {
+            let mut st = harness::setup::check();
+            harness::setup::print_report(&st);
+            if install {
+                let done = harness::setup::install_missing(&st)?;
+                if !done.is_empty() { eprintln!("installed: {}", done.join(", ")); }
+                st = harness::setup::check();
+            }
+            let (n, dir) = harness::setup::link_all(&st)?;
+            let missing: Vec<&str> = st.iter().filter(|s| !s.ok()).map(|s| s.name).collect();
+            println!("\n{n} binaries linked into {}", dir.display());
+            if missing.is_empty() { println!("all tools available ✓"); } else { println!("missing: {} → run `harness setup --install`", missing.join(", ")); }
+        }
+        Cmd::Plugin { action } => {
+            let mut p = harness::plugins::Plugins::open()?;
+            match action {
+                PluginCmd::List { refresh } => {
+                    let installed = p.installed();
+                    println!("Installed ({}):", installed.len());
+                    for pl in &installed { println!("  {} {:<28} {}sk {}cmd {}mcp{}  {}", if pl.enabled { "●" } else { "◐" }, pl.path.file_name().unwrap().to_string_lossy(), pl.skills.len(), pl.commands.len(), pl.mcp_servers.len(), if pl.ts_only { " ts-only" } else { "" }, pl.description); }
+                    match p.catalog(refresh).await {
+                        Ok(c) => { println!("\nDownloadable ({}), install with: harness plugin install <owner/repo>", c.entries.len()); for e in c.entries.iter().take(60) { let inst = installed.iter().any(|x| x.origin.as_deref().map(|o| o.contains(&e.full_name)).unwrap_or(false)); println!("  {} {:<40} ★{:<6} {:<10} {}", if inst { "●" } else { "○" }, e.full_name, e.stars, e.language, e.description); } }
+                        Err(e) => eprintln!("catalog unavailable: {e:#}"),
+                    }
+                }
+                PluginCmd::Install { spec } => { let n = p.install(&spec).await?; let info = p.inspect(&p.dir.join(&n)); println!("installed {n}: {} skills, {} commands, {} mcp servers{}", info.skills.len(), info.commands.len(), info.mcp_servers.len(), if info.ts_only { " (TypeScript-only DSH plugin: code not runnable here)" } else { "" }); }
+                PluginCmd::Enable { name } => { p.set_enabled(&name, true)?; println!("enabled {name}"); }
+                PluginCmd::Disable { name } => { p.set_enabled(&name, false)?; println!("disabled {name}"); }
+                PluginCmd::Remove { name } => { p.remove(&name)?; println!("removed {name}"); }
+                PluginCmd::Update { name } => { println!("{}", p.update(&name).await?); }
+            }
+        }
+        Cmd::Mcp { dir } => {
+            let workdir = dir.unwrap_or(std::env::current_dir()?).canonicalize()?;
+            let extra = harness::plugins::Plugins::open().map(|p| p.mcp_files()).unwrap_or_default();
+            let servers = harness::mcp::discover(&workdir, &extra);
+            println!("configured servers: {}", servers.len());
+            for (n, c, f) in &servers { println!("  {:<18} {} {}   ← {}", n, c.command, c.args.join(" "), f.display()); }
+            let ts = tools::build_toolset(cfg.net.enabled, &workdir, true).await;
+            for n in &ts.notes { println!("· {n}"); }
+            for d in ts.registry.defs().into_iter().filter(|d| d.function.name.starts_with("mcp__")) { println!("  {:<40} {}", d.function.name, llm::truncate_for_log(&d.function.description, 90)); }
         }
         Cmd::Models => {
             for m in client.list_models().await? { println!("{m}"); }
@@ -156,11 +225,24 @@ async fn run_agent(cfg: &config::Config, client: &llm::Client, workdir: &std::pa
         timeout: Duration::from_secs(cfg.agent.tool_timeout_secs),
         max_output: cfg.agent.max_tool_output_chars,
         net: cfg.net.clone(),
+        memory: None,
     };
-    let registry = tools::Registry::defaults(cfg.net.enabled);
-    let system = agent::system_prompt(&workdir.display().to_string(), &registry.names(), extra);
-    let a = agent::Agent { client, registry: &registry, ctx: &ctx, max_turns: cfg.agent.max_turns, context_budget: cfg.llm.context_budget_tokens, sink: sink.as_ref(), stream: true };
-    a.run(&system, task).await
+    let store = if cfg.memory.enabled { harness::memory::MemoryStore::open(&cfg.memory).ok() } else { None };
+    if let Some(m) = &store { let _ = m.touch_project(workdir); }
+    let ctx = tools::ToolCtx { memory: store.clone(), ..ctx };
+    let toolset = tools::build_toolset(cfg.net.enabled, workdir, true).await;
+    for n in &toolset.notes { eprintln!("· {n}"); }
+    let registry = &toolset.registry;
+    let extra_all = format!("{}{}", extra.unwrap_or(""), toolset.prompt_extra);
+    let system = agent::system_prompt_with_memory(&workdir.display().to_string(), &registry.names(), Some(&extra_all), store.as_ref());
+    let detected = llm::detect_context_length(&cfg.llm.base_url, &cfg.llm.model).await;
+    let budget = cfg.llm.effective_budget(detected.map(|d| d.0));
+    if let Some((n, src)) = detected { eprintln!("· context {} tokens ({src}) · auto-compact at {}", n, budget); } else { eprintln!("· context length unknown · auto-compact at {budget}"); }
+    let a = agent::Agent { client, registry, ctx: &ctx, max_turns: cfg.agent.max_turns, context_budget: budget, sink: sink.as_ref(), stream: true };
+    let mut msgs = Vec::new();
+    let out = a.run_turn(&mut msgs, &system, task).await?;
+    if let Some(m) = &store { agent::reflect_after_run(client, m, &msgs, &out.1, sink.as_ref()).await; }
+    Ok(out)
 }
 
 /// `self` mode rebuilds the harness while it runs. Never run from the binary being edited:

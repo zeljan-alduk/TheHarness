@@ -42,6 +42,43 @@ Node build step) shows the live timeline (reasoning folds, tool calls with args/
 inline images from `view_image`), a file browser of the workdir with **image / audio / video /
 PDF / text previews**, and a git log/status panel. Model picker is populated from the server.
 
+## Interactive TUI (`harness`)
+Claude-Code-style terminal UI: streaming answer + reasoning, `⏺`/`⎿` tool blocks (click or ⌃O to
+unfold), thinking (⌃T / click), dashboard panel (⌃P: live thinking, context gauge, tokens, tok/s +
+TTFT, CPU/GPU/RAM), mouse/trackpad scrolling, esc interrupts, messages typed while running are queued.
+Images: ⌃V pastes from the clipboard (saved under `~/.config/harness/pastes/`), image paths attach,
+previews are real images in Kitty/WezTerm/iTerm2/Ghostty (half-blocks elsewhere). Videos open a frame
+scrubber (ffmpeg): ←/→, space to select, enter attaches frames with timestamps. Commands: `/help
+/model /cd /tools /mcp /plugin /memory /brain /workflows /remember /reflect /compact /net /panel …`.
+
+## Memory (MEMORY.md · WORKFLOWS.md · BRAIN.md)
+`~/.config/harness/` holds three markdown files injected into every session: **MEMORY.md** (settings,
+preferences, ideas), **WORKFLOWS.md** (named recipes), **BRAIN.md** (what the agent learned: user,
+projects ledger, how-tos, lessons). The agent edits them with the `memory` tool; after substantive
+runs a *reflection* call appends durable lessons; long files are *consolidated*. Evals use an isolated
+store. A project can add `HARNESS.md` (like CLAUDE.md) with instructions.
+
+## Plugins & MCP
+- `harness plugin list|install|enable|disable|remove|update` or `/plugin …` in the TUI. Catalog from the
+  GitHub topics `harness-plugin` and `dsh-plugin` (● enabled ◐ disabled ○ downloadable). A plugin repo may
+  provide skills (`SKILL.md`, exposed via `load_skill`), slash commands (`commands/*.md` → `/name`), and MCP
+  servers (`mcp.json` / `.mcp.json`, or DSH `*.cordis.yml` `dsh-mcp-client` entries). TypeScript-only DSH
+  plugins are flagged `ts-only` (they need the DSH runtime).
+- MCP servers (stdio) from `~/.config/harness/mcp.json`, `<project>/.mcp.json`, `<project>/.harness/mcp.json`
+  and enabled plugins are started once per session; their tools appear as `mcp__<server>__<tool>`.
+  `harness mcp` lists them.
+
+## Context management
+The context window is detected at start (LM Studio / llama.cpp / Ollama). When the prompt exceeds
+`compact_at_fraction` × context (or `context_budget_tokens`), the agent **compacts**: an LLM-written
+handoff note (goals verbatim, files/commands/results with exact paths, findings, decisions, next steps)
+replaces older messages; recent ones stay verbatim. `/compact [focus]` forces it.
+
+## External tools
+`harness setup` audits git, python, ripgrep, fd, jq, ffmpeg, poppler, 7-zip, unzip, tar, curl, uv, node,
+gh, imagemagick, kitty; symlinks all found binaries into `~/.config/harness/bin` (first on the agent's
+PATH) and `--install` adds missing ones with Homebrew.
+
 ## Architecture
 
 ```
@@ -52,7 +89,9 @@ src/
   agent.rs     the loop: model → tool calls → results → model; budgets; context compaction
   events.rs    structured Event stream + Sink trait (StderrSink, JsonlSink) — core never prints
   sandbox.rs   local process supervision: timeout, process-group kill, env scrub, output caps
-  tools/       bash, read_file, write_file, edit_file, list_dir, view_image, web_fetch, web_search, download_file
+  tools/       bash, read_file, write_file, edit_file, list_dir, view_image, memory, load_skill, web_fetch, web_search, download_file (+ MCP tools)
+  memory.rs    MEMORY/WORKFLOWS/BRAIN store, reflection, consolidation, pastes dir
+  mcp.rs       MCP stdio client · plugins.rs plugin manager · setup.rs external tools · tui.rs terminal UI
   eval.rs      the fitness function: runs evals/tasks/* in fresh git-initialised workdirs
   lib.rs       exposes all of the above as the `harness` library
 evals/tasks/<name>/task.toml  (+ fixture/)  — prompt + `check` shell command (exit 0 = pass)
