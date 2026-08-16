@@ -3,6 +3,7 @@
 //! 3) run (or load cached) baseline eval for main, 4) verdict = tests pass ∧ mean score not lower ∧
 //! no task that always passed on main now always fails, 5) optionally merge.
 
+use crate::security::shell_quote;
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -18,7 +19,8 @@ fn sh(cmd: &str, cwd: &Path, secs: u64) -> Result<(bool, String)> {
     let o = std::process::Command::new("/bin/sh").arg("-c").arg(format!("timeout_() {{ perl -e 'alarm shift; exec @ARGV' \"$@\"; }}; timeout_ {secs} /bin/sh -c {}", shell_quote(cmd))).current_dir(cwd).output()?;
     Ok((o.status.success(), format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr))))
 }
-fn shell_quote(s: &str) -> String { format!("'{}'", s.replace('\'', "'\\''")) }
+/// `cmd 2>&1 | tail -n` while preserving cmd's exit status (POSIX sh has no pipefail).
+fn tailed(cmd: &str, n: usize) -> String { format!("__o=$(mktemp); {{ {cmd}; }} >\"$__o\" 2>&1; __rc=$?; tail -n {n} \"$__o\"; rm -f \"$__o\"; exit $__rc") }
 
 pub fn parse_report(path: &Path) -> Result<RunSummary> {
     let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(path)?)?;
@@ -29,7 +31,7 @@ pub fn parse_report(path: &Path) -> Result<RunSummary> {
 
 fn run_eval(bin: &Path, cwd: &Path, filter: Option<&str>, out: &Path) -> Result<RunSummary> {
     let f = filter.map(|f| format!(" -f {}", shell_quote(f))).unwrap_or_default();
-    let cmd = format!("{}{} eval --out {} 2>&1 | tail -3", shell_quote(&bin.display().to_string()), f, shell_quote(&out.display().to_string()));
+    let cmd = tailed(&format!("{}{} eval --out {}", shell_quote(&bin.display().to_string()), f, shell_quote(&out.display().to_string())), 3);
     let (_ok, log) = sh(&cmd, cwd, 3 * 3600)?; // eval exits 1 when not all pass; that's fine
     parse_report(out).with_context(|| format!("no eval report at {} — eval output: {}", out.display(), crate::llm::truncate_for_log(&log, 400)))
 }
@@ -53,9 +55,9 @@ pub fn judge(repo: &Path, branch: &str, runs: usize, filter: Option<&str>, merge
     log(&format!("worktree {}", wt.display()));
     // build + test
     log("building proposal (cargo build --release)…");
-    let (ok, out) = sh("cargo build --release 2>&1 | tail -3", &wt, 1800)?; if !ok { bail!("proposal build failed:\n{out}"); }
+    let (ok, out) = sh(&tailed("cargo build --release", 3), &wt, 1800)?; if !ok { bail!("proposal build failed:\n{out}"); }
     log("testing proposal (cargo test)…");
-    let (tests_ok, tout) = sh("cargo test 2>&1 | tail -5", &wt, 1800)?;
+    let (tests_ok, tout) = sh(&tailed("cargo test", 5), &wt, 1800)?;
     log(&format!("tests: {}", if tests_ok { "ok" } else { "FAILED" }));
     let mut reasons = Vec::new();
     if !tests_ok { reasons.push(format!("cargo test failed on the proposal: {}", crate::llm::truncate_for_log(tout.trim(), 300))); }
@@ -74,7 +76,7 @@ pub fn judge(repo: &Path, branch: &str, runs: usize, filter: Option<&str>, merge
     let cache = cache_dir().join(&key);
     let mut baseline: Vec<RunSummary> = std::fs::read_to_string(&cache).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
     if baseline.len() < runs {
-        let (ok, _) = sh("cargo build --release 2>&1 | tail -1", repo, 1800)?; if !ok { bail!("baseline build failed"); }
+        let (ok, _) = sh(&tailed("cargo build --release", 1), repo, 1800)?; if !ok { bail!("baseline build failed"); }
         for i in baseline.len()..runs {
             log(&format!("baseline (main @ {base_sha}) eval run {}/{}…", i + 1, runs));
             let out = repo.join("target").join(format!("arbiter-baseline-{i}.json"));
@@ -114,4 +116,16 @@ pub fn seed_baseline(repo: &Path, filter: Option<&str>, report: &Path) -> Result
     let key = format!("baseline-{base_sha}-{}-{}.json", filter.unwrap_or("all").replace('/', "_"), r.total);
     std::fs::write(cache_dir().join(key), serde_json::to_string_pretty(&vec![r])?)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn tailed_keeps_exit_status() {
+        let (ok, out) = sh(&tailed("echo a; echo b; false", 1), Path::new("/tmp"), 10).unwrap();
+        assert!(!ok); assert_eq!(out.trim(), "b");
+        let (ok, out) = sh(&tailed("echo hi", 2), Path::new("/tmp"), 10).unwrap();
+        assert!(ok); assert_eq!(out.trim(), "hi");
+    }
 }

@@ -42,12 +42,16 @@ pub struct LspServer {
 
 static SERVERS: OnceLock<Mutex<HashMap<String, Arc<LspServer>>>> = OnceLock::new();
 fn table() -> &'static Mutex<HashMap<String, Arc<LspServer>>> { SERVERS.get_or_init(|| Mutex::new(HashMap::new())) }
+/// Serializes server start-up so concurrent first calls never spawn the same server twice.
+static STARTING: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 
 fn uri_of(p: &Path) -> String { format!("file://{}", p.display()) }
 
 impl LspServer {
     pub async fn get_or_start(name: &str, cfg: &LspServerConfig, root: &Path) -> Result<Arc<LspServer>> {
         let key = format!("{name}@{}", root.display());
+        if let Some(s) = table().lock().unwrap().get(&key) { return Ok(s.clone()); }
+        let _starting = STARTING.get_or_init(|| tokio::sync::Mutex::new(())).lock().await;
         if let Some(s) = table().lock().unwrap().get(&key) { return Ok(s.clone()); }
         let mut c = Command::new(&cfg.command);
         c.args(&cfg.args).current_dir(root).stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::null()).kill_on_drop(true);
@@ -113,7 +117,10 @@ impl LspServer {
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.pending.lock().unwrap().insert(id, tx);
         self.send(json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params})).await?;
-        let msg = tokio::time::timeout(timeout, rx).await.map_err(|_| anyhow::anyhow!("lsp '{}': timeout waiting for {method}", self.name))??;
+        let msg = match tokio::time::timeout(timeout, rx).await {
+            Ok(r) => r?,
+            Err(_) => { self.pending.lock().unwrap().remove(&id); bail!("lsp '{}': timeout waiting for {method}", self.name) }
+        };
         if let Some(e) = msg.get("error") { bail!("lsp error: {e}"); }
         Ok(msg.get("result").cloned().unwrap_or(Value::Null))
     }

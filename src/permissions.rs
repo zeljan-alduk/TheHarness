@@ -66,7 +66,10 @@ const RISKY: &[&str] = &[
     "del /s", "del /q", "rmdir /s", "rd /s", "format ", "remove-item -recurse", "rm -recurse", "diskpart", "reg delete", "schtasks", "net user",
 ];
 const PLAN_OK: &[&str] = &["git status", "git log", "git diff", "git show", "git branch", "git blame", "ls", "cat ", "head ", "tail ", "grep ", "rg ", "find ", "fd ", "wc ", "tree", "pwd", "echo ", "which ", "file ", "stat ", "du ", "df ", "env", "printenv", "cargo check", "cargo metadata", "cargo tree", "python3 -c \"import", "node -e", "jq ", "sed -n", "awk ", "sort", "uniq", "diff "];
-const MUTATING: &[&str] = &["write_file", "edit_file", "apply_patch", "bash", "download_file", "extract_archive", "pdf_edit", "memory", "spawn_agent"];
+/// Tools that are not read-only per the registry but never touch files/state outside the harness itself.
+const BENIGN: &[&str] = &["todo", "ask_user", "notify"];
+/// Tools whose primary argument is a shell command (RISKY-pattern checked in auto mode).
+const SHELL_TOOLS: &[&str] = &["bash", "monitor", "run_workflow"];
 
 pub struct Policy { pub cfg: PermissionsConfig, pub workdir: PathBuf, session_allow: std::sync::Mutex<Vec<String>>, mode: std::sync::Mutex<Mode> }
 
@@ -91,7 +94,8 @@ impl Policy {
     pub fn primary_arg(tool: &str, args: &Value) -> String {
         let g = |k: &str| args.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
         match tool {
-            "bash" => g("cmd"),
+            "bash" | "monitor" => g("cmd"),
+            "run_workflow" => format!("{} {}", g("name"), g("args")),
             "read_file" | "write_file" | "edit_file" | "list_dir" | "view_image" | "read_pdf" | "pdf_edit" | "extract_archive" | "apply_patch" => g("path"),
             "web_fetch" | "download_file" => g("url"),
             "web_search" => g("query"),
@@ -126,7 +130,8 @@ impl Policy {
         for r in &self.cfg.deny { if Self::rule_matches(r, tool, &arg) { return Decision::Deny(format!("denied by rule '{r}'")); } }
         for r in self.session_allow.lock().unwrap().iter().chain(self.cfg.allow.iter()) { if Self::rule_matches(r, tool, &arg) { return Decision::Allow; } }
         for r in &self.cfg.ask { if Self::rule_matches(r, tool, &arg) { return Decision::Ask(format!("matches rule '{r}'")); } }
-        let mutating = MUTATING.contains(&tool) || tool.starts_with("mcp__") && !read_only_tool;
+        // mutating iff the registry does not declare the tool read-only (benign UI tools excepted)
+        let mutating = !read_only_tool && !BENIGN.contains(&tool);
         match self.mode() {
             Mode::Bypass => Decision::Allow,
             Mode::Plan => {
@@ -138,7 +143,7 @@ impl Policy {
             Mode::Ask => { if read_only_tool || !mutating { Decision::Allow } else { Decision::Ask("ask mode".into()) } }
             Mode::Auto => {
                 if read_only_tool || !mutating { return Decision::Allow; }
-                if tool == "bash" { let a = arg.to_lowercase(); if let Some(r) = RISKY.iter().find(|r| a.contains(*r)) { return Decision::Ask(format!("risky command pattern '{}'", r.trim())); } return Decision::Allow; }
+                if SHELL_TOOLS.contains(&tool) { let a = arg.to_lowercase(); if let Some(r) = RISKY.iter().find(|r| a.contains(*r)) { return Decision::Ask(format!("risky command pattern '{}'", r.trim())); } return Decision::Allow; }
                 if self.outside_workdir(tool, &arg) { return Decision::Ask("writes outside the working directory".into()); }
                 Decision::Allow
             }
@@ -210,5 +215,16 @@ mod tests {
         assert!(matches!(plan.check("bash", &json!({"cmd":"touch x"}), false), Decision::Ask(_)));
         let by = pol(Mode::Bypass);
         assert!(matches!(by.check("bash", &json!({"cmd":"sudo rm -rf build"}), false), Decision::Allow));
+    }
+    #[test]
+    fn non_read_only_tools_are_mutating() {
+        let p = pol(Mode::Auto);
+        assert!(matches!(p.check("monitor", &json!({"cmd":"rm -rf x"}), false), Decision::Ask(_)));
+        assert!(matches!(p.check("monitor", &json!({"cmd":"tail -f log"}), false), Decision::Allow));
+        assert!(matches!(p.check("todo", &json!({"action":"list"}), false), Decision::Allow));
+        let ask = pol(Mode::Ask);
+        assert!(matches!(ask.check("monitor", &json!({"cmd":"tail -f log"}), false), Decision::Ask(_)));
+        assert!(matches!(ask.check("worktree", &json!({"action":"enter"}), false), Decision::Ask(_)));
+        assert!(matches!(ask.check("glob", &json!({"pattern":"*.rs"}), true), Decision::Allow));
     }
 }

@@ -1,6 +1,9 @@
 //! Secret redaction for tool outputs (so keys in .env files, logs, or configs don't get echoed into
 //! the transcript / model context / session logs). Conservative patterns for well-known token formats.
 
+/// POSIX single-quote shell quoting: the result is safe to splice into an `sh -c` string as one word.
+pub fn shell_quote(s: &str) -> String { format!("'{}'", s.replace('\'', "'\\''")) }
+
 pub fn redact(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for line in text.split_inclusive('\n') {
@@ -48,4 +51,6 @@ mod tests {
         assert_eq!(redact("PORT=8080\n"), "PORT=8080\n");
         assert_eq!(redact("let x = sk_test;"), "let x = sk_test;");
     }
+    #[test]
+    fn quotes() { assert_eq!(shell_quote("a b"), "'a b'"); assert_eq!(shell_quote("it's"), "'it'\\''s'"); assert_eq!(shell_quote(""), "''"); }
 }

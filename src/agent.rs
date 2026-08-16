@@ -63,7 +63,7 @@ pub async fn compact_llm_with(client: &Client, msgs: &mut Vec<Message>, keep_las
     let prog = |f: f64, phase: &str| { if let Some(s) = sink { s.emit(&Event::CompactProgress { fraction: f, phase: phase.to_string() }); } };
     prog(0.02, "selecting messages to keep");
     // choose the cut so the kept tail starts at a user message (never splits tool_calls from results)
-    let mut cut = msgs.len().saturating_sub(keep_last).max(1);
+    let mut cut = msgs.len().saturating_sub(keep_last).clamp(1, msgs.len() - 1);
     while cut > 1 && msgs[cut].role != "user" { cut -= 1; }
     if cut <= 1 { cut = msgs.len().saturating_sub(2).max(1); while cut > 1 && msgs[cut].role == "tool" { cut -= 1; } }
     if cut <= 1 { bail!("nothing to compact"); }
@@ -318,8 +318,10 @@ impl<'a> Agent<'a> {
                 self.finish(&stats);
                 return Ok((last_text(msgs).unwrap_or_else(|| "(stopped: max turns reached)".into()), stats));
             }
-            if last_usage.prompt_tokens > self.context_budget {
-                let before = last_usage.prompt_tokens;
+            // proactive: huge tool results pushed since the last call can blow the context before it is measured
+            let est_tokens: u64 = context_map(msgs).iter().map(|x| x.1).sum();
+            if last_usage.prompt_tokens.max(est_tokens) > self.context_budget {
+                let before = last_usage.prompt_tokens.max(est_tokens);
                 if !self.ctx.hooks.pre_compact.is_empty() { let _ = crate::hooks::run_event(&self.ctx.hooks, "pre_compact", "auto", serde_json::json!({"trigger": "auto", "prompt_tokens": before}), &self.ctx.workdir).await; }
                 match compact_llm_with(&self.client.aux(), msgs, 8, None, Some(self.sink)).await {
                     Ok((n, summary, mb, ma)) => { stats.compactions += 1; self.sink.emit(&Event::Compacted { count: n, prompt_tokens: before, summary, map_before: mb, map_after: ma }); }

@@ -296,7 +296,7 @@ async fn main() -> Result<()> {
             // Work in a separate git worktree so this checkout (and any human editing it) is untouched.
             let wt = std::env::temp_dir().join("harness-proposals").join(branch.replace('/', "__"));
             std::fs::create_dir_all(wt.parent().unwrap())?;
-            let cmd = format!("git worktree add -q -b '{branch}' '{}'", wt.display());
+            let cmd = format!("git worktree add -q -b {} {}", harness::security::shell_quote(&branch), harness::security::shell_quote(&wt.display().to_string()));
             let o = sandbox::run_shell(&cmd, &repo, Duration::from_secs(30), 4000).await?;
             if !o.success() { bail!("could not create worktree for {branch}: {}{}", o.stdout, o.stderr); }
             eprintln!("branch {branch} → worktree {}", wt.display());

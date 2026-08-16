@@ -3,7 +3,8 @@
 //!   type = "agent"  task (template), parallel = ["a","b"] or items_from = "steps.<id>.lines" (one agent per item, run
 //!                   concurrently), read_only, max_turns, check (shell; if it fails the agent is re-run with the failure
 //!                   output, up to max_attempts)
-//! Templates: {args} {workdir} {item} {steps.<id>.output}
+//! Templates: {args} {workdir} {item} {steps.<id>.output} — in shell `cmd`/`check` strings values are inserted
+//! shell-quoted (one word each); a `cmd`/`check` that is exactly "{args}" runs the args verbatim.
 //! Files: ~/.config/harness/workflows/*.toml and <workdir>/.harness/workflows/*.toml
 
 use crate::agent::{Agent, SubAgentEnv};
@@ -108,6 +109,15 @@ fn render(t: &str, vars: &HashMap<String, String>) -> String {
     for (k, v) in vars { s = s.replace(&format!("{{{k}}}"), v); }
     s
 }
+/// Like `render`, but for shell command strings: every substituted value is inserted single-quoted so
+/// `{args}` / `{steps.x.output}` become one shell word each and cannot inject commands. A template that is
+/// exactly one placeholder (e.g. `check = "{args}"`) is the command itself and stays raw.
+fn render_sh(t: &str, vars: &HashMap<String, String>) -> String {
+    if let Some(v) = vars.iter().find(|(k, _)| t.trim() == format!("{{{k}}}")) { return v.1.clone(); }
+    let mut s = t.to_string();
+    for (k, v) in vars { s = s.replace(&format!("{{{k}}}"), &crate::security::shell_quote(v)); }
+    s
+}
 
 pub async fn run(wf: &Workflow, args: &str, wenv: &WorkflowEnv) -> Result<String> {
     let workdir = wenv.ctx.workdir.clone();
@@ -119,7 +129,7 @@ pub async fn run(wf: &Workflow, args: &str, wenv: &WorkflowEnv) -> Result<String
         let id = format!("wf:{}:{}", wf.name, step.id);
         match step.kind.as_str() {
             "shell" => {
-                let cmd = render(&step.cmd, &vars);
+                let cmd = render_sh(&step.cmd, &vars);
                 wenv.sink.emit(&Event::ToolCall { id: id.clone(), name: format!("workflow ▸ shell {}", step.id), args: cmd.clone() });
                 let t0 = std::time::Instant::now();
                 let o = crate::sandbox::run_shell(&cmd, &workdir, Duration::from_secs(1800), 60_000).await?;
@@ -136,7 +146,7 @@ pub async fn run(wf: &Workflow, args: &str, wenv: &WorkflowEnv) -> Result<String
                     let mut v = vars.clone(); v.insert("item".into(), item.clone());
                     let task = render(&step.task, &v);
                     let label = if item.is_empty() { step.id.clone() } else { format!("{} [{}]", step.id, crate::llm::truncate_for_log(item, 30)) };
-                    let check = step.check.as_ref().map(|c| render(c, &v));
+                    let check = step.check.as_ref().map(|c| render_sh(c, &v));
                     let sid = format!("{id}:{k}");
                     async move { run_agent_step(wenv, &sid, &label, &task, step, check.as_deref()).await.map(|o| if item.is_empty() { o } else { format!("### {item}\n{o}") }) }
                 });
@@ -181,4 +191,16 @@ async fn run_agent_step(wenv: &WorkflowEnv, sid: &str, label: &str, task: &str, 
         if ok { return Ok(last); }
     }
     bail!("step '{}' did not pass its check after {} attempt(s); last report:\n{}", step.id, step.max_attempts, last)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn shell_render_quotes() {
+        let v: HashMap<String, String> = [("args".to_string(), "x; rm -rf /".to_string()), ("item".to_string(), "it's".to_string())].into_iter().collect();
+        assert_eq!(render_sh("echo {args} {item}", &v), "echo 'x; rm -rf /' 'it'\\''s'");
+        assert_eq!(render_sh("{args}", &v), "x; rm -rf /");
+        assert_eq!(render("echo {args}", &v), "echo x; rm -rf /");
+    }
 }
