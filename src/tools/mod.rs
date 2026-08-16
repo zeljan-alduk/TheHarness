@@ -41,12 +41,16 @@ pub struct ToolCtx {
     pub lsp_servers: std::collections::HashMap<String, crate::lsp::LspServerConfig>,
     /// Additional directories file tools may access (/add-dir).
     pub extra_roots: Vec<PathBuf>,
+    /// Who answers questions / approvals for the model (None = headless: ask_user gets no answer).
+    pub approver: Option<std::sync::Arc<dyn crate::permissions::Approver>>,
+    /// Asynchronous events for the model (monitor lines, scheduled prompts); drained before each model call.
+    pub inbox: std::sync::Arc<crate::inbox::Inbox>,
 }
 
 impl ToolCtx {
     /// A context with defaults (no memory/sub-agents/hooks) — tests, `harness tool`, sub-processes.
     pub fn basic(workdir: PathBuf) -> Self {
-        Self { workdir, timeout: Duration::from_secs(120), max_output: 16000, net: crate::config::NetConfig::default(), memory: None, subagent: None, redact_secrets: true, hooks: Default::default(), todos: Default::default(), lsp_servers: Default::default(), extra_roots: vec![] }
+        Self { workdir, timeout: Duration::from_secs(120), max_output: 16000, net: crate::config::NetConfig::default(), memory: None, subagent: None, redact_secrets: true, hooks: Default::default(), todos: Default::default(), lsp_servers: Default::default(), extra_roots: vec![], approver: None, inbox: Default::default() }
     }
     /// Resolve a model-supplied path against workdir and refuse escapes.
     /// Symlinks are resolved on the deepest existing ancestor.
@@ -169,6 +173,10 @@ impl Registry {
             Err(e) => format!("error: {e:#}").into(),
         };
         if ctx.redact_secrets { out.text = crate::security::redact(&out.text); }
+        // todo hygiene reminder (like Claude Code's system reminders): appended to a tool result, at most every 6 calls
+        if name != "todo" && name != "load_skill" {
+            if let Some(r) = todo_reminder(ctx) { out.text.push_str(&format!("\n\n[harness reminder] {r}")); }
+        }
         // hooks: post_tool (fire and forget)
         if !ctx.hooks.post_tool.is_empty() { crate::hooks::run_post_tool(&ctx.hooks, name, &out.text, &ctx.workdir).await; }
         out
@@ -195,6 +203,21 @@ pub async fn build_toolset(net_enabled: bool, workdir: &Path, with_mcp: bool) ->
         servers = srv;
     }
     Toolset { registry, notes, servers, prompt_extra }
+}
+
+static TODO_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// A gentle reminder when the todo list exists but isn't being maintained.
+fn todo_reminder(ctx: &ToolCtx) -> Option<String> {
+    let todos = ctx.todos.lock().ok()?;
+    if todos.is_empty() { return None; }
+    let n = TODO_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if n % 6 != 5 { return None; }
+    let open: Vec<&todo::TodoItem> = todos.iter().filter(|t| t.status != "done").collect();
+    if open.is_empty() { return Some("all todo items are marked done — if the work continues, add the next steps with todo add/set.".into()); }
+    let in_prog = todos.iter().filter(|t| t.status == "in_progress").count();
+    if in_prog == 0 { return Some(format!("your todo list has {} open item(s) but none is in_progress — mark the one you are working on with todo start {{id}} (and todo done / todo next as you finish).", open.len())); }
+    if in_prog > 1 { return Some("more than one todo is in_progress — keep exactly one; use todo done for finished ones.".into()); }
+    Some("keep the todo list current: todo done {id} for finished items, todo next to move on.".into())
 }
 
 pub fn arg_str<'a>(args: &'a Value, key: &str) -> Result<&'a str> {

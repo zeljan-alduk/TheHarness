@@ -180,7 +180,7 @@ Rules:
 - Prefer edit_file for small changes; apply_patch for multi-hunk changes; write_file for new files. Keep edits minimal and idiomatic.
 - Verify your work: run the build, tests, diagnostics, or the program itself with bash. If it fails, fix it and re-run.
 - The working directory is a git repository. Use `git status`, `git diff`, `git log` freely to understand state, and `git checkout -- <file>` / `git revert` to undo mistakes. Commit when a coherent unit of work is done, with a clear message.
-- For multi-step work keep the `todo` list current; delegate independent sub-tasks with spawn_agent (several in one turn run in parallel).
+- For multi-step work use the `todo` tool: set the plan up front, keep exactly one item in_progress (todo start / todo next), and mark items done the moment they finish — the user watches this list live. Delegate independent sub-tasks with spawn_agent (several in one turn run in parallel).
 - Tool outputs may be truncated in the middle; use offset/limit or grep to see more.
 - When done, your final message (with no tool calls) must state what changed and how you verified it.
 - Finish decisively: once the task is verified, stop calling tools and answer. Do not re-verify, re-read, or polish beyond what was asked; the user may have queued the next task.";
