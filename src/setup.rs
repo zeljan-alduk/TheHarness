@@ -5,25 +5,29 @@
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 
-pub struct ExtTool { pub name: &'static str, pub bins: &'static [&'static str], pub purpose: &'static str, pub brew: Option<&'static str>, pub cask: bool, pub required: bool, pub any_of: bool }
+pub struct ExtTool { pub name: &'static str, pub bins: &'static [&'static str], pub purpose: &'static str, pub brew: Option<&'static str>, pub cask: bool, pub required: bool, pub any_of: bool, pub other_install: Option<&'static str> }
 
 pub const TOOLS: &[ExtTool] = &[
-    ExtTool { name: "git",      bins: &["git"],               purpose: "version control (agent undo/branches)",      brew: Some("git"),      cask: false, required: true, any_of: false },
-    ExtTool { name: "python3",  bins: &["python3"],           purpose: "scripting, quick checks",                   brew: Some("python"),   cask: false, required: true, any_of: false },
-    ExtTool { name: "ripgrep",  bins: &["rg"],                purpose: "fast code search",                          brew: Some("ripgrep"),  cask: false, required: false, any_of: false },
-    ExtTool { name: "fd",       bins: &["fd"],                purpose: "fast file find",                            brew: Some("fd"),       cask: false, required: false, any_of: false },
-    ExtTool { name: "jq",       bins: &["jq"],                purpose: "JSON processing",                           brew: Some("jq"),       cask: false, required: false, any_of: false },
-    ExtTool { name: "ffmpeg",   bins: &["ffmpeg", "ffprobe"], purpose: "video frames / audio / media conversion",   brew: Some("ffmpeg"),   cask: false, required: false, any_of: false },
-    ExtTool { name: "poppler",  bins: &["pdftotext", "pdftoppm"], purpose: "read PDFs (read_pdf), render PDF pages", brew: Some("poppler"),  cask: false, required: false, any_of: false },
-    ExtTool { name: "7-zip",    bins: &["7z", "7zz"],         purpose: "archives incl. .7z/.rar (extract_archive)", brew: Some("sevenzip"), cask: false, required: false, any_of: true },
-    ExtTool { name: "unzip",    bins: &["unzip", "zip"],      purpose: "zip archives",                              brew: None,             cask: false, required: true, any_of: false },
-    ExtTool { name: "tar",      bins: &["tar", "gzip"],       purpose: "tar/gzip archives",                         brew: None,             cask: false, required: true, any_of: false },
-    ExtTool { name: "curl",     bins: &["curl"],              purpose: "HTTP from the shell",                       brew: Some("curl"),     cask: false, required: true, any_of: false },
-    ExtTool { name: "uv",       bins: &["uv"],                purpose: "Python envs and tools without global installs", brew: Some("uv"),   cask: false, required: false, any_of: false },
-    ExtTool { name: "node",     bins: &["node", "npm"],       purpose: "JavaScript tooling",                        brew: Some("node"),     cask: false, required: false, any_of: false },
-    ExtTool { name: "gh",       bins: &["gh"],                purpose: "GitHub CLI",                                brew: Some("gh"),       cask: false, required: false, any_of: false },
-    ExtTool { name: "imagemagick", bins: &["magick"],         purpose: "image conversion/resizing",                 brew: Some("imagemagick"), cask: false, required: false, any_of: false },
-    ExtTool { name: "kitty",    bins: &["kitty"],             purpose: "terminal with inline image previews",       brew: Some("kitty"),    cask: true,  required: false, any_of: false },
+    ExtTool { name: "git",      bins: &["git"],               purpose: "version control (agent undo/branches)",      brew: Some("git"),      cask: false, required: true, any_of: false, other_install: None },
+    ExtTool { name: "python3",  bins: &["python3"],           purpose: "scripting, quick checks",                   brew: Some("python"),   cask: false, required: true, any_of: false, other_install: None },
+    ExtTool { name: "ripgrep",  bins: &["rg"],                purpose: "fast code search",                          brew: Some("ripgrep"),  cask: false, required: false, any_of: false, other_install: None },
+    ExtTool { name: "fd",       bins: &["fd"],                purpose: "fast file find",                            brew: Some("fd"),       cask: false, required: false, any_of: false, other_install: None },
+    ExtTool { name: "jq",       bins: &["jq"],                purpose: "JSON processing",                           brew: Some("jq"),       cask: false, required: false, any_of: false, other_install: None },
+    ExtTool { name: "ffmpeg",   bins: &["ffmpeg", "ffprobe"], purpose: "video frames / audio / media conversion",   brew: Some("ffmpeg"),   cask: false, required: false, any_of: false, other_install: None },
+    ExtTool { name: "poppler",  bins: &["pdftotext", "pdftoppm"], purpose: "read PDFs (read_pdf), render PDF pages", brew: Some("poppler"),  cask: false, required: false, any_of: false, other_install: None },
+    ExtTool { name: "7-zip",    bins: &["7z", "7zz"],         purpose: "archives incl. .7z/.rar (extract_archive)", brew: Some("sevenzip"), cask: false, required: false, any_of: true, other_install: None },
+    ExtTool { name: "unzip",    bins: &["unzip", "zip"],      purpose: "zip archives",                              brew: None,             cask: false, required: true, any_of: false, other_install: None },
+    ExtTool { name: "tar",      bins: &["tar", "gzip"],       purpose: "tar/gzip archives",                         brew: None,             cask: false, required: true, any_of: false, other_install: None },
+    ExtTool { name: "curl",     bins: &["curl"],              purpose: "HTTP from the shell",                       brew: Some("curl"),     cask: false, required: true, any_of: false, other_install: None },
+    ExtTool { name: "uv",       bins: &["uv"],                purpose: "Python envs and tools without global installs", brew: Some("uv"),   cask: false, required: false, any_of: false, other_install: None },
+    ExtTool { name: "node",     bins: &["node", "npm"],       purpose: "JavaScript tooling",                        brew: Some("node"),     cask: false, required: false, any_of: false, other_install: None },
+    ExtTool { name: "gh",       bins: &["gh"],                purpose: "GitHub CLI",                                brew: Some("gh"),       cask: false, required: false, any_of: false, other_install: None },
+    ExtTool { name: "imagemagick", bins: &["magick"],         purpose: "image conversion/resizing",                 brew: Some("imagemagick"), cask: false, required: false, any_of: false, other_install: None },
+    ExtTool { name: "rust-analyzer", bins: &["rust-analyzer"], purpose: "Rust language server (lsp tool)",     brew: None,             cask: false, required: false, any_of: false, other_install: Some("rustup component add rust-analyzer") },
+    ExtTool { name: "pyright",  bins: &["pyright-langserver"], purpose: "Python language server (lsp tool)",  brew: None,             cask: false, required: false, any_of: false, other_install: Some("npm install -g pyright") },
+    ExtTool { name: "typescript-language-server", bins: &["typescript-language-server"], purpose: "TS/JS language server (lsp tool)", brew: None, cask: false, required: false, any_of: false, other_install: Some("npm install -g typescript-language-server typescript") },
+    ExtTool { name: "gopls",    bins: &["gopls"],             purpose: "Go language server (lsp tool)",         brew: Some("gopls"),    cask: false, required: false, any_of: false, other_install: None },
+    ExtTool { name: "kitty",    bins: &["kitty"],             purpose: "terminal with inline image previews",       brew: Some("kitty"),    cask: true,  required: false, any_of: false, other_install: None },
 ];
 
 #[derive(Debug, Clone)]
@@ -48,7 +52,9 @@ pub fn check() -> Vec<Status> {
         let mut found = Vec::new(); let mut missing = Vec::new();
         for b in t.bins { match which(b) { Some(p) => found.push((b.to_string(), p)), None => missing.push(*b) } }
         if t.any_of && !found.is_empty() { missing.clear(); }
-        let install = t.brew.map(|f| if t.cask { format!("brew install --cask {f}") } else { format!("brew install {f}") });
+        // rustup proxies exist even when the component is not installed: verify it runs
+        if t.name == "rust-analyzer" && !found.is_empty() { let ok = std::process::Command::new("rust-analyzer").arg("--version").output().map(|o| o.status.success()).unwrap_or(false); if !ok { found.clear(); missing = vec!["rust-analyzer"]; } }
+        let install = t.brew.map(|f| if t.cask { format!("brew install --cask {f}") } else { format!("brew install {f}") }).or_else(|| t.other_install.map(String::from));
         Status { name: t.name, found, missing, purpose: t.purpose, required: t.required, install }
     }).collect()
 }
@@ -72,13 +78,11 @@ pub fn link_all(statuses: &[Status]) -> Result<(usize, PathBuf)> {
 
 /// Install missing tools with Homebrew (macOS). Streams brew's output to the terminal.
 pub fn install_missing(statuses: &[Status]) -> Result<Vec<String>> {
-    let brew = which("brew").context("Homebrew not found — install it from https://brew.sh then rerun `harness setup --install`")?;
     let mut done = Vec::new();
     for s in statuses.iter().filter(|s| !s.ok()) {
         let Some(cmd) = &s.install else { eprintln!("  {}: no installer known (system tool?)", s.name); continue };
-        let args: Vec<&str> = cmd.split_whitespace().skip(1).collect();
         eprintln!("→ {cmd}");
-        let st = std::process::Command::new(&brew).args(&args).status()?;
+        let st = std::process::Command::new("/bin/sh").arg("-c").arg(cmd).status()?;
         if st.success() { done.push(s.name.to_string()); } else { eprintln!("  failed: {cmd}"); }
     }
     Ok(done)

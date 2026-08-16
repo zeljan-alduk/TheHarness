@@ -8,6 +8,7 @@ pub mod eval;
 pub mod events;
 pub mod hooks;
 pub mod llm;
+pub mod lsp;
 pub mod mcp;
 pub mod memory;
 pub mod permissions;

@@ -873,7 +873,7 @@ impl App {
         let perm_mode = self.perm_mode;
         let budget = self.cfg.llm.effective_budget(if self.metrics.ctx_len > 0 { Some(self.metrics.ctx_len) } else { None });
         self.run_started = Instant::now();
-        self.metrics.turn_start = Some(Instant::now()); self.metrics.live_peak = 0.0; self.metrics.live_chars.clear();
+        self.metrics.turn_start = Some(Instant::now()); self.metrics.live_peak = 0.0; self.metrics.live_chars.clear(); self.turn_tokens = 0;
         let handle = tokio::spawn(async move {
             let res: Result<(String, harness::agent::RunStats), String> = async {
                 let client = Client::new(&cfg.llm).map_err(|e| e.to_string())?;
@@ -885,7 +885,7 @@ impl App {
                 let policy = Arc::new(harness::permissions::Policy::new(pcfg, &workdir));
                 let approver: Arc<dyn harness::permissions::Approver> = Arc::new(TuiApprover(tx.clone()));
                 let env = Arc::new(harness::agent::SubAgentEnv::new(client.clone(), registry.clone(), policy.clone(), approver.clone(), sink.clone(), budget, true));
-                let ctx = ToolCtx { workdir: workdir.clone(), timeout: Duration::from_secs(cfg.agent.tool_timeout_secs), max_output: cfg.agent.max_tool_output_chars, net: cfg.net.clone(), memory: store.clone(), subagent: Some(env), redact_secrets: cfg.security.redact_secrets, hooks: cfg.hooks.clone(), todos: todos.clone() };
+                let ctx = ToolCtx { workdir: workdir.clone(), timeout: Duration::from_secs(cfg.agent.tool_timeout_secs), max_output: cfg.agent.max_tool_output_chars, net: cfg.net.clone(), memory: store.clone(), subagent: Some(env), redact_secrets: cfg.security.redact_secrets, hooks: cfg.hooks.clone(), todos: todos.clone(), lsp_servers: cfg.lsp.servers.clone() };
                 let agent = Agent { client: &client, registry, ctx: &ctx, max_turns: cfg.agent.max_turns, context_budget: budget, sink: sink.as_ref(), stream: true, policy: &policy, approver: approver.as_ref() };
                 let extra = format!("You are in an interactive session: the user can see everything and will reply; keep final answers concise.{extra_prompt}");
                 let system = harness::agent::system_prompt_with_memory(&workdir.display().to_string(), &registry.names(), Some(&extra), store.as_ref());
@@ -1017,10 +1017,6 @@ impl App {
                     let script = format!("display notification \"{body}\" with title \"{title}\" sound name \"Glass\"");
                     tokio::spawn(async move { let _ = tokio::process::Command::new("osascript").arg("-e").arg(script).output().await; });
                 }
-                match &res {
-                    Ok((_, stats)) => { self.session_meta.prompt_tokens += stats.prompt_tokens; self.session_meta.completion_tokens += stats.completion_tokens; }
-                    Err(_) => {}
-                }
                 self.save_session();
                 match res {
                     Ok((_, stats)) => { self.spawn_reflection(&stats); }
@@ -1040,7 +1036,13 @@ impl App {
         match e {
             Event::RunStarted { model, workdir, .. } if workdir == "\u{0}models" => { self.models = model.split('\u{1f}').map(String::from).collect(); }
             Event::RunStarted { .. } | Event::Turn { .. } => {}
-            Event::ModelResponse { prompt_tokens, completion_tokens, ttft_secs, secs, .. } => { self.metrics.on_call(prompt_tokens, completion_tokens, ttft_secs, secs); self.last_prompt_tokens = prompt_tokens; }
+            Event::ModelResponse { prompt_tokens, completion_tokens, ttft_secs, secs, .. } => {
+                self.metrics.on_call(prompt_tokens, completion_tokens, ttft_secs, secs);
+                self.last_prompt_tokens = prompt_tokens;
+                // live session totals (per call), so the panel updates while a task runs
+                self.total_prompt += prompt_tokens; self.total_completion += completion_tokens; self.turn_tokens += completion_tokens;
+                self.session_meta.prompt_tokens += prompt_tokens; self.session_meta.completion_tokens += completion_tokens;
+            }
             Event::ReasoningDelta { text } => {
                 self.metrics.on_delta(text.chars().count());
                 if let Some(Block::Reasoning { text: t, streaming: true, .. }) = self.blocks.last_mut() { t.push_str(&text); }
@@ -1075,7 +1077,7 @@ impl App {
             }
             Event::RunFinished { stop_reason, turns, tool_calls, prompt_tokens, completion_tokens, wall_secs } => {
                 self.finish_streaming();
-                self.total_prompt += prompt_tokens; self.total_completion += completion_tokens; self.turn_tokens = completion_tokens;
+                let _ = (prompt_tokens, completion_tokens); // already accumulated per model call
                 let s = format!("{} · {} model call{} · {} tool call{} · {}+{} tokens · {:.0}s", if stop_reason == "done" { "done" } else { &stop_reason }, turns, if turns == 1 { "" } else { "s" }, tool_calls, if tool_calls == 1 { "" } else { "s" }, fmt_k(prompt_tokens), fmt_k(completion_tokens), wall_secs);
                 self.blocks.push(Block::Finished(s));
             }

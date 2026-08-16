@@ -22,6 +22,14 @@ pub struct Config {
     pub ui: UiConfig,
     #[serde(default)]
     pub sandbox: SandboxConfig,
+    #[serde(default)]
+    pub lsp: LspConfig,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct LspConfig {
+    /// name → {command, args, exts}. Empty = built-in defaults (rust-analyzer, pyright, typescript-language-server, gopls).
+    #[serde(default)] pub servers: std::collections::HashMap<String, crate::lsp::LspServerConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]

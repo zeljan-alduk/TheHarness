@@ -165,7 +165,7 @@ async fn main() -> Result<()> {
         Cmd::Tool { dir, name, args } => {
             let workdir = dir.unwrap_or(std::env::current_dir()?).canonicalize().context("workdir does not exist")?;
             let store = if cfg.memory.enabled { harness::memory::MemoryStore::open(&cfg.memory).ok() } else { None };
-            let ctx = tools::ToolCtx { workdir: workdir.clone(), timeout: Duration::from_secs(cfg.agent.tool_timeout_secs), max_output: cfg.agent.max_tool_output_chars, net: cfg.net.clone(), memory: store, subagent: None, redact_secrets: cfg.security.redact_secrets, hooks: cfg.hooks.clone(), todos: Default::default() };
+            let ctx = tools::ToolCtx { workdir: workdir.clone(), timeout: Duration::from_secs(cfg.agent.tool_timeout_secs), max_output: cfg.agent.max_tool_output_chars, net: cfg.net.clone(), memory: store, subagent: None, redact_secrets: cfg.security.redact_secrets, hooks: cfg.hooks.clone(), todos: Default::default(), lsp_servers: cfg.lsp.servers.clone() };
             let ts = tools::build_toolset(cfg.net.enabled, &workdir, name.starts_with("mcp__")).await;
             let out = ts.registry.call(&name, args.as_deref().unwrap_or("{}"), &ctx).await;
             println!("{}", out.text);
@@ -281,7 +281,7 @@ async fn run_agent(cfg: &config::Config, client: &llm::Client, workdir: &std::pa
         net: cfg.net.clone(),
         memory: None,
         subagent: None,
-        redact_secrets: cfg.security.redact_secrets, hooks: cfg.hooks.clone(), todos: Default::default(),
+        redact_secrets: cfg.security.redact_secrets, hooks: cfg.hooks.clone(), todos: Default::default(), lsp_servers: cfg.lsp.servers.clone(),
     };
     let store = if cfg.memory.enabled { harness::memory::MemoryStore::open(&cfg.memory).ok() } else { None };
     if let Some(m) = &store { let _ = m.touch_project(workdir); }

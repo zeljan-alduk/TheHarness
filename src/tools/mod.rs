@@ -4,6 +4,7 @@ pub mod diagnostics;
 pub mod download;
 pub mod fs;
 pub mod image;
+pub mod lsp;
 pub mod memory;
 pub mod notebook;
 pub mod patch;
@@ -34,6 +35,8 @@ pub struct ToolCtx {
     pub hooks: crate::hooks::HooksConfig,
     /// Shared task list (todo tool) — the UI renders it.
     pub todos: std::sync::Arc<std::sync::Mutex<Vec<todo::TodoItem>>>,
+    /// Language servers ([lsp] config; empty = built-in defaults).
+    pub lsp_servers: std::collections::HashMap<String, crate::lsp::LspServerConfig>,
 }
 
 impl ToolCtx {
@@ -104,6 +107,7 @@ impl Registry {
             Arc::new(search::Grep),
             Arc::new(search::Glob),
             Arc::new(diagnostics::Diagnostics),
+            Arc::new(lsp::Lsp),
             Arc::new(notebook::NotebookEdit),
             Arc::new(image::ViewImage),
             Arc::new(memory::MemoryTool),
@@ -194,7 +198,7 @@ mod tests {
     fn ctx() -> ToolCtx {
         let d = std::env::temp_dir().join(format!("harness-test-{}", std::process::id()));
         std::fs::create_dir_all(&d).unwrap();
-        ToolCtx { workdir: d, timeout: Duration::from_secs(5), max_output: 1000, net: crate::config::NetConfig::default(), memory: None, subagent: None, redact_secrets: true, hooks: Default::default(), todos: Default::default() }
+        ToolCtx { workdir: d, timeout: Duration::from_secs(5), max_output: 1000, net: crate::config::NetConfig::default(), memory: None, subagent: None, redact_secrets: true, hooks: Default::default(), todos: Default::default(), lsp_servers: Default::default() }
     }
     #[test]
     fn resolve_rejects_escape() {
