@@ -89,7 +89,7 @@ src/
   agent.rs     the loop: model → tool calls → results → model; budgets; context compaction
   events.rs    structured Event stream + Sink trait (StderrSink, JsonlSink) — core never prints
   sandbox.rs   local process supervision: timeout, process-group kill, env scrub, output caps
-  tools/       bash, read_file, write_file, edit_file, list_dir, view_image, memory, load_skill, web_fetch, web_search, download_file (+ MCP tools)
+  tools/       bash, read_file, write_file, edit_file, list_dir, view_image, memory, load_skill, read_pdf, extract_archive, web_fetch, web_search, download_file (+ MCP tools)
   memory.rs    MEMORY/WORKFLOWS/BRAIN store, reflection, consolidation, pastes dir
   mcp.rs       MCP stdio client · plugins.rs plugin manager · setup.rs external tools · tui.rs terminal UI
   eval.rs      the fitness function: runs evals/tasks/* in fresh git-initialised workdirs
