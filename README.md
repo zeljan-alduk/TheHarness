@@ -51,6 +51,23 @@ previews are real images in Kitty/WezTerm/iTerm2/Ghostty (half-blocks elsewhere)
 scrubber (ffmpeg): ←/→, space to select, enter attaches frames with timestamps. Commands: `/help
 /model /cd /tools /mcp /plugin /memory /brain /workflows /remember /reflect /compact /net /panel …`.
 
+## Permissions, sub-agents, sessions
+- **Permissions**: `[permissions] mode = bypass|auto|ask|plan` + allow/deny/ask glob rules; risky shell
+  commands and writes outside the workdir prompt (y / a=always / n) in the TUI, desktop and web UIs;
+  `/permissions`, `/plan`, shift+tab cycles; `harness run -y` approves non-interactively.
+- **Sub-agents**: `spawn_agent {task, workdir?, read_only?}` — fresh context, same tools/policy; several in
+  one turn run in parallel. Read-only tool calls in one turn also run in parallel.
+- **Task hand-off**: messages typed while a task runs are queued; `/next` (⌃N) stops the current task and
+  starts the next; loop detection nudges then stops repeated identical calls; reflection never blocks the
+  next task.
+- **Sessions**: every turn is saved under `~/.config/harness/sessions/`; `/sessions`, `/resume <n|id|last>`,
+  `harness --resume <id>`, `harness -c` (continue latest for this directory).
+- **Tools** (all): bash (+background), process, read/write/edit_file, apply_patch, list_dir, grep, glob,
+  diagnostics, notebook_edit, view_image, read_pdf, extract_archive, memory, load_skill, todo, spawn_agent,
+  web_fetch, web_search, download_file, + MCP tools. `[hooks]` run shell hooks around tools; `[security]`
+  redacts secrets; `[sandbox] mode = "seatbelt"` confines shell writes (macOS).
+- **Web UI**: `harness serve` (localhost:7878) — same UI as the desktop app, from any browser.
+
 ## Memory (MEMORY.md · WORKFLOWS.md · BRAIN.md)
 `~/.config/harness/` holds three markdown files injected into every session: **MEMORY.md** (settings,
 preferences, ideas), **WORKFLOWS.md** (named recipes), **BRAIN.md** (what the agent learned: user,
