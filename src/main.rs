@@ -242,6 +242,7 @@ async fn main() -> Result<()> {
         }
         Cmd::SelfImprove { branch, task } => {
             reexec_from_temp_copy()?;
+            let task = if task == "-" { let mut s = String::new(); std::io::Read::read_to_string(&mut std::io::stdin(), &mut s)?; s.trim().to_string() } else { task };
             let repo = repo_root()?;
             let branch = branch.unwrap_or_else(|| format!("proposal/{}", slug(&task)));
             let o = sandbox::run_shell("git rev-parse --is-inside-work-tree && git status --porcelain", &repo, Duration::from_secs(10), 4000).await?;
