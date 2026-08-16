@@ -36,6 +36,9 @@ jobs:
           "$H" --config "$GITHUB_WORKSPACE/harness.toml" tool bash '{"cmd":"echo ok"}' | grep -q ok
           "$H" --config "$GITHUB_WORKSPACE/harness.toml" tool write_file '{"path":"a.txt","content":"hello\n"}'
           "$H" --config "$GITHUB_WORKSPACE/harness.toml" tool glob '{"pattern":"*.txt"}' | grep -q a.txt
+      - name: Tool integration tests (no model)
+        if: runner.os != 'Windows'
+        run: HARNESS_BIN=$GITHUB_WORKSPACE/target/release/harness HARNESS_MEMORY_DIR=/tmp/itest-mem sh scripts/integration_tools.sh
       - name: Headless TUI e2e (pty + VT100 emulator)
         if: runner.os != 'Windows'
         run: |
