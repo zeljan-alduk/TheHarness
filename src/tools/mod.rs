@@ -1,3 +1,4 @@
+pub mod agents;
 pub mod archive;
 pub mod ask_user;
 pub mod bash;
@@ -14,7 +15,10 @@ pub mod notify;
 pub mod notebook;
 pub mod patch;
 pub mod pdf;
+pub mod plan;
 pub mod process;
+pub mod run_workflow;
+pub mod schedule;
 pub mod search;
 pub mod skill;
 pub mod subagent;
@@ -154,12 +158,10 @@ impl Registry {
             Arc::new(notify::Notify),
             Arc::new(findings::ReportFindings),
             Arc::new(mcp_resources::McpResources),
-            Arc::new(monitor::Monitor),
-            Arc::new(monitor::Schedule),
-            Arc::new(monitor::Monitor),
-            Arc::new(notify::Notify),
-            Arc::new(findings::ReportFindings),
-            Arc::new(mcp_resources::McpResources),
+            Arc::new(schedule::Schedule),
+            Arc::new(plan::PlanMode),
+            Arc::new(agents::Agents),
+            Arc::new(run_workflow::RunWorkflow),
         ];
         if net_enabled {
             tools.push(Arc::new(web::WebFetch));

@@ -10,7 +10,7 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock, Weak};
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
@@ -73,6 +73,28 @@ pub struct McpServer {
     transport: Transport,
     next_id: u64,
     pub tools: Vec<McpToolInfo>,
+    /// `capabilities` object from the initialize result (e.g. `{"tools":{}, "resources":{}}`).
+    pub capabilities: Value,
+}
+
+/// Process-global registry of live servers (name, weak handle) so tools like `mcp_resources` can reach
+/// them without threading handles through every `ToolCtx`. Dropped servers are pruned on read.
+static SERVERS: OnceLock<std::sync::Mutex<Vec<(String, Weak<Mutex<McpServer>>)>>> = OnceLock::new();
+
+fn registry() -> &'static std::sync::Mutex<Vec<(String, Weak<Mutex<McpServer>>)>> { SERVERS.get_or_init(|| std::sync::Mutex::new(Vec::new())) }
+
+/// Register a live server handle (called by `start_all`).
+pub fn register_server(name: &str, server: &Arc<Mutex<McpServer>>) {
+    let mut g = registry().lock().unwrap_or_else(|e| e.into_inner());
+    g.retain(|(n, w)| n != name && w.strong_count() > 0);
+    g.push((name.to_string(), Arc::downgrade(server)));
+}
+
+/// Currently connected servers (name, handle), in registration order; dropped handles are pruned.
+pub fn connected_servers() -> Vec<(String, Arc<Mutex<McpServer>>)> {
+    let mut g = registry().lock().unwrap_or_else(|e| e.into_inner());
+    g.retain(|(_, w)| w.strong_count() > 0);
+    g.iter().filter_map(|(n, w)| w.upgrade().map(|s| (n.clone(), s))).collect()
 }
 
 impl McpServer {
@@ -81,7 +103,7 @@ impl McpServer {
             let http = reqwest::Client::builder().timeout(Duration::from_secs(120)).build()?;
             let mut headers = cfg.headers.clone();
             for v in headers.values_mut() { *v = expand_env(v); }
-            let mut s = Self { name: name.to_string(), transport: Transport::Http { http, url: url.clone(), headers, session: None }, next_id: 1, tools: vec![] };
+            let mut s = Self { name: name.to_string(), transport: Transport::Http { http, url: url.clone(), headers, session: None }, next_id: 1, tools: vec![], capabilities: Value::Null };
             s.handshake().await?;
             return Ok(s);
         }
@@ -94,15 +116,16 @@ impl McpServer {
         let mut child = c.spawn().with_context(|| format!("mcp '{name}': cannot start `{}` (is it installed? try `harness setup`)", cfg.command))?;
         let stdin = child.stdin.take().context("no stdin")?;
         let stdout = child.stdout.take().context("no stdout")?;
-        let mut s = Self { name: name.to_string(), transport: Transport::Stdio { child, stdin, reader: BufReader::new(stdout) }, next_id: 1, tools: vec![] };
+        let mut s = Self { name: name.to_string(), transport: Transport::Stdio { child, stdin, reader: BufReader::new(stdout) }, next_id: 1, tools: vec![], capabilities: Value::Null };
         s.handshake().await?;
         Ok(s)
     }
 
     async fn handshake(&mut self) -> Result<()> {
         let name = self.name.clone();
-        self.request("initialize", json!({"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "harness", "version": env!("CARGO_PKG_VERSION")}}), Duration::from_secs(30)).await
+        let init = self.request("initialize", json!({"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "harness", "version": env!("CARGO_PKG_VERSION")}}), Duration::from_secs(30)).await
             .with_context(|| format!("mcp '{name}': initialize failed"))?;
+        self.capabilities = init.get("capabilities").cloned().unwrap_or(Value::Null);
         self.notify("notifications/initialized", json!({})).await?;
         let list = self.request("tools/list", json!({}), Duration::from_secs(30)).await.with_context(|| format!("mcp '{name}': tools/list failed"))?;
         for t in list["tools"].as_array().cloned().unwrap_or_default() {
@@ -195,6 +218,33 @@ impl McpServer {
     }
 
     pub async fn shutdown(mut self) { if let Transport::Stdio { child, .. } = &mut self.transport { let _ = child.kill().await; } }
+
+    /// Whether the server advertised `capabilities.resources` during initialize.
+    pub fn supports_resources(&self) -> bool { self.capabilities.get("resources").map(|r| !r.is_null()).unwrap_or(false) }
+
+    /// `resources/list` (follows `nextCursor` pagination). Returns the raw resource objects.
+    pub async fn list_resources(&mut self) -> Result<Vec<Value>> { self.list_paged("resources/list", "resources").await }
+
+    /// `resources/templates/list` (paginated). Returns the raw template objects.
+    pub async fn list_resource_templates(&mut self) -> Result<Vec<Value>> { self.list_paged("resources/templates/list", "resourceTemplates").await }
+
+    async fn list_paged(&mut self, method: &str, key: &str) -> Result<Vec<Value>> {
+        let mut out = Vec::new();
+        let mut cursor: Option<String> = None;
+        for _ in 0..50 {
+            let params = match &cursor { Some(c) => json!({"cursor": c}), None => json!({}) };
+            let res = self.request(method, params, Duration::from_secs(30)).await?;
+            out.extend(res[key].as_array().cloned().unwrap_or_default());
+            match res.get("nextCursor").and_then(|c| c.as_str()) { Some(c) if !c.is_empty() => cursor = Some(c.to_string()), _ => break }
+        }
+        Ok(out)
+    }
+
+    /// `resources/read`: returns the `contents` array (each `{uri, mimeType?, text? | blob?}`).
+    pub async fn read_resource(&mut self, uri: &str, timeout: Duration) -> Result<Vec<Value>> {
+        let res = self.request("resources/read", json!({"uri": uri}), timeout).await?;
+        Ok(res["contents"].as_array().cloned().unwrap_or_default())
+    }
 }
 
 fn expand_env(s: &str) -> String {
@@ -235,6 +285,7 @@ pub async fn start_all(workdir: &Path, extra_files: &[PathBuf]) -> (Vec<Arc<dyn 
             Ok(Ok(server)) => {
                 let infos = server.tools.clone();
                 let shared = Arc::new(Mutex::new(server));
+                register_server(&name, &shared);
                 for info in infos {
                     let full = format!("mcp__{}__{}", sanitize(&name), sanitize(&info.name));
                     let desc = format!("[MCP {name}] {}", info.description);

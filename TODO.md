@@ -8,32 +8,32 @@ Status: ☐ open · ◐ partial · ☑ done.
 
 - ☑ **`ask_user`** (Claude Code `AskUserQuestion`) — multiple-choice / free-text clarification prompt shown in the
   TUI (and desktop/web UIs) with an optional auto-continue timeout; headless runs answer "no user present".
-- ☐ **`monitor`** (`Monitor`) — run a command in the background and stream each output line (or matching lines)
-  back into the conversation so the model can react to logs / polled status. Today `process tail` is polling only.
+- ☑ **`monitor`** (`Monitor`) — `monitor {start {cmd, filter?, timeout_secs?, max_lines?}|stop|list}`: background
+  command whose (regex-filtered) output lines arrive as inbox events (coalesced ~1/s) plus an exit note.
 - ☑ **`worktree`** (`EnterWorktree` / `ExitWorktree`) — `worktree {create|enter|exit|list|remove}` under
   `.harness/worktrees/<name>` (excluded via `.git/info/exclude`); `enter` switches every tool's working directory until
   `exit` (`ToolCtx::effective`, TUI mode line shows it); `spawn_agent {isolation:"worktree"}` gets a fresh worktree.
-- ☐ **MCP resources** (`ListMcpResourcesTool` / `ReadMcpResourceTool`) — the harness bridges MCP *tools* only;
-  expose `mcp_resources {list|read, server, uri}`.
+- ☑ **MCP resources** (`ListMcpResourcesTool` / `ReadMcpResourceTool`) — `mcp_resources {list|read|templates, server?, uri?}`
+  (image blobs returned as images; servers registered globally in `mcp.rs`).
 
 ## P1
 
-- ☐ **`notify`** (`PushNotification`) — desktop notification when a long task finishes / needs input
-  (`osascript` / `notify-send` / PowerShell toast).
-- ☐ **`schedule`** (`CronCreate/List/Delete`, `ScheduleWakeup`) — session-scoped one-shot / recurring prompts
-  ("in 10 min re-run the tests and report"), restored on resume.
-- ☐ **`report_findings`** (`ReportFindings`) — structured code-review findings (file, line, summary, severity,
-  failure scenario) rendered as a list in the UI and saved as JSON.
-- ☐ **Task graph** (`TaskCreate/Get/List/Update`) — `todo` items with dependencies (`blocked_by`), owner and
-  details; `process kill` already covers `TaskStop`.
-- ☐ **Model-driven plan mode** (`EnterPlanMode` / `ExitPlanMode`) — the model may enter plan mode and present a
-  plan for approval; today `/plan` is user-toggled only.
+- ☑ **`notify`** (`PushNotification`) — `notify {message, title?, subtitle?, sound?}` via `osascript` / `notify-send` /
+  PowerShell toast; `HARNESS_NO_NOTIFY` suppresses.
+- ◐ **`schedule`** (`CronCreate/List/Delete`, `ScheduleWakeup`) — `schedule {add {prompt, delay_secs|at HH:MM, every_secs?}|list|remove|clear}`
+  fires prompts into the inbox; session-scoped (not yet restored on resume).
+- ◐ **`report_findings`** (`ReportFindings`) — `report_findings {findings:[{file,line?,severity,title,summary,...}], summary?}`
+  validated, sorted, saved to `.harness/findings/<ts>.json` + `latest.json`; rendered as text (no dedicated UI panel yet).
+- ☑ **Task graph** (`TaskCreate/Get/List/Update`) — `todo` items carry `blocked_by`, `owner`, `details`; `get`, blocked
+  `start` refused unless `force`, `next` skips blocked; TUI marks ⏳/@owner. `process kill` covers `TaskStop`.
+- ☑ **Model-driven plan mode** (`EnterPlanMode` / `ExitPlanMode`) — `plan_mode {enter|exit {plan}}`: sets the shared
+  policy to Plan, presents the plan via ask_user-style question (approve / approve+ask / revise), restores the mode.
 
 ## P2
 
-- ☐ **Agent messaging** (`SendMessage` / `ListAgents`) — talk to a running sub-agent / resume it with a follow-up
-  message; agent teams.
-- ☐ **`Workflow`** as a tool — run a `harness workflow` TOML from inside a session.
+- ◐ **Agent messaging** (`SendMessage` / `ListAgents`) — `agents {list|send {id,message}|kill|wait}` (steer via the
+  sub-agent inbox); resuming a finished agent / teams not yet.
+- ☑ **`Workflow`** as a tool — `run_workflow {list|run {name, args?}}`.
 - ☐ **`powershell`** — native PowerShell tool on Windows (today: shell selection inside `bash`).
 - ☐ **`WaitForMcpServers` / `ToolSearch`** — lazy MCP connection + deferred tool loading for very large tool sets.
 - ☐ **`SendUserFile`** — hand a generated file to the user (open in Finder / attach in web UI).
