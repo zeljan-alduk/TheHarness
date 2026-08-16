@@ -94,7 +94,7 @@ pub async fn run_task(cfg: &Config, client: &Client, task_dir: &Path, spec: &Tas
     };
     let registry = Registry::defaults(cfg.net.enabled);
     let sink = crate::events::StderrSink { verbose };
-    let agent = Agent { client, registry: &registry, ctx: &ctx, max_turns: spec.max_turns.unwrap_or(cfg.agent.max_turns), context_budget: cfg.llm.context_budget_tokens, sink: &sink };
+    let agent = Agent { client, registry: &registry, ctx: &ctx, max_turns: spec.max_turns.unwrap_or(cfg.agent.max_turns), context_budget: cfg.llm.context_budget_tokens, sink: &sink, stream: true };
     let system = crate::agent::system_prompt(&ctx.workdir.display().to_string(), &registry.names(), None);
     let timeout = Duration::from_secs(spec.timeout_secs.unwrap_or(cfg.eval.task_timeout_secs));
 

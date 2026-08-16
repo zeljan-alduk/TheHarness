@@ -94,11 +94,14 @@ impl Default for NetConfig {
 }
 
 impl Config {
-    /// Load from explicit path, else ./harness.toml, else next to the executable.
+    /// Lookup order: --config / $HARNESS_CONFIG, ./harness.toml, ~/.config/harness/harness.toml,
+    /// next to the executable, and the repo root when running via cargo.
     pub fn load(explicit: Option<&Path>) -> Result<Config> {
         let mut candidates: Vec<PathBuf> = Vec::new();
         if let Some(p) = explicit { candidates.push(p.to_path_buf()); }
+        if let Some(p) = std::env::var_os("HARNESS_CONFIG") { candidates.push(PathBuf::from(p)); }
         candidates.push(PathBuf::from("harness.toml"));
+        if let Some(home) = std::env::var_os("HOME") { candidates.push(PathBuf::from(home).join(".config/harness/harness.toml")); }
         let exe = std::env::var_os("HARNESS_ORIG_EXE").map(PathBuf::from).or_else(|| std::env::current_exe().ok());
         if let Some(exe) = exe {
             if let Some(dir) = exe.parent() { candidates.push(dir.join("harness.toml")); }

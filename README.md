@@ -9,6 +9,15 @@ tools) **and its own source**, but only let it improve itself through an
 **eval-gated loop** — proposals land on git branches and are judged by a benchmark score,
 never by the agent's own opinion.
 
+## Install & use (interactive, Claude-Code-style)
+
+```sh
+cargo install --path .                       # → ~/.cargo/bin/harness
+mkdir -p ~/.config/harness && cp harness.toml ~/.config/harness/   # user config (edit model/server here)
+cd ~/some/project && harness                 # interactive TUI: streaming, tools, /commands, esc to interrupt
+```
+Config lookup: `--config`, `$HARNESS_CONFIG`, `./harness.toml`, `~/.config/harness/harness.toml`, next to the binary.
+
 ## Quick start
 
 ```sh

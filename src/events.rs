@@ -8,6 +8,9 @@ use serde::Serialize;
 pub enum Event {
     RunStarted { model: String, workdir: String, tools: Vec<String> },
     Turn { n: usize },
+    /// Streaming increments (only when the client streams). Final `Reasoning`/`Assistant` still follow.
+    ReasoningDelta { text: String },
+    AssistantDelta { text: String },
     Reasoning { text: String },
     Assistant { text: String },
     ToolCall { id: String, name: String, args: String },
@@ -30,7 +33,7 @@ impl Sink for StderrSink {
         use crate::llm::truncate_for_log as t;
         match e {
             Event::RunStarted { model, workdir, tools } => eprintln!("model={model} workdir={workdir} tools={tools:?}"),
-            Event::Turn { .. } => {}
+            Event::Turn { .. } | Event::ReasoningDelta { .. } | Event::AssistantDelta { .. } => {}
             Event::Reasoning { text } => if self.verbose { eprintln!("💭 {}", t(text.trim(), 400)) },
             Event::Assistant { text } => if self.verbose { eprintln!("🗣 {}", t(text.trim(), 800)) },
             Event::ToolCall { name, args, .. } => eprintln!("▶ {name} {}", t(&args.replace('\n', "\\n"), 300)),

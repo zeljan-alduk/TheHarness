@@ -65,7 +65,7 @@ async fn start_run(app: AppHandle, state: State<'_, RunState>, task: String, wor
             let registry = Registry::defaults(cfg.net.enabled);
             let system = system_prompt(&workdir.display().to_string(), &registry.names(), None);
             let sink = TauriSink { app: app2.clone() };
-            let agent = Agent { client: &client, registry: &registry, ctx: &ctx, max_turns: cfg.agent.max_turns, context_budget: cfg.llm.context_budget_tokens, sink: &sink };
+            let agent = Agent { client: &client, registry: &registry, ctx: &ctx, max_turns: cfg.agent.max_turns, context_budget: cfg.llm.context_budget_tokens, sink: &sink, stream: true };
             agent.run(&system, &task).await.map(|(t, _)| t).map_err(|e| format!("{e:#}"))
         }.await;
         let payload = match result {

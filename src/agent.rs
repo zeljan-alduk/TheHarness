@@ -1,7 +1,7 @@
 //! The core loop: model -> tool calls -> results -> model, with budgets and context compaction.
 
 use crate::events::{Event, Sink};
-use crate::llm::{Client, Content, Message, Usage};
+use crate::llm::{Client, Content, Delta, Message, Usage};
 use crate::tools::{Registry, ToolCtx};
 use anyhow::{bail, Result};
 use std::time::Instant;
@@ -24,6 +24,8 @@ pub struct Agent<'a> {
     pub max_turns: usize,
     pub context_budget: u64,
     pub sink: &'a dyn Sink,
+    /// Stream tokens (emits ReasoningDelta/AssistantDelta). Requires a server that supports SSE.
+    pub stream: bool,
 }
 
 pub fn system_prompt(workdir: &str, tools: &[&str], extra: Option<&str>) -> String {
@@ -45,10 +47,45 @@ Rules:
     s
 }
 
+/// If a run was interrupted after the model asked for tools but before results were appended,
+/// the transcript is invalid for the next request. Patch it with stub results.
+pub fn repair_dangling(msgs: &mut Vec<Message>) {
+    let mut i = 0;
+    while i < msgs.len() {
+        if msgs[i].role == "assistant" {
+            if let Some(calls) = msgs[i].tool_calls.clone() {
+                let mut j = i + 1;
+                let mut have = std::collections::HashSet::new();
+                while j < msgs.len() && msgs[j].role == "tool" { if let Some(id) = &msgs[j].tool_call_id { have.insert(id.clone()); } j += 1; }
+                let mut insert_at = j;
+                for c in calls {
+                    if !have.contains(&c.id) {
+                        msgs.insert(insert_at, Message::tool(c.id.clone(), c.function.name.clone(), "[interrupted by user before this tool ran]"));
+                        insert_at += 1;
+                    }
+                }
+                i = insert_at;
+                continue;
+            }
+        }
+        i += 1;
+    }
+}
+
 impl<'a> Agent<'a> {
+    /// One-shot: fresh transcript, run to completion.
     pub async fn run(&self, system: &str, task: &str) -> Result<(String, RunStats)> {
+        let mut msgs = Vec::new();
+        self.run_turn(&mut msgs, system, task).await
+    }
+
+    /// Multi-turn: append `task` as a user turn to an existing transcript (created if empty) and run
+    /// until the model stops calling tools. The transcript is left ready for the next turn.
+    pub async fn run_turn(&self, msgs: &mut Vec<Message>, system: &str, task: &str) -> Result<(String, RunStats)> {
         let start = Instant::now();
-        let mut msgs = vec![Message::system(system), Message::user(task)];
+        if msgs.is_empty() { msgs.push(Message::system(system)); } else if msgs[0].role == "system" { msgs[0] = Message::system(system); }
+        repair_dangling(msgs);
+        msgs.push(Message::user(task));
         let defs = self.registry.defs();
         let mut stats = RunStats::default();
         let mut last_usage = Usage::default();
@@ -59,15 +96,23 @@ impl<'a> Agent<'a> {
                 stats.stop_reason = "max_turns".into();
                 stats.wall_secs = start.elapsed().as_secs_f64();
                 self.finish(&stats);
-                return Ok((last_text(&msgs).unwrap_or_else(|| "(stopped: max turns reached)".into()), stats));
+                return Ok((last_text(msgs).unwrap_or_else(|| "(stopped: max turns reached)".into()), stats));
             }
             if last_usage.prompt_tokens > self.context_budget {
-                let n = compact(&mut msgs, 6);
+                let n = compact(msgs, 6);
                 if n > 0 { stats.compactions += 1; self.sink.emit(&Event::Compacted { count: n, prompt_tokens: last_usage.prompt_tokens }); }
             }
             stats.turns += 1;
             self.sink.emit(&Event::Turn { n: stats.turns });
-            let (msg, usage) = match self.client.chat(&msgs, &defs).await {
+            let res = if self.stream {
+                self.client.chat_stream(msgs, &defs, |d| match d {
+                    Delta::Reasoning(t) => self.sink.emit(&Event::ReasoningDelta { text: t }),
+                    Delta::Content(t) => self.sink.emit(&Event::AssistantDelta { text: t }),
+                }).await
+            } else {
+                self.client.chat(msgs, &defs).await
+            };
+            let (msg, usage) = match res {
                 Ok(x) => x,
                 Err(e) => { self.sink.emit(&Event::Error { message: format!("{e:#}") }); return Err(e); }
             };

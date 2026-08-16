@@ -1,3 +1,5 @@
+mod tui;
+
 use harness::{agent, config, eval, events, llm, sandbox, tools};
 
 use anyhow::{bail, Context, Result};
@@ -18,12 +20,15 @@ struct Cli {
     /// Emit machine-readable JSONL events on stdout instead of human logs (for UIs)
     #[arg(long, global = true)]
     json: bool,
+    /// No subcommand → interactive terminal UI
     #[command(subcommand)]
-    cmd: Cmd,
+    cmd: Option<Cmd>,
 }
 
 #[derive(Subcommand)]
 enum Cmd {
+    /// Interactive terminal UI (default when no subcommand is given)
+    Chat,
     /// Run the agent on a task in a working directory
     Run {
         /// Working directory (default: current dir)
@@ -75,7 +80,10 @@ async fn main() -> Result<()> {
     let mut cfg = config::Config::load(cli.config.as_deref())?;
     let client = llm::Client::new(&cfg.llm)?;
 
-    match cli.cmd {
+    match cli.cmd.unwrap_or(Cmd::Chat) {
+        Cmd::Chat => {
+            tui::run(cfg).await?;
+        }
         Cmd::Tool { dir, name, args } => {
             let workdir = dir.unwrap_or(std::env::current_dir()?).canonicalize().context("workdir does not exist")?;
             let ctx = tools::ToolCtx { workdir, timeout: Duration::from_secs(cfg.agent.tool_timeout_secs), max_output: cfg.agent.max_tool_output_chars, net: cfg.net.clone() };
@@ -151,7 +159,7 @@ async fn run_agent(cfg: &config::Config, client: &llm::Client, workdir: &std::pa
     };
     let registry = tools::Registry::defaults(cfg.net.enabled);
     let system = agent::system_prompt(&workdir.display().to_string(), &registry.names(), extra);
-    let a = agent::Agent { client, registry: &registry, ctx: &ctx, max_turns: cfg.agent.max_turns, context_budget: cfg.llm.context_budget_tokens, sink: sink.as_ref() };
+    let a = agent::Agent { client, registry: &registry, ctx: &ctx, max_turns: cfg.agent.max_turns, context_budget: cfg.llm.context_budget_tokens, sink: sink.as_ref(), stream: true };
     a.run(&system, task).await
 }
 
