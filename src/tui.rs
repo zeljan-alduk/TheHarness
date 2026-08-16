@@ -1881,9 +1881,31 @@ fn render_block(b: &Block, app: &App, width: usize, out: &mut Vec<Line<'static>>
             }
             let mut first = true;
             let mut in_code: Option<(String, Option<syntect::easy::HighlightLines<'static>>)> = None;
-            for l in text.lines() {
+            let all_lines: Vec<&str> = text.lines().collect();
+            let mut li = 0usize;
+            while li < all_lines.len() {
+                let l = all_lines[li]; li += 1;
                 let bullet = if first { Span::styled("⏺ ", Style::default().fg(pal().fg)) } else { Span::raw("  ") };
                 first = false;
+                // markdown table: consecutive lines starting with '|'
+                if in_code.is_none() && l.trim_start().starts_with('|') && l.trim_end().ends_with('|') {
+                    let mut rows: Vec<Vec<String>> = vec![parse_row(l)];
+                    while li < all_lines.len() && all_lines[li].trim_start().starts_with('|') { rows.push(parse_row(all_lines[li])); li += 1; }
+                    let sep_idx: Option<usize> = rows.iter().position(|r| r.iter().all(|c| !c.is_empty() && c.chars().all(|ch| ch == '-' || ch == ':' || ch == ' ')));
+                    let cols = rows.iter().map(|r| r.len()).max().unwrap_or(0);
+                    let mut widths = vec![0usize; cols];
+                    for (ri, r) in rows.iter().enumerate() { if Some(ri) == sep_idx { continue; } for (ci, c) in r.iter().enumerate() { widths[ci] = widths[ci].max(c.chars().count()).min(40); } }
+                    let mut first_row = true;
+                    for (ri, r) in rows.iter().enumerate() {
+                        if Some(ri) == sep_idx { let mut spans = vec![bullet.clone()]; for (ci, wdt) in widths.iter().enumerate() { spans.push(Span::styled(format!("{}{}", "─".repeat(wdt + 2), if ci + 1 < cols { "┼" } else { "" }), Style::default().fg(pal().dim))); } out.push(Line::from(spans)); continue; }
+                        let mut spans = vec![if first_row { bullet.clone() } else { Span::raw("  ") }];
+                        for ci in 0..cols { let cell = r.get(ci).cloned().unwrap_or_default(); let cell = truncate(&cell, widths[ci]); let pad = widths[ci].saturating_sub(cell.chars().count()); let hdr = sep_idx == Some(ri + 1); spans.push(Span::styled(format!(" {cell}{} ", " ".repeat(pad)), if hdr { Style::default().bold().fg(pal().orange) } else { Style::default() })); if ci + 1 < cols { spans.push(Span::styled("│", Style::default().fg(pal().dim))); } }
+                        out.push(Line::from(spans)); first_row = false;
+                    }
+                    continue;
+                }
+                // lists: "- ", "* ", "1. " and nested (leading spaces)
+                if in_code.is_none() { let t = l.trim_start(); let indent = l.len() - t.len(); if let Some(rest) = t.strip_prefix("- ").or_else(|| t.strip_prefix("* ")).or_else(|| t.strip_prefix("• ")) { let mut spans = vec![bullet.clone(), Span::raw(" ".repeat(indent)), Span::styled("• ", Style::default().fg(pal().orange))]; spans.extend(md_spans(rest)); push_wrapped(out, spans, w, 4 + indent); continue; } if let Some(pos) = t.find(". ") { if pos <= 3 && t[..pos].chars().all(|c| c.is_ascii_digit()) { let mut spans = vec![bullet.clone(), Span::raw(" ".repeat(indent)), Span::styled(format!("{}. ", &t[..pos]), Style::default().fg(pal().orange))]; spans.extend(md_spans(&t[pos + 2..])); push_wrapped(out, spans, w, 4 + indent); continue; } } if let Some(rest) = t.strip_prefix("- [ ] ").or_else(|| t.strip_prefix("- [x] ")).or_else(|| t.strip_prefix("- [X] ")) { let done = t.starts_with("- [x") || t.starts_with("- [X"); let mut spans = vec![bullet.clone(), Span::raw(" ".repeat(indent)), Span::styled(if done { "☑ " } else { "☐ " }, Style::default().fg(if done { pal().ok } else { pal().dim }))]; spans.extend(md_spans(rest)); push_wrapped(out, spans, w, 4 + indent); continue; } if t.starts_with("> ") { let mut spans = vec![bullet.clone(), Span::styled("▍ ", Style::default().fg(pal().dim))]; spans.extend(md_spans(&t[2..]).into_iter().map(|sp| Span::styled(sp.content.to_string(), sp.style.fg(pal().dim).italic()))); push_wrapped(out, spans, w, 4); continue; } if t == "---" || t == "***" { out.push(Line::from(vec![bullet.clone(), Span::styled("─".repeat(w.saturating_sub(4)), Style::default().fg(pal().dim))])); continue; } }
                 if let Some(rest) = l.trim_start().strip_prefix("```") {
                     if in_code.is_none() { in_code = Some((rest.trim().split_whitespace().next().unwrap_or("txt").to_string(), None)); out.push(Line::from(vec![bullet, Span::styled(format!("```{}", rest.trim()), Style::default().fg(pal().dim))])); }
                     else { in_code = None; out.push(Line::from(vec![bullet, Span::styled("```", Style::default().fg(pal().dim))])); }
@@ -2004,6 +2026,8 @@ fn render_block(b: &Block, app: &App, width: usize, out: &mut Vec<Line<'static>>
         Block::Finished(t) => { push_wrapped(out, vec![Span::styled("  ✓ ", Style::default().fg(pal().ok)), Span::styled(t.clone(), Style::default().fg(pal().dim))], w, 4); }
     }
 }
+
+fn parse_row(l: &str) -> Vec<String> { let t = l.trim().trim_start_matches('|').trim_end_matches('|'); t.split('|').map(|c| c.trim().to_string()).collect() }
 
 /// Minimal inline markdown: `code` and **bold** and headings.
 fn md_spans(l: &str) -> Vec<Span<'static>> {
