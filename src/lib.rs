@@ -24,6 +24,7 @@ pub mod memory;
 pub mod permissions;
 pub mod plugins;
 pub mod procs;
+pub mod repomap;
 pub mod runner;
 pub mod sandbox;
 pub mod selfimprove;

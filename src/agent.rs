@@ -177,7 +177,7 @@ Tools: {tools}
 
 Rules:
 - Act, don't ask. The user is not present; finish the task end-to-end, then reply with a short summary.
-- Explore before editing: list_dir / read_file / grep / glob. Never guess file contents.
+- Explore before editing: repo_map (ranked outline of an unfamiliar codebase), then list_dir / read_file / grep / glob. Never guess file contents.
 - Prefer edit_file for small changes; apply_patch for multi-hunk changes; write_file for new files. Keep edits minimal and idiomatic.
 - Verify your work: run the build, tests, diagnostics, or the program itself with bash. If it fails, fix it and re-run.
 - The working directory is a git repository. Use `git status`, `git diff`, `git log` freely to understand state, and `git checkout -- <file>` / `git revert` to undo mistakes. Commit when a coherent unit of work is done, with a clear message.
@@ -326,9 +326,13 @@ impl<'a> Agent<'a> {
             let est_tokens: u64 = context_map(msgs).iter().map(|x| x.1).sum();
             if last_usage.prompt_tokens.max(est_tokens) > self.context_budget {
                 let before = last_usage.prompt_tokens.max(est_tokens);
-                if !self.ctx.hooks.pre_compact.is_empty() { let _ = crate::hooks::run_event(&self.ctx.hooks, "pre_compact", "auto", serde_json::json!({"trigger": "auto", "prompt_tokens": before}), &self.ctx.workdir).await; }
+                if self.ctx.hooks.any("pre_compact") { let _ = crate::hooks::run_event(&self.ctx.hooks, "pre_compact", "auto", serde_json::json!({"trigger": "auto", "prompt_tokens": before}), &self.ctx.workdir).await; }
                 match compact_llm_with(&self.client.aux(), msgs, 8, None, Some(self.sink)).await {
-                    Ok((n, summary, mb, ma)) => { stats.compactions += 1; self.sink.emit(&Event::Compacted { count: n, prompt_tokens: before, summary, map_before: mb, map_after: ma }); }
+                    Ok((n, summary, mb, ma)) => {
+                        stats.compactions += 1;
+                        if self.ctx.hooks.any("post_compact") { let _ = crate::hooks::run_event(&self.ctx.hooks, "post_compact", "auto", serde_json::json!({"trigger": "auto", "removed": n, "prompt_tokens_before": before, "summary": crate::llm::truncate_for_log(&summary, 2000)}), &self.ctx.workdir).await; }
+                        self.sink.emit(&Event::Compacted { count: n, prompt_tokens: before, summary, map_before: mb, map_after: ma });
+                    }
                     Err(_) => { let mb = context_map(msgs); let n = compact(msgs, 6); if n > 0 { stats.compactions += 1; self.sink.emit(&Event::Compacted { count: n, prompt_tokens: before, summary: String::new(), map_before: mb, map_after: context_map(msgs) }); } }
                 }
                 last_usage = Usage::default(); // re-measured on the next call
@@ -337,6 +341,10 @@ impl<'a> Agent<'a> {
             if let Some(m) = self.ctx.inbox.take_message() { msgs.push(Message::user(m)); }
             stats.turns += 1;
             self.sink.emit(&Event::Turn { n: stats.turns });
+            if self.ctx.hooks.any("before_model") {
+                let est: u64 = context_map(msgs).iter().map(|x| x.1).sum();
+                let _ = crate::hooks::run_event(&self.ctx.hooks, "before_model", self.client.model(), serde_json::json!({"turn": stats.turns, "messages": msgs.len(), "est_prompt_tokens": est, "model": self.client.model()}), &self.ctx.workdir).await;
+            }
             let call_start = Instant::now();
             let mut first_token: Option<Instant> = None;
             let res = if self.stream {
@@ -369,6 +377,9 @@ impl<'a> Agent<'a> {
             };
             retries = 0;
             let secs = call_start.elapsed().as_secs_f64();
+            if self.ctx.hooks.any("after_model") {
+                let _ = crate::hooks::run_event(&self.ctx.hooks, "after_model", self.client.model(), serde_json::json!({"turn": stats.turns, "secs": secs, "text": crate::llm::truncate_for_log(&msg.text(), 2000), "tool_calls": msg.tool_calls.as_ref().map(|c| c.len()).unwrap_or(0), "prompt_tokens": usage.prompt_tokens, "completion_tokens": usage.completion_tokens}), &self.ctx.workdir).await;
+            }
             self.sink.emit(&Event::ModelResponse {
                 prompt_tokens: usage.prompt_tokens, completion_tokens: usage.completion_tokens,
                 ttft_secs: first_token.map(|t| (t - call_start).as_secs_f64()).unwrap_or(secs), secs,
@@ -421,9 +432,22 @@ impl<'a> Agent<'a> {
             let ectx = self.ctx.effective();
             let ectx = &ectx;
             let mut blocked: Vec<Option<String>> = Vec::new();
-            for (_, name, args) in &prepared {
-                if !self.ctx.hooks.pre_tool.is_empty() {
-                    if let Some(reason) = crate::hooks::run_pre_tool(&self.ctx.hooks, name, args, &ectx.workdir).await { self.sink.emit(&Event::Permission { tool: name.clone(), summary: crate::llm::truncate_for_log(args, 80), decision: format!("blocked by hook: {reason}") }); blocked.push(Some(format!("error: blocked by a pre-tool hook: {reason}"))); continue; }
+            // pre_tool hooks may rewrite a call's arguments or add context to its result
+            let mut rewrites: Vec<(usize, String)> = Vec::new();
+            let mut hook_context: Vec<(usize, String)> = Vec::new();
+            for (idx, (_, name, args)) in prepared.iter().enumerate() {
+                if self.ctx.hooks.any("pre_tool") {
+                    match crate::hooks::run_pre_tool_full(&self.ctx.hooks, name, args, &ectx.workdir, Some(self.client)).await {
+                        Err(reason) => {
+                            self.sink.emit(&Event::Permission { tool: name.clone(), summary: crate::llm::truncate_for_log(args, 80), decision: format!("blocked by hook: {reason}") });
+                            if self.ctx.hooks.any("permission_denied") { let _ = crate::hooks::run_event(&self.ctx.hooks, "permission_denied", name, serde_json::json!({"tool": name, "args": args, "reason": reason, "by": "hook"}), &ectx.workdir).await; }
+                            blocked.push(Some(format!("error: blocked by a pre-tool hook: {reason}"))); continue;
+                        }
+                        Ok((rewritten, context)) => {
+                            if let Some(new_args) = rewritten { rewrites.push((idx, new_args)); }
+                            if !context.is_empty() { hook_context.push((idx, context)); }
+                        }
+                    }
                 }
                 let av: serde_json::Value = serde_json::from_str(args).unwrap_or(serde_json::Value::Null);
                 let ro = self.registry.is_read_only(name);
@@ -442,9 +466,25 @@ impl<'a> Agent<'a> {
                 }
                 let msg = match d {
                     crate::permissions::Decision::Allow => None,
-                    crate::permissions::Decision::Deny(r) => { self.sink.emit(&Event::Permission { tool: name.clone(), summary: crate::permissions::Policy::primary_arg(name, &av), decision: format!("denied: {r}") }); Some(format!("error: blocked by permission policy ({r}). Ask the user or choose another approach.")) }
+                    crate::permissions::Decision::Deny(r) => {
+                        self.sink.emit(&Event::Permission { tool: name.clone(), summary: crate::permissions::Policy::primary_arg(name, &av), decision: format!("denied: {r}") });
+                        if self.ctx.hooks.any("permission_denied") { let _ = crate::hooks::run_event(&self.ctx.hooks, "permission_denied", name, serde_json::json!({"tool": name, "args": args, "reason": r, "by": "policy"}), &ectx.workdir).await; }
+                        Some(format!("error: blocked by permission policy ({r}). Ask the user or choose another approach."))
+                    }
                     crate::permissions::Decision::Ask(r) => {
                         let arg = crate::permissions::Policy::primary_arg(name, &av);
+                        // a permission_request hook may decide instead of the user
+                        let mut hook_decided: Option<bool> = None;
+                        if self.ctx.hooks.any("permission_request") {
+                            for o in crate::hooks::run(&self.ctx.hooks, "permission_request", name, serde_json::json!({"tool": name, "args": args, "summary": arg, "reason": r}), &ectx.workdir, Some(self.client)).await {
+                                match o.decision.as_deref() { Some("allow") => hook_decided = Some(true), Some("block") | Some("deny") => hook_decided = Some(false), _ => {} }
+                            }
+                        }
+                        if let Some(allowed) = hook_decided {
+                            self.sink.emit(&Event::Permission { tool: name.clone(), summary: arg.clone(), decision: format!("{} by a permission_request hook", if allowed { "allowed" } else { "denied" }) });
+                            blocked.push(if allowed { None } else { Some("error: a permission hook refused this call. Do not retry it; take a different approach.".to_string()) });
+                            continue;
+                        }
                         let req = crate::permissions::ApprovalRequest { tool: name.clone(), summary: arg.clone(), suggested_rule: crate::permissions::Policy::suggested_rule(name, &arg), reason: r.clone() };
                         self.sink.emit(&Event::Permission { tool: name.clone(), summary: arg.clone(), decision: format!("asking: {r}") });
                         match self.approver.ask(req.clone()).await {
@@ -457,6 +497,12 @@ impl<'a> Agent<'a> {
                 };
                 blocked.push(msg);
             }
+            for (idx, new_args) in &rewrites {
+                if let Some(slot) = prepared.get_mut(*idx) {
+                    self.sink.emit(&Event::Permission { tool: slot.1.clone(), summary: crate::llm::truncate_for_log(new_args, 80), decision: "arguments rewritten by a pre_tool hook".into() });
+                    slot.2 = new_args.clone();
+                }
+            }
             let outputs: Vec<(crate::tools::ToolOutput, f64)> = if all_read_only && prepared.len() > 1 {
                 // independent reads: run concurrently
                 let futs = prepared.iter().zip(blocked.iter()).map(|((_, name, args), b)| async move { if b.is_some() { return (crate::tools::ToolOutput::default(), 0.0); } let t0 = Instant::now(); let o = self.registry.call(name, args, ectx).await; (o, t0.elapsed().as_secs_f64()) });
@@ -466,8 +512,9 @@ impl<'a> Agent<'a> {
                 for ((_, name, args), b) in prepared.iter().zip(blocked.iter()) { if b.is_some() { v.push((crate::tools::ToolOutput::default(), 0.0)); continue; } let t0 = Instant::now(); let o = self.registry.call(name, args, ectx).await; v.push((o, t0.elapsed().as_secs_f64())); }
                 v
             };
-            for (((id, name, _), (out, secs)), block) in prepared.into_iter().zip(outputs).zip(blocked) {
-                let out = match block { Some(m) => crate::tools::ToolOutput { text: m, images: vec![] }, None => out };
+            for (i, (((id, name, _), (out, secs)), block)) in prepared.into_iter().zip(outputs).zip(blocked).enumerate() {
+                let mut out = match block { Some(m) => crate::tools::ToolOutput { text: m, images: vec![] }, None => out };
+                if let Some((_, ctx_text)) = hook_context.iter().find(|(idx, _)| *idx == i) { out.text.push_str(&format!("\n\n[hook] {}", ctx_text.trim())); }
                 self.sink.emit(&Event::ToolResult { id: id.clone(), name: name.clone(), result: out.text.clone(), secs,
                     images: out.images.iter().map(|(m, b)| format!("data:{m};base64,{b}")).collect() });
                 msgs.push(Message::tool(id, name.clone(), out.text));

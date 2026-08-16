@@ -17,6 +17,7 @@ pub mod patch;
 pub mod pdf;
 pub mod plan;
 pub mod process;
+pub mod repomap;
 pub mod run_workflow;
 pub mod schedule;
 pub mod search;
@@ -146,6 +147,7 @@ impl Registry {
             Arc::new(fs::ListDir),
             Arc::new(search::Grep),
             Arc::new(search::Glob),
+            Arc::new(repomap::RepoMap),
             Arc::new(diagnostics::Diagnostics),
             Arc::new(lsp::Lsp),
             Arc::new(notebook::NotebookEdit),
@@ -234,7 +236,12 @@ impl Registry {
         if matches!(name, "write_file" | "edit_file" | "apply_patch" | "notebook_edit") && !out.text.starts_with("error:") {
             let base = ctx.effective();
             if let Some(p) = crate::instructions::touched_path(name, &args_for_rules) {
-                if let Ok(abs) = base.resolve(&p) { if let Some(note) = crate::format::after_edit(&abs, &base).await { out.text.push_str(&note); } }
+                if let Ok(abs) = base.resolve(&p) {
+                    if let Some(note) = crate::format::after_edit(&abs, &base).await { out.text.push_str(&note); }
+                    if ctx.hooks.any("file_changed") {
+                        let _ = crate::hooks::run_event(&ctx.hooks, "file_changed", &abs.display().to_string(), serde_json::json!({"path": abs.display().to_string(), "tool": name}), &base.workdir).await;
+                    }
+                }
             }
         }
         // path-scoped rules / sub-directory instruction files, injected the first time a call touches a match

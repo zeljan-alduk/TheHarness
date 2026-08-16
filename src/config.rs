@@ -250,6 +250,13 @@ impl Config {
         }
         cfg.apply_settings_overlay();
         cfg.apply_env();
+        // hooks defined for Claude Code in this project are honoured too (trusted directories only)
+        if crate::permissions::is_trusted(&cwd) {
+            for f in [cwd.join(".claude").join("settings.json"), cwd.join(".claude").join("settings.local.json")] {
+                let n = crate::hooks::import_claude_hooks(&mut cfg.hooks, &f);
+                if n > 0 { eprintln!("config: imported {n} hook(s) from {}", f.display()); }
+            }
+        }
         Ok(cfg)
     }
 

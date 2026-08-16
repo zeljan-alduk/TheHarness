@@ -29,6 +29,7 @@ impl Tool for Worktree {
                 let path = format!("{root}/.harness-worktrees/{name}");
                 let o = sh(format!("mkdir -p '{root}/.harness-worktrees' && (grep -qx '.harness-worktrees/' '{root}/.git/info/exclude' 2>/dev/null || echo '.harness-worktrees/' >> '{root}/.git/info/exclude'); git worktree add -b '{branch}' '{path}' HEAD 2>&1 || git worktree add '{path}' '{branch}' 2>&1")).await?;
                 if !o.success() { bail!("worktree add failed: {}{}", o.stdout, o.stderr); }
+                if ctx.hooks.any("worktree_create") { let _ = crate::hooks::run_event(&ctx.hooks, "worktree_create", &name, json!({"name": name, "path": path, "branch": branch}), &ctx.workdir).await; }
                 Ok(format!("worktree ready: {path} (branch {branch}, from HEAD). Work there via spawn_agent {{workdir: \"{path}\"}} or `cd {path} && …`; when done: worktree exit {{name: \"{name}\"}} then merge the branch if wanted.").into())
             }
             "exit" => {

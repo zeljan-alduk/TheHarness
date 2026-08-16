@@ -32,6 +32,7 @@ impl Tool for SpawnAgent {
         if args.get("isolation").and_then(|v| v.as_str()) == Some("worktree") {
             let name = format!("agent-{}", env.next_label());
             workdir = crate::worktree::create(&workdir, &name, None, None)?;
+            if ctx.hooks.any("worktree_create") { let _ = crate::hooks::run_event(&ctx.hooks, "worktree_create", &name, json!({"name": name, "path": workdir.display().to_string(), "branch": format!("wt/{name}")}), &ctx.workdir).await; }
             wt_note = format!("\n[worktree '{name}' at {} — branch wt/{name}; merge or cherry-pick from it, then `worktree remove {{name:\"{name}\"}}`]", workdir.display());
         }
         // named custom agent (.harness/agents/*.md, .claude/agents/*.md, …)
