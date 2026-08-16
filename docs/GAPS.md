@@ -38,7 +38,7 @@ Priority: P0 = decisive for daily use, P1 = strong differentiator, P2 = polish/b
 | Capability | Us | Best | Gap | Prio |
 |---|---|---|---|---|
 | Eval-gated `self` mode + **arbiter** (`harness arbiter`) | ✅ | (unique) | schedule arbiter runs nightly | P2 |
-| Eval corpus | ◐ (14 tasks, checks validated) | SWE-bench-style suites | 30–50 tasks across langs; repo-level tasks; timing/token cost in the score; flaky-run averaging | **P0** |
+| Eval corpus | ◐ (20 tasks, checks validated) | SWE-bench-style suites | 30–50 tasks across langs; repo-level tasks; timing/token cost in the score; flaky-run averaging | **P0** |
 | Reflection → BRAIN.md; consolidation | ✅ | (unique-ish; DSH goal/memory pkgs) | evaluate memory usefulness (A/B with memory off) | P1 |
 | Prompt/policy tuning by the agent | ◐ (system prompt still in code) | — | make system prompt + tool descriptions data files the agent can propose changes to, measured by eval | P1 |
 
