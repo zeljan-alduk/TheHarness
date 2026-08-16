@@ -1,0 +1,21 @@
+# Example: run the eval suite every night and fail the job on a regression.
+name: harness-eval
+on:
+  schedule: [{ cron: "0 3 * * *" }]
+  workflow_dispatch:
+jobs:
+  eval:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release
+      - name: Run the eval suite
+        env: { ANTHROPIC_API_KEY: "${{ secrets.ANTHROPIC_API_KEY }}" }
+        run: |
+          ./target/release/harness --set llm.provider=anthropic --set llm.model=claude-sonnet-5 \
+            --set llm.base_url=https://api.anthropic.com eval --out "$RUNNER_TEMP/report.json"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: eval-report, path: "${{ runner.temp }}/report.json" }

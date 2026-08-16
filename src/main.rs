@@ -82,6 +82,20 @@ enum Cmd {
         #[arg(short, long)]
         out: Option<PathBuf>,
     },
+    /// Import Terminal-Bench / Harbor tasks into evals/tasks (instruction → prompt, tests → check)
+    #[command(name = "eval-import")]
+    EvalImport {
+        /// A Harbor task directory, or a directory of them
+        path: PathBuf,
+        /// Where to write the converted tasks (default: the configured tasks dir)
+        #[arg(short, long)]
+        out: Option<PathBuf>,
+        /// Also import tasks whose environment is a container (their checks may not pass locally)
+        #[arg(long)]
+        include_docker: bool,
+        #[arg(long, default_value_t = 200)]
+        limit: usize,
+    },
     /// Self-improvement: run the agent on the harness's own repo, on a new git branch
     #[command(name = "self")]
     SelfImprove {
@@ -553,6 +567,17 @@ async fn main() -> Result<()> {
                 report.total_prompt_tokens, report.total_completion_tokens, report.total_wall_secs, out.display());
             println!("{}", serde_json::to_string(&serde_json::json!({"passed": report.passed, "total": report.total, "score": report.score}))?);
             if report.passed < report.total { std::process::exit(1); }
+        }
+        Cmd::EvalImport { path, out, include_docker, limit } => {
+            let dest = out.unwrap_or_else(|| PathBuf::from(&cfg.eval.tasks_dir));
+            std::fs::create_dir_all(&dest)?;
+            let res = eval::import_harbor(&path, &dest, include_docker, limit)?;
+            let (mut ok, mut skipped) = (0, 0);
+            for r in &res {
+                if r.ok { ok += 1; println!("✓ {:<32} {}", r.name, r.note); } else { skipped += 1; println!("· {:<32} skipped: {}", r.name, r.note); }
+            }
+            println!("\n{ok} task(s) imported into {}{} — run them with: harness eval --filter imported", dest.display(), if skipped > 0 { format!(", {skipped} skipped") } else { String::new() });
+            if ok == 0 { std::process::exit(1); }
         }
         Cmd::SelfImprove { branch, task } => {
             reexec_from_temp_copy()?;

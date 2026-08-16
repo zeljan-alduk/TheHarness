@@ -1,0 +1,27 @@
+# Example: reply to "@harness <task>" on an issue or pull request.
+# Copy into .github/workflows/ and set ANTHROPIC_API_KEY (or another provider's key) as a repo secret.
+name: harness
+on:
+  issue_comment:
+    types: [created]
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+jobs:
+  respond:
+    if: startsWith(github.event.comment.body, '@harness')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: aldotech/TheHarness/.github/actions/harness@main
+        with:
+          prompt: ${{ github.event.comment.body }}
+          provider: anthropic
+          model: claude-sonnet-5
+          api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          max_turns: 30
+          comment: "true"

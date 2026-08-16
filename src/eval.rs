@@ -38,6 +38,106 @@ pub struct TaskResult {
     pub workdir: String,
 }
 
+/// What happened to one task during an import.
+#[derive(Debug, Clone, Serialize)]
+pub struct Imported { pub name: String, pub ok: bool, pub note: String }
+
+/// Import Terminal-Bench / Harbor style tasks into our `evals/tasks` format.
+///
+/// A Harbor task is a directory with `task.yaml` (the instruction), `tests/` (what decides pass/fail),
+/// usually an `environment/` with a Dockerfile, and a reference `solution/`. We keep the instruction as
+/// the prompt, turn the tests into our `check` command, and copy everything that is not scaffolding
+/// into `fixture/`. Tasks whose environment is a container are skipped unless `include_docker` is set,
+/// because their checks cannot pass on a bare workdir — being honest about that beats a fake red suite.
+pub fn import_harbor(src: &Path, dest: &Path, include_docker: bool, limit: usize) -> Result<Vec<Imported>> {
+    let mut roots: Vec<PathBuf> = Vec::new();
+    if src.join("task.yaml").is_file() || src.join("task.toml").is_file() { roots.push(src.to_path_buf()); }
+    else {
+        for e in std::fs::read_dir(src).with_context(|| format!("reading {}", src.display()))? {
+            let p = e?.path();
+            if p.is_dir() && (p.join("task.yaml").is_file() || p.join("task.toml").is_file()) { roots.push(p); }
+        }
+    }
+    roots.sort();
+    let mut out = Vec::new();
+    for root in roots.into_iter().take(limit.max(1)) {
+        let name = root.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "task".into());
+        match import_one(&root, dest, &name, include_docker) {
+            Ok(note) => out.push(Imported { name, ok: true, note }),
+            Err(e) => out.push(Imported { name, ok: false, note: format!("{e:#}") }),
+        }
+    }
+    Ok(out)
+}
+
+fn yaml_str(v: &serde_yaml::Value, keys: &[&str]) -> Option<String> {
+    for k in keys {
+        if let Some(s) = v.get(*k).and_then(|x| x.as_str()) { if !s.trim().is_empty() { return Some(s.trim().to_string()); } }
+    }
+    None
+}
+
+fn import_one(root: &Path, dest: &Path, name: &str, include_docker: bool) -> Result<String> {
+    let spec_path = if root.join("task.yaml").is_file() { root.join("task.yaml") } else { root.join("task.toml") };
+    let text = std::fs::read_to_string(&spec_path)?;
+    let doc: serde_yaml::Value = serde_yaml::from_str(&text).with_context(|| format!("parsing {}", spec_path.display()))?;
+    let prompt = yaml_str(&doc, &["instruction", "prompt", "description", "task"]).context("no instruction/prompt in the task file")?;
+    let dockerish = ["environment/Dockerfile", "Dockerfile", "docker-compose.yaml", "environment/docker-compose.yaml"].iter().any(|f| root.join(f).exists());
+    if dockerish && !include_docker { anyhow::bail!("needs a container environment (pass --include-docker to import it anyway)"); }
+
+    // what decides pass/fail
+    let check = if root.join("run-tests.sh").is_file() { "bash run-tests.sh".to_string() }
+        else if root.join("tests/run-tests.sh").is_file() { "bash tests/run-tests.sh".to_string() }
+        else if root.join("tests").is_dir() {
+            let py = std::fs::read_dir(root.join("tests")).map(|rd| rd.flatten().any(|e| e.path().extension().map(|x| x == "py").unwrap_or(false))).unwrap_or(false);
+            if py { "python3 -m pytest -q tests".to_string() } else { "bash -c 'for t in tests/*.sh; do bash \"$t\" || exit 1; done'".to_string() }
+        } else { anyhow::bail!("no tests/ or run-tests.sh — nothing would decide pass/fail") };
+
+    let timeout = doc.get("max_agent_timeout_sec").or_else(|| doc.get("timeout_sec")).and_then(|v| v.as_u64());
+    let mut tags: Vec<String> = doc.get("tags").and_then(|v| v.as_sequence()).map(|a| a.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect()).unwrap_or_default();
+    tags.push("imported".into());
+    if dockerish { tags.push("needs-docker".into()); }
+    if let Some(d) = yaml_str(&doc, &["difficulty"]) { tags.push(d); }
+
+    // copy everything that is not scaffolding into fixture/ (the tests come along: the check runs them)
+    let out_dir = dest.join(name);
+    std::fs::create_dir_all(&out_dir)?;
+    let fixture = out_dir.join("fixture");
+    let _ = std::fs::remove_dir_all(&fixture);
+    std::fs::create_dir_all(&fixture)?;
+    let mut copied = 0usize;
+    for e in std::fs::read_dir(root)? {
+        let p = e?.path();
+        let base = p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+        if matches!(base.as_str(), "task.yaml" | "task.toml" | "solution" | "solution.sh" | "environment" | ".git") { continue; }
+        let to = fixture.join(&base);
+        if p.is_dir() { copy_dir(&p, &to)?; } else { std::fs::copy(&p, &to)?; }
+        copied += 1;
+    }
+    // some layouts keep the working files under environment/ next to the Dockerfile
+    if include_docker && root.join("environment").is_dir() {
+        for e in std::fs::read_dir(root.join("environment"))? {
+            let p = e?.path();
+            let base = p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+            if base == "Dockerfile" || base.starts_with("docker-compose") { continue; }
+            let to = fixture.join(&base);
+            if p.is_dir() { copy_dir(&p, &to)?; } else { std::fs::copy(&p, &to)?; }
+            copied += 1;
+        }
+    }
+
+    let spec = format!(
+"name = {name}\nprompt = {prompt}\ncheck = {check}\ntags = {tags}\n{timeout}# imported from {src} by `harness eval-import` — review the check before trusting the score\n",
+        name = toml_str(name), prompt = toml_str(&prompt), check = toml_str(&check),
+        tags = toml::Value::Array(tags.into_iter().map(toml::Value::String).collect()),
+        timeout = timeout.map(|t| format!("timeout_secs = {t}\n")).unwrap_or_default(),
+        src = root.display());
+    std::fs::write(out_dir.join("task.toml"), spec)?;
+    Ok(format!("{copied} fixture entr{} · check: {check}", if copied == 1 { "y" } else { "ies" }))
+}
+
+fn toml_str(s: &str) -> String { toml::Value::String(s.to_string()).to_string() }
+
 pub fn load_tasks(dir: &Path, filter: Option<&str>) -> Result<Vec<(PathBuf, TaskSpec)>> {
     let mut out = Vec::new();
     for e in std::fs::read_dir(dir).with_context(|| format!("reading tasks dir {}", dir.display()))? {
@@ -160,4 +260,55 @@ pub async fn run_all(cfg: &Config, client: &Client, filter: Option<&str>, verbos
         total_wall_secs: results.iter().map(|r| r.stats.wall_secs).sum(),
         results,
     })
+}
+
+#[cfg(test)]
+mod import_tests {
+    use super::*;
+
+    fn write(p: &Path, body: &str) { std::fs::create_dir_all(p.parent().unwrap()).unwrap(); std::fs::write(p, body).unwrap(); }
+
+    #[test]
+    fn imports_harbor_tasks() {
+        let d = std::env::temp_dir().join(format!("harness-tbimport-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        let (src, dest) = (d.join("bench"), d.join("out"));
+        // a plain task: instruction + shell tests + a workspace file
+        write(&src.join("fix-parser/task.yaml"), "instruction: |\n  Fix the parser so the tests pass.\ntags: [parsing, hard]\nmax_agent_timeout_sec: 600\ndifficulty: hard\n");
+        write(&src.join("fix-parser/run-tests.sh"), "#!/bin/sh\nexit 0\n");
+        write(&src.join("fix-parser/src/parser.py"), "def parse(s): return None\n");
+        write(&src.join("fix-parser/solution/solution.sh"), "echo cheat\n");
+        // a containerised task: skipped by default
+        write(&src.join("needs-image/task.yaml"), "instruction: Build the image and run it.\n");
+        write(&src.join("needs-image/environment/Dockerfile"), "FROM alpine\n");
+        write(&src.join("needs-image/tests/test_x.py"), "def test_x(): assert True\n");
+        // a task with no tests at all: refused
+        write(&src.join("no-tests/task.yaml"), "instruction: Do something.\n");
+
+        let res = import_harbor(&src, &dest, false, 100).unwrap();
+        let by = |n: &str| res.iter().find(|r| r.name == n).cloned().unwrap();
+        assert!(by("fix-parser").ok, "{res:?}");
+        assert!(!by("needs-image").ok && by("needs-image").note.contains("container"), "{res:?}");
+        assert!(!by("no-tests").ok && by("no-tests").note.contains("tests"), "{res:?}");
+
+        let spec: TaskSpec = toml::from_str(&std::fs::read_to_string(dest.join("fix-parser/task.toml")).unwrap()).unwrap();
+        assert_eq!(spec.name, "fix-parser");
+        assert!(spec.prompt.contains("Fix the parser"));
+        assert_eq!(spec.check, "bash run-tests.sh");
+        assert_eq!(spec.timeout_secs, Some(600));
+        assert!(spec.tags.contains(&"imported".to_string()) && spec.tags.contains(&"hard".to_string()));
+        assert!(dest.join("fix-parser/fixture/src/parser.py").is_file(), "workspace files are copied");
+        assert!(!dest.join("fix-parser/fixture/solution").exists(), "the reference solution is never copied");
+        // the imported task is loadable by the eval runner
+        let tasks = load_tasks(&dest, None).unwrap();
+        assert_eq!(tasks.len(), 1);
+
+        // with --include-docker the containerised one comes in, tagged
+        let res = import_harbor(&src, &dest, true, 100).unwrap();
+        assert!(res.iter().find(|r| r.name == "needs-image").unwrap().ok);
+        let spec: TaskSpec = toml::from_str(&std::fs::read_to_string(dest.join("needs-image/task.toml")).unwrap()).unwrap();
+        assert!(spec.tags.contains(&"needs-docker".to_string()));
+        assert!(spec.check.contains("pytest"));
+        let _ = std::fs::remove_dir_all(&d);
+    }
 }

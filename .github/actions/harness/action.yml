@@ -1,0 +1,151 @@
+name: "TheHarness"
+description: "Run TheHarness on a repository: a prompt in, a JSON result (and optionally a PR/issue comment) out."
+author: "TheHarness"
+branding: { icon: "cpu", color: "orange" }
+
+inputs:
+  prompt:
+    description: "What the agent should do. Supports the usual GitHub expressions, e.g. the body of the issue comment that triggered the run."
+    required: true
+  model:
+    description: "Model name (default: whatever the config says)."
+    required: false
+  base_url:
+    description: "OpenAI-compatible endpoint, e.g. https://api.openai.com/v1 or a self-hosted server."
+    required: false
+    default: "https://api.anthropic.com"
+  provider:
+    description: "anthropic | openai | claude-code | acp:<agent> (default: anthropic)."
+    required: false
+    default: "anthropic"
+  api_key:
+    description: "API key for the model provider (pass a secret)."
+    required: false
+  permissions:
+    description: "bypass | auto | ask | plan. CI has no user, so anything that would ask is denied unless this is bypass."
+    required: false
+    default: "bypass"
+  max_turns:
+    description: "Stop after this many model turns."
+    required: false
+    default: "40"
+  goal:
+    description: "Optional success condition; the agent keeps working until a checker model says it holds."
+    required: false
+  json_schema:
+    description: "Optional JSON schema (inline or a path) the final answer must match."
+    required: false
+  working_directory:
+    description: "Where to run (default: the checked-out repository)."
+    required: false
+    default: "."
+  harness_ref:
+    description: "Git ref of TheHarness to build (default: main). Ignored when harness_binary is set."
+    required: false
+    default: "main"
+  harness_repo:
+    description: "Repository to build the harness from."
+    required: false
+    default: "aldotech/TheHarness"
+  harness_binary:
+    description: "Path to a prebuilt harness binary (skips the build)."
+    required: false
+  comment:
+    description: "Post the result as a comment on the triggering issue/PR (needs github_token and issues/pull-requests: write)."
+    required: false
+    default: "false"
+  github_token:
+    description: "Token used for the comment."
+    required: false
+    default: ${{ github.token }}
+
+outputs:
+  result:
+    description: "The agent's final answer (or the JSON value when json_schema is set)."
+    value: ${{ steps.run.outputs.result }}
+  session_id:
+    description: "Session id of the run (its transcript is uploaded as part of the log)."
+    value: ${{ steps.run.outputs.session_id }}
+  is_error:
+    description: "true when the run failed."
+    value: ${{ steps.run.outputs.is_error }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Cache the harness build
+      if: inputs.harness_binary == ''
+      uses: actions/cache@v4
+      with:
+        path: ~/.cargo/bin/harness
+        key: harness-${{ runner.os }}-${{ inputs.harness_ref }}
+
+    - name: Build the harness
+      if: inputs.harness_binary == ''
+      shell: bash
+      run: |
+        set -euo pipefail
+        if [ -x "$HOME/.cargo/bin/harness" ]; then echo "using the cached harness"; else
+          tmp=$(mktemp -d)
+          git clone --depth 1 --branch "${{ inputs.harness_ref }}" "https://github.com/${{ inputs.harness_repo }}.git" "$tmp/harness"
+          (cd "$tmp/harness" && cargo install --path . --locked)
+        fi
+        "$HOME/.cargo/bin/harness" --version
+
+    - name: Run
+      id: run
+      shell: bash
+      working-directory: ${{ inputs.working_directory }}
+      env:
+        HARNESS_PROMPT: ${{ inputs.prompt }}
+        ANTHROPIC_API_KEY: ${{ inputs.api_key }}
+        OPENAI_API_KEY: ${{ inputs.api_key }}
+      run: |
+        set -uo pipefail
+        BIN="${{ inputs.harness_binary }}"; [ -n "$BIN" ] || BIN="$HOME/.cargo/bin/harness"
+        CFG="$RUNNER_TEMP/harness.toml"
+        cat > "$CFG" <<TOML
+        [llm]
+        base_url = "${{ inputs.base_url }}"
+        model = "${{ inputs.model }}"
+        provider = "${{ inputs.provider }}"
+        [agent]
+        max_turns = ${{ inputs.max_turns }}
+        [permissions]
+        mode = "${{ inputs.permissions }}"
+        [ui]
+        notify = false
+        TOML
+        args=(--config "$CFG" -y run --output-format json --max-turns "${{ inputs.max_turns }}")
+        [ -n "${{ inputs.goal }}" ] && args+=(--goal "${{ inputs.goal }}")
+        [ -n "${{ inputs.json_schema }}" ] && args+=(--json-schema "${{ inputs.json_schema }}")
+        printf '%s' "$HARNESS_PROMPT" > "$RUNNER_TEMP/prompt.txt"
+        set +e
+        "$BIN" "${args[@]}" - < "$RUNNER_TEMP/prompt.txt" > "$RUNNER_TEMP/result.json"
+        code=$?
+        set -e
+        cat "$RUNNER_TEMP/result.json"
+        result=$(jq -r 'if (.result|type) == "string" then .result else (.result|tojson) end' "$RUNNER_TEMP/result.json" 2>/dev/null || cat "$RUNNER_TEMP/result.json")
+        {
+          echo "result<<HARNESS_EOF"
+          echo "$result"
+          echo "HARNESS_EOF"
+          echo "session_id=$(jq -r '.session_id // ""' "$RUNNER_TEMP/result.json" 2>/dev/null)"
+          echo "is_error=$(jq -r '.is_error // false' "$RUNNER_TEMP/result.json" 2>/dev/null)"
+        } >> "$GITHUB_OUTPUT"
+        {
+          echo "### TheHarness"
+          echo
+          echo "$result"
+        } >> "$GITHUB_STEP_SUMMARY"
+        exit $code
+
+    - name: Comment on the issue / PR
+      if: ${{ inputs.comment == 'true' && github.event.issue.number != '' }}
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github_token }}
+        BODY: ${{ steps.run.outputs.result }}
+      run: |
+        printf '%s\n' "$BODY" > "$RUNNER_TEMP/comment.md"
+        gh issue comment "${{ github.event.issue.number }}" --repo "${{ github.repository }}" --body-file "$RUNNER_TEMP/comment.md"
