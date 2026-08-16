@@ -43,8 +43,7 @@ struct Shared {
     events: broadcast::Sender<String>,
     run: Mutex<Option<tokio::task::JoinHandle<()>>>,
     asks: Mutex<std::collections::HashMap<u64, tokio::sync::oneshot::Sender<crate::permissions::Approval>>>,
-    next_ask: Mutex<u64>,
-}
+    next_ask: Mutex<u64>, allow_remote: bool }
 
 struct SseSink { tx: broadcast::Sender<String> }
 impl Sink for SseSink { fn emit(&self, e: &Event) { let _ = self.tx.send(json!({"name": "agent-event", "payload": e}).to_string()); } }
@@ -58,6 +57,25 @@ impl crate::permissions::Approver for WebApprover {
         self.shared.asks.lock().unwrap().insert(id, tx);
         let _ = self.shared.events.send(json!({"name": "permission-ask", "payload": {"id": id, "tool": req.tool, "summary": req.summary, "rule": req.suggested_rule, "reason": req.reason}}).to_string());
         rx.await.unwrap_or(crate::permissions::Approval::Deny)
+    }
+}
+
+/// A LAN URL for this bind address (so the printed link works from a phone), if we can find one.
+fn lan_address(bind: &str) -> Option<String> {
+    let port = bind.rsplit(':').next().unwrap_or("7878").to_string();
+    let host = bind.rsplit_once(':').map(|(h, _)| h).unwrap_or("");
+    if !matches!(host, "0.0.0.0" | "::" | "[::]") { return None; }
+    // ask the OS for the address that would be used to reach the internet
+    let out = std::process::Command::new("sh").arg("-c").arg("ipconfig getifaddr en0 2>/dev/null || hostname -I 2>/dev/null | awk '{print $1}'").output().ok()?;
+    let ip = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!ip.is_empty()).then(|| format!("http://{ip}:{port}"))
+}
+
+/// Print a QR code for the URL when `qrencode` is around — scanning beats typing a token on a phone.
+fn print_qr(url: &str) {
+    if crate::setup::which("qrencode").is_none() { return; }
+    if let Ok(o) = std::process::Command::new("qrencode").args(["-t", "ANSIUTF8", "-m", "1", url]).output() {
+        if o.status.success() { eprint!("{}", String::from_utf8_lossy(&o.stdout)); }
     }
 }
 
@@ -83,13 +101,24 @@ fn allowed_path(sh: &Shared, p: &str) -> Result<PathBuf> {
     if roots.iter().any(|r| full.starts_with(r)) { Ok(full) } else { anyhow::bail!("{p}: outside the allowed directories ({})", roots.iter().map(|r| r.display().to_string()).collect::<Vec<_>>().join(", ")) }
 }
 
-pub async fn serve(cfg: crate::config::Config, bind: &str) -> Result<()> {
+pub async fn serve(cfg: crate::config::Config, bind: &str) -> Result<()> { serve_with(cfg, bind, false).await }
+
+/// `allow_remote` lifts the loopback Host/Origin pin so another machine (or a phone) can attach with
+/// the token. Only do that on a network you trust: the token is the only thing between the outside and
+/// an agent with tools.
+pub async fn serve_with(cfg: crate::config::Config, bind: &str, allow_remote: bool) -> Result<()> {
     let listener = TcpListener::bind(bind).await.with_context(|| format!("binding {bind}"))?;
     let (tx, _) = broadcast::channel::<String>(1024);
     let token = new_token();
     let cwd = std::env::current_dir()?.canonicalize()?;
-    let shared = Arc::new(Shared { cfg, token: token.clone(), roots: Mutex::new(vec![cwd]), events: tx, run: Mutex::new(None), asks: Mutex::new(Default::default()), next_ask: Mutex::new(0) });
-    eprintln!("harness web UI on http://{bind}/?token={token}  (ctrl+c to stop; the token is required)");
+    let shared = Arc::new(Shared { cfg, token: token.clone(), roots: Mutex::new(vec![cwd]), events: tx, run: Mutex::new(None), asks: Mutex::new(Default::default()), next_ask: Mutex::new(0), allow_remote });
+    let url = format!("http://{bind}/?token={token}");
+    eprintln!("harness web UI on {url}  (ctrl+c to stop; the token is required)");
+    if allow_remote {
+        let lan = lan_address(bind);
+        eprintln!("remote access is ON — attach from another machine with:\n  harness attach {}", lan.as_deref().unwrap_or(&url));
+        if let Some(u) = &lan { print_qr(u); }
+    }
     loop {
         let (sock, _) = listener.accept().await?;
         let sh = shared.clone();
@@ -119,7 +148,7 @@ async fn handle(mut sock: TcpStream, sh: Arc<Shared>) -> Result<()> {
     }
     // Local-origin pinning: Host must be a loopback name; a present Origin must be our own origin (blocks CSRF / DNS rebinding).
     let host_name = host.rsplit_once(':').map(|(h, _)| h).unwrap_or(&host).trim_matches(|c| c == '[' || c == ']');
-    if !matches!(host_name, "localhost" | "127.0.0.1" | "::1") || origin.as_deref().is_some_and(|o| o != format!("http://{host}")) {
+    if !sh.allow_remote && (!matches!(host_name, "localhost" | "127.0.0.1" | "::1") || origin.as_deref().is_some_and(|o| o != format!("http://{host}"))) {
         w.write_all(&respond("403 Forbidden", "text/plain", b"forbidden: bad Host/Origin")).await?; return Ok(());
     }
     if content_length > MAX_BODY { w.write_all(&respond("413 Payload Too Large", "text/plain", b"body too large")).await?; return Ok(()); }

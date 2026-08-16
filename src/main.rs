@@ -173,9 +173,24 @@ enum Cmd {
     },
     /// Serve the web UI (same UI as the desktop app) on localhost
     Serve {
-        /// address to bind, e.g. 127.0.0.1:7878 (use 0.0.0.0:7878 to reach it from other devices — no auth!)
+        /// address to bind, e.g. 127.0.0.1:7878 (with --allow-remote, 0.0.0.0:7878 reaches other devices)
         #[arg(long, default_value = "127.0.0.1:7878")]
         bind: String,
+        /// Accept connections from other machines (token still required; prints a link and a QR code)
+        #[arg(long)]
+        allow_remote: bool,
+    },
+    /// Attach this terminal to a running `harness serve` (local or remote); the session outlives the client
+    Attach {
+        /// The URL `harness serve` printed (it carries ?token=…), or host:port with --token
+        url: String,
+        #[arg(long)]
+        token: Option<String>,
+        /// Working directory for the runs (default: the server's)
+        #[arg(short = 'C', long)]
+        dir: Option<String>,
+        /// Optional first task to start right away
+        task: Option<String>,
     },
     /// Smart self-improvement loop: propose → confirm (auto for frontier models) → implement on proposal/* branches → arbiter → merge → install
     Improve {
@@ -379,7 +394,8 @@ async fn main() -> Result<()> {
             }
         }
         Cmd::Acp => { harness::acp::serve(cfg).await?; }
-        Cmd::Serve { bind } => { harness::serve::serve(cfg, &bind).await?; }
+        Cmd::Serve { bind, allow_remote } => { harness::serve::serve_with(cfg, &bind, allow_remote).await?; }
+        Cmd::Attach { url, token, dir, task } => { harness::attach::attach(&url, token.as_deref(), dir, task).await?; }
         Cmd::Improve { hint, no_install, skip_arbiter } => {
             // the loop rebuilds/installs the harness: never run it from the binary being replaced
             reexec_from_temp_copy()?;
