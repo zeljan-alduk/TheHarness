@@ -10,7 +10,7 @@ use serde::Serialize;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Duration;
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 
 /// Bridges core events to the webview.
 struct TauriSink { app: AppHandle }
@@ -19,7 +19,28 @@ impl Sink for TauriSink {
 }
 
 #[derive(Default)]
-struct RunState { handle: Mutex<Option<tauri::async_runtime::JoinHandle<()>>> }
+struct RunState { handle: Mutex<Option<tauri::async_runtime::JoinHandle<()>>>, asks: Mutex<std::collections::HashMap<u64, tokio::sync::oneshot::Sender<harness::permissions::Approval>>>, next_ask: Mutex<u64> }
+
+/// Permission prompts go to the webview as `permission-ask`; the UI answers via `answer_permission`.
+struct TauriApprover { app: AppHandle }
+#[async_trait::async_trait]
+impl harness::permissions::Approver for TauriApprover {
+    async fn ask(&self, req: harness::permissions::ApprovalRequest) -> harness::permissions::Approval {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let state = self.app.state::<RunState>();
+        let id = { let mut n = state.next_ask.lock().unwrap(); *n += 1; *n };
+        state.asks.lock().unwrap().insert(id, tx);
+        let _ = self.app.emit("permission-ask", &serde_json::json!({"id": id, "tool": req.tool, "summary": req.summary, "rule": req.suggested_rule, "reason": req.reason}));
+        rx.await.unwrap_or(harness::permissions::Approval::Deny)
+    }
+}
+
+#[tauri::command]
+fn answer_permission(state: State<'_, RunState>, id: u64, decision: String) -> Result<(), String> {
+    let tx = state.asks.lock().unwrap().remove(&id).ok_or("unknown prompt")?;
+    let a = match decision.as_str() { "once" | "yes" => harness::permissions::Approval::Once, "always" => harness::permissions::Approval::Always, _ => harness::permissions::Approval::Deny };
+    let _ = tx.send(a); Ok(())
+}
 
 #[derive(Serialize)]
 struct RunFinished { ok: bool, text: String, error: Option<String> }
@@ -69,7 +90,7 @@ async fn start_run(app: AppHandle, state: State<'_, RunState>, task: String, wor
             let budget = cfg.llm.effective_budget(harness::llm::detect_context_length(&cfg.llm.base_url, &cfg.llm.model).await.map(|d| d.0));
             let mut pcfg = cfg.permissions.clone(); pcfg.allow.extend(harness::permissions::persisted_rules());
             let policy = std::sync::Arc::new(harness::permissions::Policy::new(pcfg, &workdir));
-            let approver: std::sync::Arc<dyn harness::permissions::Approver> = std::sync::Arc::new(harness::permissions::AutoApprover { yes: true }); // desktop UI: approvals coming in a later iteration; auto-approve
+            let approver: std::sync::Arc<dyn harness::permissions::Approver> = std::sync::Arc::new(TauriApprover { app: app2.clone() });
             let env = std::sync::Arc::new(harness::agent::SubAgentEnv::new(client.clone(), registry.clone(), policy.clone(), approver.clone(), sink.clone(), budget, true));
             let ctx = ToolCtx { workdir: workdir.clone(), timeout: Duration::from_secs(cfg.agent.tool_timeout_secs), max_output: cfg.agent.max_tool_output_chars, net: cfg.net.clone(), memory: store.clone(), subagent: Some(env), redact_secrets: cfg.security.redact_secrets, hooks: cfg.hooks.clone(), todos: Default::default() };
             let agent = Agent { client: &client, registry: &registry, ctx: &ctx, max_turns: cfg.agent.max_turns, context_budget: budget, sink: sink.as_ref(), stream: true, policy: &policy, approver: approver.as_ref() };
@@ -160,7 +181,7 @@ fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .manage(RunState::default())
-        .invoke_handler(tauri::generate_handler![get_config, list_models, start_run, stop_run, list_dir, read_file, git_log])
+        .invoke_handler(tauri::generate_handler![get_config, list_models, start_run, stop_run, list_dir, read_file, git_log, answer_permission])
         .run(tauri::generate_context!())
         .expect("error while running TheHarness UI");
 }

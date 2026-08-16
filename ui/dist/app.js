@@ -32,7 +32,19 @@ listen('agent-event', ({ payload: e }) => {
     case 'compacted': addSystem(`compacted ${e.count} old tool results (prompt was ${e.prompt_tokens} tokens)`); break;
     case 'run_finished': addFinished(e); break;
     case 'error': addError(e.message); break;
+    case 'memory': addSystem(`🧠 ${e.file} › ${e.section}: ${e.text}`); break;
+    case 'permission': if ((e.decision || '').startsWith('denied')) addError(`🔒 ${e.tool}: ${e.decision}`); break;
+    case 'model_response': setStats(`${e.completion_tokens} tok · ttft ${e.ttft_secs.toFixed(1)}s · ${(e.completion_tokens / Math.max(0.1, e.secs - e.ttft_secs)).toFixed(1)} tok/s`); break;
+    case 'assistant_delta': case 'reasoning_delta': break;
   }
+});
+listen('permission-ask', ({ payload: p }) => {
+  const d = el('div', 'ev tool'); d.style.borderColor = 'var(--accent)';
+  d.appendChild(el('div', null, `🔒 ${p.tool}(${p.summary}) — ${p.reason}`));
+  const row = el('div', 'row'); row.style.marginTop = '8px';
+  const mk = (label, dec, cls) => { const b = el('button', cls, label); b.onclick = async () => { await invoke('answer_permission', { id: p.id, decision: dec }); d.querySelectorAll('button').forEach(x => x.disabled = true); d.appendChild(el('div', 'dim', `→ ${label}`)); }; return b; };
+  row.appendChild(mk('Allow once', 'once', 'primary')); row.appendChild(mk(`Always (${p.rule})`, 'always', '')); row.appendChild(mk('Deny', 'deny', ''));
+  d.appendChild(row); tl().appendChild(d); scrollDown();
 });
 listen('run-finished', ({ payload: p }) => {
   state.running = false; $('run').disabled = false; $('stop').disabled = true;
