@@ -32,6 +32,7 @@ pub mod runner;
 pub mod sandbox;
 pub mod selfimprove;
 pub mod serve;
+pub mod scheduler;
 pub mod security;
 pub mod sessions;
 pub mod setup;

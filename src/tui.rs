@@ -1480,6 +1480,35 @@ impl App {
                     }
                 });
             }
+            "/jobs" => {
+                let store = harness::scheduler::Store::open();
+                match store {
+                    Ok(st) => {
+                        let a = arg.trim().to_string();
+                        if let Some(name) = a.strip_prefix("run ") {
+                            let (name, cfg, tx) = (name.trim().to_string(), self.cfg.clone(), self.tx.clone());
+                            self.blocks.push(Block::System(format!("running scheduled job '{name}' in the background")));
+                            tokio::spawn(async move {
+                                let Ok(store) = harness::scheduler::Store::open() else { return };
+                                let msg = match store.get(&name) {
+                                    None => format!("no scheduled job '{name}'"),
+                                    Some(j) => match harness::scheduler::run_job(&cfg, &store, &j).await { Ok(t) => format!("job '{name}': {}", truncate(t.trim(), 300)), Err(e) => format!("job '{name}' failed: {e:#}") },
+                                };
+                                let _ = tx.send(Msg::Notice(msg));
+                            });
+                        } else if let Some(name) = a.strip_prefix("remove ") {
+                            match st.remove(name.trim()) { Ok(j) => self.blocks.push(Block::System(format!("removed job '{}'", j.id))), Err(e) => self.blocks.push(Block::Error(format!("{e:#}"))) }
+                        } else {
+                            let mut lines = harness::scheduler::render(&st.list());
+                            lines.push(String::new());
+                            lines.push("add with: harness schedule add <name> --every 1h|--at 03:00 \"<prompt>\" · run them with: harness daemon".into());
+                            lines.push("here: /jobs run <name> · /jobs remove <name>".into());
+                            self.blocks.push(Block::Banner(lines));
+                        }
+                    }
+                    Err(e) => self.blocks.push(Block::Error(format!("{e:#}"))),
+                }
+            }
             "/goal" => {
                 let a = arg.trim().to_string();
                 if a.is_empty() {
@@ -2158,6 +2187,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ("/vim", "toggle vim-style modal editing in the prompt"),
     ("/workflow", "run a workflow: /workflow <name> [args]  (list with /workflow)"),
     ("/queue", "queue a task instead of steering: /queue <text> · show the queue · /queue clear"),
+    ("/jobs", "persistent scheduled jobs (harness daemon runs them): /jobs · /jobs run <name> · /jobs remove <name>"),
     ("/arena", "best-of-n: /arena [models] -- <task> runs it in parallel worktrees and judges the results"),
     ("/goal", "keep working until a condition holds: /goal <condition> · /goal off (checked by the aux model each turn)"),
     ("/next", "stop the current task and start the next queued one (ctrl+n)"),

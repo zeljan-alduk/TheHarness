@@ -155,6 +155,24 @@ async fn handle(mut sock: TcpStream, sh: Arc<Shared>) -> Result<()> {
             let out = match invoke(&sh, &cmd, args).await { Ok(v) => json!({"result": v}), Err(e) => json!({"error": format!("{e:#}")}) };
             w.write_all(&respond("200 OK", "application/json", out.to_string().as_bytes())).await?;
         }
+        // webhook trigger: POST /api/hook/<job> (token-protected like every /api route) runs a scheduled job now
+        ("POST", r) if r.starts_with("/api/hook/") => {
+            let name = r.trim_start_matches("/api/hook/").to_string();
+            let store = crate::scheduler::Store::open();
+            match store.as_ref().ok().and_then(|st| st.get(&name)) {
+                Some(job) => {
+                    let (cfg, id) = (sh.cfg.clone(), job.id.clone());
+                    tokio::spawn(async move {
+                        if let Ok(store) = crate::scheduler::Store::open() {
+                            let r = crate::scheduler::run_job(&cfg, &store, &job).await;
+                            eprintln!("· webhook '{id}': {}", match r { Ok(t) => crate::llm::truncate_for_log(t.trim(), 160), Err(e) => format!("failed: {e:#}") });
+                        }
+                    });
+                    w.write_all(&respond("202 Accepted", "application/json", json!({"started": name}).to_string().as_bytes())).await?;
+                }
+                None => { w.write_all(&respond("404 Not Found", "application/json", json!({"error": format!("no scheduled job '{name}'")}).to_string().as_bytes())).await?; }
+            }
+        }
         _ => { w.write_all(&respond("404 Not Found", "text/plain", b"not found")).await?; }
     }
     Ok(())

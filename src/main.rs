@@ -168,6 +168,20 @@ enum Cmd {
         #[arg(long)]
         skip_arbiter: bool,
     },
+    /// Scheduled jobs that survive restarts: add | list | remove | enable | disable | run | log
+    Schedule {
+        #[command(subcommand)]
+        action: ScheduleCmd,
+    },
+    /// Run due scheduled jobs (cron-style). Leave it running, or call it from launchd/systemd/cron with --once
+    Daemon {
+        /// Seconds between checks (default 30)
+        #[arg(long, default_value_t = 30)]
+        tick: u64,
+        /// Run whatever is due right now, then exit
+        #[arg(long)]
+        once: bool,
+    },
     /// Workflows: list | run <name|path> [args]
     Workflow {
         #[command(subcommand)]
@@ -200,6 +214,38 @@ enum Cmd {
     Models,
     /// Print the effective configuration
     Config,
+}
+
+#[derive(Subcommand)]
+enum ScheduleCmd {
+    /// Add a job: harness schedule add nightly-eval --every 1d "run the eval suite and report regressions"
+    Add {
+        /// Short name (used as the id)
+        name: String,
+        prompt: String,
+        /// Repeat interval: 30s | 10m | 2h | 1d
+        #[arg(long)]
+        every: Option<String>,
+        /// Local daily time HH:MM (instead of --every)
+        #[arg(long)]
+        at: Option<String>,
+        /// Working directory (default: here)
+        #[arg(short = 'C', long)]
+        dir: Option<PathBuf>,
+        #[arg(long)]
+        max_turns: Option<usize>,
+        /// Run it once immediately as well as on schedule
+        #[arg(long)]
+        now: bool,
+    },
+    List,
+    Remove { name: String },
+    Enable { name: String },
+    Disable { name: String },
+    /// Run a job right now, whatever its schedule says
+    Run { name: String },
+    /// Show the job's output log
+    Log { name: String, #[arg(long, default_value_t = 60)] lines: usize },
 }
 
 #[derive(Subcommand)]
@@ -276,6 +322,41 @@ async fn main() -> Result<()> {
             let r = harness::arena::run(&cfg, &workdir, &task, &list, sink, true).await?;
             if cli.json { println!("{}", serde_json::to_string(&r)?); } else { for l in harness::arena::render(&r) { println!("{l}"); } }
             if r.winner.is_none() { std::process::exit(1); }
+        }
+        Cmd::Daemon { tick, once } => { harness::scheduler::daemon(cfg, Duration::from_secs(tick.max(5)), once).await?; }
+        Cmd::Schedule { action } => {
+            let store = harness::scheduler::Store::open()?;
+            match action {
+                ScheduleCmd::Add { name, prompt, every, at, dir, max_turns, now: start_now } => {
+                    let workdir = dir.unwrap_or(std::env::current_dir()?).canonicalize().context("workdir does not exist")?;
+                    let now = harness::scheduler::now();
+                    let (every_secs, at, next_at) = match (every, at) {
+                        (Some(e), None) => { let s = harness::scheduler::parse_every(&e)?; (Some(s), None, now + s) }
+                        (None, Some(t)) => { let n = harness::scheduler::next_daily(&t, now)?; (None, Some(t), n) }
+                        (Some(_), Some(_)) => bail!("use --every or --at, not both"),
+                        (None, None) => (None, None, now),
+                    };
+                    let next_at = if start_now { now } else { next_at };
+                    let job = harness::scheduler::Job { id: name, prompt, workdir: workdir.display().to_string(), every_secs, at, next_at, enabled: true, runs: 0, last_run: 0, last_status: String::new(), max_turns, created: 0 };
+                    let j = store.add(job)?;
+                    println!("scheduled '{}' ({}) in {} — run the daemon to execute it: harness daemon", j.id, j.cadence(), harness::scheduler::fmt_secs(j.next_at.saturating_sub(now)));
+                }
+                ScheduleCmd::List => { for l in harness::scheduler::render(&store.list()) { println!("{l}"); } }
+                ScheduleCmd::Remove { name } => { let j = store.remove(&name)?; println!("removed '{}'", j.id); }
+                ScheduleCmd::Enable { name } => { let j = store.set_enabled(&name, true)?; println!("enabled '{}' — next in {}", j.id, harness::scheduler::fmt_secs(j.next_at.saturating_sub(harness::scheduler::now()))); }
+                ScheduleCmd::Disable { name } => { let j = store.set_enabled(&name, false)?; println!("paused '{}'", j.id); }
+                ScheduleCmd::Run { name } => {
+                    let job = store.get(&name).context("no such job")?;
+                    let out = harness::scheduler::run_job(&cfg, &store, &job).await?;
+                    println!("{out}");
+                }
+                ScheduleCmd::Log { name, lines } => {
+                    let job = store.get(&name).context("no such job")?;
+                    let p = store.log_path(&job.id);
+                    let text = std::fs::read_to_string(&p).unwrap_or_else(|_| format!("(no log yet at {})", p.display()));
+                    for l in text.lines().rev().take(lines).collect::<Vec<_>>().into_iter().rev() { println!("{l}"); }
+                }
+            }
         }
         Cmd::Acp => { harness::acp::serve(cfg).await?; }
         Cmd::Serve { bind } => { harness::serve::serve(cfg, &bind).await?; }
