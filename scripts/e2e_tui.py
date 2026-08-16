@@ -10,7 +10,7 @@ except ImportError:
     pyte = None
 
 NO_MODEL = "--no-model" in sys.argv
-ROWS, COLS = 45, 150
+ROWS, COLS = 70, 160
 HARNESS = os.environ.get("HARNESS_BIN", os.path.expanduser("~/.cargo/bin/harness"))
 WORK = os.environ.get("HARNESS_E2E_DIR", "/tmp/harness-e2e"); os.makedirs(WORK, exist_ok=True)
 
