@@ -1,9 +1,11 @@
 pub mod archive;
 pub mod bash;
+pub mod diagnostics;
 pub mod download;
 pub mod fs;
 pub mod image;
 pub mod memory;
+pub mod notebook;
 pub mod patch;
 pub mod process;
 pub mod search;
@@ -101,6 +103,8 @@ impl Registry {
             Arc::new(fs::ListDir),
             Arc::new(search::Grep),
             Arc::new(search::Glob),
+            Arc::new(diagnostics::Diagnostics),
+            Arc::new(notebook::NotebookEdit),
             Arc::new(image::ViewImage),
             Arc::new(memory::MemoryTool),
             Arc::new(skill::LoadSkill),

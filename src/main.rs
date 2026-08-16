@@ -129,6 +129,7 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     let mut cfg = config::Config::load(cli.config.as_deref())?;
     if let Some(m) = &cli.permissions { cfg.permissions.mode = harness::permissions::Mode::parse(m).context("--permissions must be bypass|auto|ask|plan")?; }
+    sandbox::configure_seatbelt(cfg.sandbox.mode == "seatbelt", cfg.sandbox.deny_network, cfg.sandbox.allow_write.clone());
     let client = llm::Client::new(&cfg.llm)?;
 
     match cli.cmd.unwrap_or(Cmd::Chat) {

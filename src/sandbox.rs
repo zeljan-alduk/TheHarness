@@ -28,9 +28,27 @@ fn is_secret_env(k: &str) -> bool {
         && !u.starts_with("HARNESS_")
 }
 
+static SEATBELT: std::sync::OnceLock<Option<(bool, Vec<String>)>> = std::sync::OnceLock::new();
+/// Enable macOS seatbelt for all shell commands (call once at startup).
+pub fn configure_seatbelt(enabled: bool, deny_network: bool, allow_write: Vec<String>) {
+    let _ = SEATBELT.set(if enabled { Some((deny_network, allow_write)) } else { None });
+}
+fn seatbelt_profile(cwd: &Path, deny_network: bool, extra: &[String]) -> String {
+    let home = std::env::var("HOME").unwrap_or_default();
+    let mut writable = vec![cwd.canonicalize().unwrap_or(cwd.to_path_buf()).display().to_string(), std::env::temp_dir().display().to_string(), "/private/tmp".into(), "/tmp".into(), format!("{home}/.config/harness"), format!("{home}/.cargo/registry"), format!("{home}/.cargo/git"), format!("{home}/.cache"), format!("{home}/.npm"), "/dev".into()];
+    writable.extend(extra.iter().cloned());
+    let allows: String = writable.iter().map(|p| format!("(subpath \"{}\")", p.replace('"', ""))).collect::<Vec<_>>().join(" ");
+    let net = if deny_network { "(deny network*) (allow network* (local ip \"localhost:*\")) (allow network* (remote ip \"localhost:*\"))" } else { "" };
+    format!("(version 1) (allow default) (deny file-write*) (allow file-write* {allows}) (allow file-write* (literal \"/dev/null\") (literal \"/dev/tty\") (regex #\"^/dev/tty\")) {net}")
+}
+
 pub async fn run_shell(cmd: &str, cwd: &Path, timeout: Duration, max_output: usize) -> Result<ProcOutput> {
     let start = std::time::Instant::now();
-    let mut c = Command::new("/bin/sh");
+    let seatbelt = SEATBELT.get().cloned().flatten().filter(|_| cfg!(target_os = "macos") && Path::new("/usr/bin/sandbox-exec").exists());
+    let mut c = match &seatbelt {
+        Some((deny_net, extra)) => { let mut c = Command::new("/usr/bin/sandbox-exec"); c.arg("-p").arg(seatbelt_profile(cwd, *deny_net, extra)).arg("/bin/sh"); c }
+        None => Command::new("/bin/sh"),
+    };
     c.arg("-c").arg(cmd)
         .current_dir(cwd)
         .stdin(Stdio::null())

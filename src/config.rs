@@ -20,6 +20,18 @@ pub struct Config {
     pub security: SecurityConfig,
     #[serde(default)]
     pub ui: UiConfig,
+    #[serde(default)]
+    pub sandbox: SandboxConfig,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct SandboxConfig {
+    /// "none" (default) or "seatbelt" (macOS sandbox-exec: shell commands may only write inside the
+    /// workdir, $TMPDIR and ~/.config/harness; set deny_network to also block outbound network).
+    #[serde(default)] pub mode: String,
+    #[serde(default)] pub deny_network: bool,
+    /// Extra writable paths for seatbelt mode.
+    #[serde(default)] pub allow_write: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
