@@ -19,6 +19,30 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use unicode_width::UnicodeWidthChar;
 
+// ───────────────────────── syntax highlighting ─────────────────────────
+struct Highlighter { ss: syntect::parsing::SyntaxSet, dark: syntect::highlighting::Theme, light: syntect::highlighting::Theme }
+static HL: std::sync::OnceLock<Highlighter> = std::sync::OnceLock::new();
+fn hl() -> &'static Highlighter {
+    HL.get_or_init(|| {
+        let ts = syntect::highlighting::ThemeSet::load_defaults();
+        Highlighter { ss: syntect::parsing::SyntaxSet::load_defaults_newlines(), dark: ts.themes["base16-ocean.dark"].clone(), light: ts.themes["InspiredGitHub"].clone() }
+    })
+}
+/// Highlight one line of code in `lang` into styled spans (falls back to plain).
+fn highlight_line(lang: &str, line: &str, state: &mut Option<syntect::easy::HighlightLines<'static>>) -> Vec<Span<'static>> {
+    let h = hl();
+    if state.is_none() {
+        let syntax = h.ss.find_syntax_by_token(lang).or_else(|| h.ss.find_syntax_by_extension(lang)).unwrap_or_else(|| h.ss.find_syntax_plain_text());
+        let theme = if LIGHT.load(std::sync::atomic::Ordering::Relaxed) { &h.light } else { &h.dark };
+        *state = Some(syntect::easy::HighlightLines::new(syntax, theme));
+    }
+    let hl_state = state.as_mut().unwrap();
+    match hl_state.highlight_line(&format!("{line}\n"), &h.ss) {
+        Ok(ranges) => ranges.into_iter().map(|(st, txt)| { let c = st.foreground; let mut style = Style::default().fg(Color::Rgb(c.r, c.g, c.b)); if st.font_style.contains(syntect::highlighting::FontStyle::BOLD) { style = style.bold(); } if st.font_style.contains(syntect::highlighting::FontStyle::ITALIC) { style = style.italic(); } Span::styled(txt.trim_end_matches('\n').to_string(), style) }).collect(),
+        Err(_) => vec![Span::raw(line.to_string())],
+    }
+}
+
 // ───────────────────────── palette (dark / light) ─────────────────────────
 #[derive(Clone, Copy)]
 struct Pal { orange: Color, dim: Color, ok: Color, err: Color, think: Color, blue: Color, pink: Color, cyan: Color, fg: Color, panel_bg: Color }
@@ -1407,10 +1431,25 @@ fn render_block(b: &Block, app: &App, width: usize, out: &mut Vec<Line<'static>>
                 return;
             }
             let mut first = true;
+            let mut in_code: Option<(String, Option<syntect::easy::HighlightLines<'static>>)> = None;
             for l in text.lines() {
                 let bullet = if first { Span::styled("⏺ ", Style::default().fg(pal().fg)) } else { Span::raw("  ") };
-                push_wrapped(out, vec![bullet, Span::raw(l.to_string())], w, 2);
                 first = false;
+                if let Some(rest) = l.trim_start().strip_prefix("```") {
+                    if in_code.is_none() { in_code = Some((rest.trim().split_whitespace().next().unwrap_or("txt").to_string(), None)); out.push(Line::from(vec![bullet, Span::styled(format!("```{}", rest.trim()), Style::default().fg(pal().dim))])); }
+                    else { in_code = None; out.push(Line::from(vec![bullet, Span::styled("```", Style::default().fg(pal().dim))])); }
+                    continue;
+                }
+                if let Some((lang, state)) = &mut in_code {
+                    let mut spans = vec![bullet, Span::styled("  ", Style::default().bg(pal().panel_bg))];
+                    spans.extend(highlight_line(lang, l, state).into_iter().map(|sp| Span::styled(sp.content.to_string(), sp.style.bg(pal().panel_bg))));
+                    let used: usize = spans.iter().map(|sp| sp.content.chars().count()).sum();
+                    if used < w { spans.push(Span::styled(" ".repeat(w - used), Style::default().bg(pal().panel_bg))); }
+                    out.push(Line::from(spans));
+                    continue;
+                }
+                // light markdown: **bold**, `code`
+                push_wrapped(out, std::iter::once(bullet).chain(md_spans(l)).collect(), w, 2);
             }
             if *streaming { if let Some(last) = out.last_mut() { last.spans.push(Span::styled("▍", Style::default().fg(pal().orange))); } }
             if text.is_empty() && *streaming { out.push(Line::from(vec![Span::styled("⏺ ", Style::default().fg(pal().fg)), Span::styled("▍", Style::default().fg(pal().orange))])); }
@@ -1469,6 +1508,25 @@ fn render_block(b: &Block, app: &App, width: usize, out: &mut Vec<Line<'static>>
         Block::Error(t) => { for (i, l) in t.lines().enumerate() { push_wrapped(out, vec![Span::styled(if i == 0 { "✗ " } else { "  " }, Style::default().fg(pal().err)), Span::styled(l.to_string(), Style::default().fg(pal().err))], w, 2); } out.push(Line::raw("")); }
         Block::Finished(t) => { push_wrapped(out, vec![Span::styled("  ✓ ", Style::default().fg(pal().ok)), Span::styled(t.clone(), Style::default().fg(pal().dim))], w, 4); }
     }
+}
+
+/// Minimal inline markdown: `code` and **bold** and headings.
+fn md_spans(l: &str) -> Vec<Span<'static>> {
+    let mut out = Vec::new();
+    if let Some(h) = l.strip_prefix("### ").or_else(|| l.strip_prefix("## ")).or_else(|| l.strip_prefix("# ")) { out.push(Span::styled(h.to_string(), Style::default().bold().fg(pal().orange))); return out; }
+    let mut rest = l; let mut bold = false;
+    while !rest.is_empty() {
+        if let Some(i) = rest.find('`') {
+            if let Some(j) = rest[i + 1..].find('`') {
+                if i > 0 { out.push(Span::styled(rest[..i].to_string(), if bold { Style::default().bold() } else { Style::default() })); }
+                out.push(Span::styled(rest[i + 1..i + 1 + j].to_string(), Style::default().fg(pal().cyan)));
+                rest = &rest[i + j + 2..]; continue;
+            }
+        }
+        if let Some(i) = rest.find("**") { if i > 0 { out.push(Span::styled(rest[..i].to_string(), if bold { Style::default().bold() } else { Style::default() })); } bold = !bold; rest = &rest[i + 2..]; continue; }
+        out.push(Span::styled(rest.to_string(), if bold { Style::default().bold() } else { Style::default() })); break;
+    }
+    out
 }
 
 fn args_summary(name: &str, args: &str, max: usize) -> String {
