@@ -59,12 +59,12 @@ def step(name, ok): results.append((name, ok)); print(("PASS " if ok else "FAIL 
 
 pump(2.5)
 step("banner shows model", "qwen3.8" in screen() or "model" in screen())
-for cmd, marker in [("/help", "Commands"), ("/tools", "download_file"), ("/config", "server"), ("/pwd", WORK.split("/")[-1]),
+for cmd, marker in [("/help", "Images:"), ("/tools", "download_file"), ("/config", "server"), ("/pwd", WORK.split("/")[-1]),
                     ("/cost", "session tokens"), ("/net off", "internet tools: off"), ("/net on", "internet tools: on"),
                     ("/thinking", "thinking shown"), ("/thinking", "thinking hidden"), ("/expand", None), ("/panel", None),
                     ("/model", "available:"), ("/cd /tmp", "cwd"), (f"/cd {WORK}", "cwd"), ("/bogus", "unknown command"),
                     ("/permissions", "permission mode"), ("/permissions plan", "plan mode"), ("/permissions auto", "auto permissions"), ("/plan", "plan mode"), ("/plan", "auto permissions"),
-                    ("/queue", "queue is empty"), ("/sessions", "Sessions"), ("/theme light", "theme → light"), ("/theme dark", "theme → dark"),
+                    ("/queue", "queue is empty"), ("/sessions", "essions"), ("/theme light", "theme → light"), ("/theme dark", "theme → dark"),
                     ("/mcp", "MCP servers configured"), ("/memory", "MEMORY"), ("/brain", "BRAIN"), ("/workflows", "WORKFLOWS"),
                     ("/remember e2e marker preference", "MEMORY › Preferences"), ("/plugin bogus", "usage: /plugin"), ("/reload", "reloading tools"),
                     ("/context", "Context map"), ("/workflow", "Workflows"), ("/workflow nope", "no workflow named"),
@@ -74,6 +74,7 @@ for cmd, marker in [("/help", "Commands"), ("/tools", "download_file"), ("/confi
     send(cmd + "\r"); pump(0.8)
     step(f"{cmd}", marker is None or marker in screen())
     if cmd in ("/settings", "/config"): send("q"); pump(0.5)
+    if cmd == "/sessions": send("q"); pump(0.3); send("\x15"); pump(0.3)  # close the picker (or clear a stray q if it was the empty banner)
 send("/mod\t"); pump(0.3); step("tab-completes /model", "/model " in screen()); send("\x15")  # ctrl+u clears line
 buf = b""; send(f"look at {IMG}"); pump(0.5); step("image path harvested on submit (pending)", True)
 if NO_MODEL:

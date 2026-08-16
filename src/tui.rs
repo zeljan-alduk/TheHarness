@@ -443,6 +443,8 @@ struct App {
     tool_view: String,               // summary | hidden | full
     tool_groups_open: std::collections::HashSet<usize>, // first block index of an expanded tool burst
     settings_open: bool, settings_cursor: usize,
+    /// /sessions picker: (all sessions, cursor into the filtered view, filter text, first visible row, row rect for clicks)
+    sessions_pick: Option<SessionPicker>,
     live_policy: Option<Arc<harness::permissions::Policy>>,
     extra_roots: Vec<PathBuf>,
     /// worktree enter/exit state (shared with the running agent; persists across turns)
@@ -481,7 +483,7 @@ pub async fn run(cfg: Config, resume: Option<String>) -> Result<()> {
         quit: false, restart: false, improve: None, improve_cancel: Default::default(), restart_at: None, tick: 0, word: 0, models: vec![],
         metrics: Metrics::new(0), panel: None, attachments: vec![], tool_previews: Default::default(),
         picker, images: Default::default(), img_seq: 0,
-        think_scroll: 0, toolset: None, perm_mode: harness::permissions::Mode::Auto, vim: false, vim_normal: false, keymap: Keymap::load(), sel_anchor: None, sel_cur: None, sel_dragging: false, visible_text: vec![], toast: None, tool_view: "summary".into(), tool_groups_open: Default::default(), settings_open: false, settings_cursor: 0, live_policy: None, cc_rate: None, extra_roots: vec![], wt_cwd: harness::worktree::new_cell(), cc: None, cc_last_session: None, compact_progress: None, session_meta: harness::sessions::Meta::default(), todos: Default::default(), inbox: Default::default(), event_log: None, pending_ask: None, pending_q: None, subenv: None, attached: None, video: None, strip_rects: vec![], tr_rect: Rect::default(), panel_rect: Rect::default(), tr_start: 0, line_map: vec![],
+        think_scroll: 0, toolset: None, perm_mode: harness::permissions::Mode::Auto, vim: false, vim_normal: false, keymap: Keymap::load(), sel_anchor: None, sel_cur: None, sel_dragging: false, visible_text: vec![], toast: None, tool_view: "summary".into(), tool_groups_open: Default::default(), settings_open: false, settings_cursor: 0, sessions_pick: None, live_policy: None, cc_rate: None, extra_roots: vec![], wt_cwd: harness::worktree::new_cell(), cc: None, cc_last_session: None, compact_progress: None, session_meta: harness::sessions::Meta::default(), todos: Default::default(), inbox: Default::default(), event_log: None, pending_ask: None, pending_q: None, subenv: None, attached: None, video: None, strip_rects: vec![], tr_rect: Rect::default(), panel_rect: Rect::default(), tr_start: 0, line_map: vec![],
     };
     app.metrics.ctx_len = app.cfg.llm.context_budget_tokens.unwrap_or(0);
     app.perm_mode = app.cfg.permissions.mode;
@@ -523,6 +525,7 @@ pub async fn run(cfg: Config, resume: Option<String>) -> Result<()> {
             tokio::select! {
                 _ = ticker.tick() => {
                     app.tick += 1; if app.tick % 30 == 0 { app.word = (app.word + 1) % WORDS.len(); }
+                    if app.tick % 2 == 0 { if let Some(p) = &mut app.sessions_pick { p.marquee.1 += 1; } }
                     // cross-session: heartbeat every ~5s, poll our mailbox every ~2s
                     if app.tick % 60 == 0 { if app.session_meta.id.is_empty() { app.session_meta.id = harness::sessions::SessionStore::new_id(); } harness::mailbox::heartbeat(&harness::mailbox::Live { id: app.session_meta.id.clone(), title: if app.session_meta.title.is_empty() { "(new session)".into() } else { app.session_meta.title.clone() }, workdir: app.workdir.display().to_string(), pid: std::process::id(), backend: app.cfg.llm.provider.clone().unwrap_or("local".into()), updated: 0, busy: app.running.is_some() }); }
                     if app.tick % 25 == 0 && !app.session_meta.id.is_empty() { for m in harness::mailbox::take(&app.session_meta.id) { app.blocks.push(Block::System(format!("✉ message from session {}: {}", m.from, truncate(&m.text, 200)))); app.inbox.push(format!("message from session {}", m.from), m.text); } }
@@ -673,6 +676,23 @@ impl App {
                     _ => {}
                 }
             }
+            CEvent::Mouse(m) if self.sessions_pick.is_some() => {
+                let mut resume: Option<String> = None;
+                if let Some(p) = &mut self.sessions_pick {
+                    match m.kind {
+                        MouseEventKind::ScrollUp => p.mv(-1), MouseEventKind::ScrollDown => p.mv(1),
+                        MouseEventKind::Down(MouseButton::Left) => {
+                            let r = p.rows;
+                            if m.column >= r.x && m.column < r.x + r.width && m.row >= r.y && m.row < r.y + r.height {
+                                let idx = p.top + (m.row - r.y) as usize;
+                                if idx < p.filtered().len() { if p.cursor == idx { resume = p.selected_id(); } else { p.cursor = idx; } }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                if let Some(id) = resume { self.sessions_pick = None; if self.running.is_some() { self.set_status("finish or interrupt the current task first"); } else { self.resume_session(&id); } }
+            }
             CEvent::Mouse(m) => {
                 let in_panel = self.panel_rect.width > 0 && m.column >= self.panel_rect.x && m.column < self.panel_rect.x + self.panel_rect.width;
                 match m.kind {
@@ -692,6 +712,27 @@ impl App {
                     }
                     _ => {}
                 }
+            }
+            CEvent::Key(k) if k.kind == KeyEventKind::Press && self.sessions_pick.is_some() => {
+                let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+                let mut resume: Option<String> = None;
+                if let Some(p) = &mut self.sessions_pick {
+                    match k.code {
+                        KeyCode::Esc => self.sessions_pick = None,
+                        KeyCode::Char('c') | KeyCode::Char('d') if ctrl => self.sessions_pick = None,
+                        KeyCode::Char('q') if p.filter.is_empty() => self.sessions_pick = None,
+                        KeyCode::Up => p.mv(-1), KeyCode::Down | KeyCode::Tab => p.mv(1),
+                        KeyCode::Char('k') if p.filter.is_empty() => p.mv(-1), KeyCode::Char('j') if p.filter.is_empty() => p.mv(1),
+                        KeyCode::PageUp => p.mv(-10), KeyCode::PageDown => p.mv(10),
+                        KeyCode::Home => p.cursor = 0, KeyCode::End => { p.cursor = p.filtered().len().saturating_sub(1); }
+                        KeyCode::Enter => { resume = p.selected_id(); }
+                        KeyCode::Backspace => { p.filter.pop(); p.cursor = 0; }
+                        KeyCode::Char('u') if ctrl => { p.filter.clear(); p.cursor = 0; }
+                        KeyCode::Char(c) if !ctrl && !k.modifiers.contains(KeyModifiers::ALT) => { p.filter.push(c); p.cursor = 0; }
+                        _ => {}
+                    }
+                }
+                if let Some(id) = resume { self.sessions_pick = None; if self.running.is_some() { self.set_status("finish or interrupt the current task first"); } else { self.resume_session(&id); } }
             }
             CEvent::Key(k) if k.kind == KeyEventKind::Press && self.settings_open => {
                 let n = SETTINGS.len();
@@ -948,6 +989,12 @@ impl App {
                 let mut lines = vec![format!("Live sessions ({}) — /msg <id|prefix|title|all> <text>", l.len())];
                 for s in l { lines.push(format!("  {}{}  {:<40} {}  [{}]{}", if s.id == self.session_meta.id { "● " } else { "  " }, s.id, truncate(&s.title, 40), short_path(std::path::Path::new(&s.workdir)), s.backend, if s.busy { " busy" } else { "" })); }
                 self.blocks.push(Block::Banner(lines));
+            }
+            "/sessions" if arg.is_empty() || arg == "pick" => {
+                match harness::sessions::SessionStore::open() {
+                    Ok(store) => { let all = store.list(None); if all.is_empty() { self.blocks.push(Block::Banner(vec!["no saved sessions yet".into()])); } else { self.sessions_pick = Some(SessionPicker { all, cursor: 0, filter: String::new(), top: 0, rows: Rect::default(), marquee: (0, 0) }); } }
+                    Err(e) => self.blocks.push(Block::Error(format!("sessions: {e}"))),
+                }
             }
             "/sessions" => {
                 match harness::sessions::SessionStore::open() {
@@ -1890,7 +1937,7 @@ impl App {
 const COMMANDS: &[(&str, &str)] = &[
     ("/help", "show commands and keys"),
     ("/clear", "start a new session (forget the transcript)"),
-    ("/sessions", "list saved sessions · /sessions live = other running sessions"),
+    ("/sessions", "pick a saved session to resume (↑/↓/click, enter) · /sessions list = plain list · /sessions live = other running sessions"),
     ("/msg", "message another live session: /msg <id|prefix|title|all> <text>"),
     ("/resume", "resume a saved session: /resume <n|id|last>"),
     ("/model", "show or switch the model: /model <name>"),
@@ -1997,6 +2044,7 @@ fn draw(f: &mut Frame, app: &mut App) {
 
     if app.video.is_some() { draw_video(f, app, tr_area); }
     if app.settings_open { draw_settings(f, app, tr_area); }
+    if app.sessions_pick.is_some() { draw_sessions(f, app, tr_area); }
     // transcript
     let mut lines: Vec<Line> = Vec::new();
     let mut ph: Vec<Placeholder> = Vec::new();
@@ -2038,7 +2086,7 @@ fn draw(f: &mut Frame, app: &mut App) {
     app.line_map = line_map; app.tr_rect = tr_area; app.tr_start = start;
     app.panel_rect = panel_area.map(|(_, pa)| pa).unwrap_or_default();
     let visible: Vec<Line> = lines.into_iter().skip(start).take(h).collect();
-    if app.video.is_none() && !app.settings_open { f.render_widget(Paragraph::new(visible), tr_area); }
+    if app.video.is_none() && !app.settings_open && app.sessions_pick.is_none() { f.render_widget(Paragraph::new(visible), tr_area); }
     // images: draw those whose slot is fully inside the visible window
     for p in ph {
         if app.video.is_some() { break; }
@@ -2089,15 +2137,14 @@ fn draw(f: &mut Frame, app: &mut App) {
     let (mode_txt, mode_col) = match app.perm_mode { harness::permissions::Mode::Bypass => ("▶▶ bypass permissions on", pal().pink), harness::permissions::Mode::Auto => ("▶▶ auto permissions", pal().cyan), harness::permissions::Mode::Ask => ("▶▶ ask before changes", pal().orange), harness::permissions::Mode::Plan => ("▶▶ plan mode · read-only", pal().think) };
     let mut st = vec![Span::styled(format!("  {mode_txt}"), Style::default().fg(mode_col)), dot(),
         Span::styled(format!("{}{}", app.model, if app.cfg.llm.provider.as_deref() == Some("claude-code") { app.cfg.llm.effort.as_ref().map(|e| format!(" · effort {e}")).unwrap_or_default() } else { String::new() }), Style::default().fg(pal().cyan)), dot(),
-        Span::styled(short_path(&app.workdir), Style::default().fg(pal().cyan)), dot(),
-        Span::styled(format!("ctx {}", fmt_k(app.last_prompt_tokens)), Style::default().fg(pal().cyan))];
+        Span::styled(short_path(&app.workdir), Style::default().fg(pal().cyan))];
     if !app.net { st.push(dot()); st.push(Span::styled("offline", Style::default().fg(pal().pink))); }
     if !app.queued.is_empty() { st.push(dot()); st.push(Span::styled(format!("{} queued", app.queued.len()), Style::default().fg(pal().cyan))); }
     if let Some(id) = app.attached { st.push(dot()); st.push(Span::styled(format!("attached #{id}"), Style::default().fg(pal().orange))); }
     if app.vim { st.push(dot()); st.push(Span::styled(if app.vim_normal { "-- NORMAL --" } else { "-- INSERT --" }, Style::default().fg(if app.vim_normal { pal().orange } else { pal().ok }).bold())); }
     if let Some(wt) = app.wt_cwd.lock().unwrap().as_ref() { st.push(dot()); st.push(Span::styled(format!("worktree {}", wt.name), Style::default().fg(pal().orange))); }
     let lw: usize = st.iter().map(|s| s.content.chars().count()).sum();
-    let right = if app.running.is_none() { "? for shortcuts · /help" } else { "esc to interrupt" };
+    let right = if app.running.is_none() { "" } else { "esc to interrupt" };
     let pad = width.saturating_sub(lw + right.chars().count() + 1);
     st.push(Span::raw(" ".repeat(pad))); st.push(Span::styled(right, Style::default().fg(pal().dim)));
     f.render_widget(Paragraph::new(Line::from(st)), st_area);
@@ -2123,6 +2170,65 @@ fn draw(f: &mut Frame, app: &mut App) {
 }
 
 // ───────────────────────── settings panel ─────────────────────────
+struct SessionPicker { all: Vec<harness::sessions::Meta>, cursor: usize, filter: String, top: usize, rows: Rect, /// marquee: (row the offset belongs to, tick counter) — reset when the cursor moves
+    marquee: (usize, u32) }
+/// Marquee window over `s`: if it fits in `w` cells, pad it; otherwise show a `w`-wide slice that starts at `off`
+/// (wrapping around after a gap so it reads like a ticker), pausing briefly at the start.
+fn marquee(s: &str, w: usize, tick: u32) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() <= w { return format!("{:<w$}", s, w = w); }
+    let gap = 4usize; let cycle = chars.len() + gap; let pause = 6u32;
+    let off = if tick < pause { 0 } else { ((tick - pause) as usize) % cycle };
+    let mut out = String::with_capacity(w);
+    for i in 0..w { let j = (off + i) % cycle; out.push(if j < chars.len() { chars[j] } else { ' ' }); }
+    out
+}
+impl SessionPicker {
+    fn filtered(&self) -> Vec<&harness::sessions::Meta> {
+        let q = self.filter.to_lowercase();
+        self.all.iter().filter(|m| q.is_empty() || m.id.contains(&q) || m.title.to_lowercase().contains(&q) || m.workdir.to_lowercase().contains(&q)).collect()
+    }
+    fn selected_id(&self) -> Option<String> { self.filtered().get(self.cursor).map(|m| m.id.clone()) }
+    fn mv(&mut self, d: i32) { let n = self.filtered().len(); if n == 0 { self.cursor = 0; return; } self.cursor = (self.cursor as i32 + d).clamp(0, n as i32 - 1) as usize; }
+}
+
+fn draw_sessions(f: &mut Frame, app: &mut App, area: Rect) {
+    f.render_widget(ratatui::widgets::Clear, area);
+    let dim = Style::default().fg(pal().dim);
+    let cur_id = app.session_meta.id.clone();
+    let Some(p) = &mut app.sessions_pick else { return };
+    let avail = area.height.saturating_sub(4) as usize;
+    if p.cursor < p.top { p.top = p.cursor; } if avail > 0 && p.cursor >= p.top + avail { p.top = p.cursor + 1 - avail; }
+    if p.marquee.0 != p.cursor { p.marquee = (p.cursor, 0); }
+    let items = p.filtered();
+    let n = items.len();
+    let hdr = format!(" Sessions ({}{})  ·  ↑/↓ or click select · enter / click again resume · type to filter · esc close ", n, if p.filter.is_empty() { String::new() } else { format!(" of {}", p.all.len()) });
+    let mut lines: Vec<Line> = vec![Line::from(Span::styled(hdr, Style::default().fg(Color::Black).bg(pal().orange).bold()))];
+    lines.push(Line::from(vec![Span::styled(" filter: ", dim), Span::raw(p.filter.clone()), Span::styled("▏", Style::default().fg(pal().orange)), Span::styled(if cur_id.is_empty() { String::new() } else { format!("      current: {cur_id}") }, dim)]));
+    let top = p.top; let cursor = p.cursor;
+    let tick = p.marquee.1;
+    let w = area.width as usize;
+    let title_w = w.saturating_sub(82).clamp(10, 70);
+    for (i, m) in items.iter().enumerate().skip(top).take(avail.max(1)) {
+        let sel = i == cursor;
+        let is_cur = m.id == cur_id;
+        let wd = short_path(std::path::Path::new(&m.workdir));
+        let (t, d) = if sel { (marquee(&m.title, title_w, tick), marquee(&wd, 28, tick)) } else { (format!("{:<tw$}", truncate(&m.title, title_w), tw = title_w), format!("{:<28}", truncate(&wd, 28))) };
+        let row = format!("{:>3}. {}  {}  {} {:>3} turns · {}", i + 1, m.id, t, d, m.turns, harness::sessions::fmt_age(m.updated));
+        let st = if sel { Style::default().fg(Color::Black).bg(pal().orange).bold() } else if is_cur { Style::default().fg(pal().orange) } else { Style::default() };
+        lines.push(Line::from(vec![Span::styled(if sel { " ▸ " } else { "   " }, Style::default().fg(pal().orange)), Span::styled(format!("{:<w2$}", row, w2 = w.saturating_sub(4)), st)]));
+    }
+    if n == 0 { lines.push(Line::from(Span::styled("   no sessions match", dim.italic()))); }
+    drop(items);
+    p.rows = Rect { x: area.x, y: area.y + 2, width: area.width, height: avail as u16 };
+    f.render_widget(Paragraph::new(lines), area);
+    if n > avail && avail > 0 {
+        let sb_area = Rect { x: area.x + area.width.saturating_sub(1), y: area.y + 2, width: 1, height: avail as u16 };
+        let mut st = ratatui::widgets::ScrollbarState::new(n.saturating_sub(avail)).position(top);
+        f.render_stateful_widget(ratatui::widgets::Scrollbar::new(ratatui::widgets::ScrollbarOrientation::VerticalRight).thumb_style(Style::default().fg(pal().dim)).track_style(Style::default().fg(pal().dim)), sb_area, &mut st);
+    }
+}
+
 fn draw_settings(f: &mut Frame, app: &mut App, area: Rect) {
     f.render_widget(ratatui::widgets::Clear, area);
     let dim = Style::default().fg(pal().dim);
