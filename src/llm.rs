@@ -111,7 +111,7 @@ pub struct Usage {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Provider { OpenAi, Anthropic }
+pub enum Provider { OpenAi, Anthropic, ClaudeCode }
 
 #[derive(Clone)]
 pub struct Client {
@@ -133,8 +133,8 @@ impl Client {
             .connect_timeout(std::time::Duration::from_secs(30))
             .read_timeout(std::time::Duration::from_secs(300))
             .build()?;
-        let provider = match cfg.provider.as_deref() { Some("anthropic") => Provider::Anthropic, Some(_) => Provider::OpenAi, None => if cfg.base_url.contains("anthropic.com") { Provider::Anthropic } else { Provider::OpenAi } };
-        let api_key = cfg.api_key.clone().or_else(|| match provider { Provider::Anthropic => std::env::var("ANTHROPIC_API_KEY").ok(), Provider::OpenAi => std::env::var("OPENAI_API_KEY").ok() });
+        let provider = match cfg.provider.as_deref() { Some("anthropic") => Provider::Anthropic, Some("claude-code") | Some("claude_code") | Some("claude") => Provider::ClaudeCode, Some(_) => Provider::OpenAi, None => if cfg.base_url.contains("anthropic.com") { Provider::Anthropic } else { Provider::OpenAi } };
+        let api_key = cfg.api_key.clone().or_else(|| match provider { Provider::Anthropic => std::env::var("ANTHROPIC_API_KEY").ok(), Provider::OpenAi => std::env::var("OPENAI_API_KEY").ok(), Provider::ClaudeCode => None });
         Ok(Self {
             http,
             base_url: cfg.base_url.trim_end_matches('/').to_string(),
@@ -155,6 +155,7 @@ impl Client {
     pub fn with_model(&self, model: &str) -> Client { let mut c = self.clone(); c.model = model.to_string(); c }
 
     pub async fn list_models(&self) -> Result<Vec<String>> {
+        if self.provider == Provider::ClaudeCode { return Ok(vec!["sonnet".into(), "opus".into(), "haiku".into(), "claude-sonnet-5".into(), "claude-opus-5".into()]); }
         if self.provider == Provider::Anthropic {
             let mut req = self.http.get(format!("{}/v1/models?limit=100", self.base_url.trim_end_matches("/v1"))).header("anthropic-version", "2023-06-01");
             if let Some(k) = &self.api_key { req = req.header("x-api-key", k); }
@@ -168,6 +169,7 @@ impl Client {
     }
 
     pub async fn chat(&self, messages: &[Message], tools: &[ToolDef]) -> Result<(Message, Usage)> {
+        if self.provider == Provider::ClaudeCode { bail!("provider claude-code: model calls go through the claude CLI session, not the HTTP client"); }
         if self.provider == Provider::Anthropic { return self.chat_stream(messages, tools, |_| {}).await; }
         let mut body = json!({
             "model": self.model,
@@ -213,6 +215,7 @@ impl Client {
     /// Same as `chat` but streams (SSE). `on_delta` is called for each reasoning/content increment;
     /// tool-call fragments are assembled internally and returned in the final message.
     pub async fn chat_stream(&self, messages: &[Message], tools: &[ToolDef], mut on_delta: impl FnMut(Delta)) -> Result<(Message, Usage)> {
+        if self.provider == Provider::ClaudeCode { bail!("provider claude-code: model calls go through the claude CLI session, not the HTTP client"); }
         if self.provider == Provider::Anthropic { return self.anthropic_stream(messages, tools, &mut on_delta).await; }
         let mut body = json!({
             "model": self.model,
@@ -291,7 +294,7 @@ impl Client {
 /// Detect the loaded context length of `model` from the server. Tries LM Studio (`/api/v0/models`),
 /// llama.cpp server (`/props`), Ollama (`/api/show`). Returns (tokens, source).
 pub async fn detect_context_length(base_url: &str, model: &str) -> Option<(u64, &'static str)> {
-    if base_url.contains("anthropic.com") || model.starts_with("claude-") { return Some((200_000, "Anthropic (known)")); }
+    if base_url.contains("anthropic.com") || model.starts_with("claude-") || matches!(model, "sonnet" | "opus" | "haiku") { return Some((200_000, "Anthropic (known)")); }
     let root = base_url.trim_end_matches('/').trim_end_matches("/v1").to_string();
     let http = reqwest::Client::builder().timeout(std::time::Duration::from_secs(4)).build().ok()?;
     // LM Studio

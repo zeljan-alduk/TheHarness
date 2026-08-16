@@ -67,15 +67,20 @@ pub async fn compact_llm_with(client: &Client, msgs: &mut Vec<Message>, keep_las
     if cut <= 1 { cut = msgs.len().saturating_sub(2).max(1); while cut > 1 && msgs[cut].role == "tool" { cut -= 1; } }
     if cut <= 1 { bail!("nothing to compact"); }
     let old: Vec<Message> = msgs[1..cut].to_vec();
+    let old_tokens: u64 = context_map(&old).iter().map(|x| x.1).sum();
+    if old_tokens < 1500 { bail!("only ~{old_tokens} tokens would be compacted — too small to gain anything (a handoff note costs a few hundred tokens)"); }
+    // size the note to what it replaces: ~1/4 of the compacted content, between 120 and 900 words
+    let max_words = (old_tokens / 5).clamp(120, 900);
     let transcript = render_for_summary(&old, 60_000);
-    let system = "You compact the working context of an autonomous coding agent mid-session. Write a HANDOFF NOTE so the agent can continue seamlessly without the original messages. Be precise and dense; never invent; keep exact file paths, function/identifier names, commands, numbers, URLs, and error messages verbatim. Use this structure with markdown headings:
+    let system_base = "You compact the working context of an autonomous coding agent mid-session. Write a HANDOFF NOTE so the agent can continue seamlessly without the original messages. Be precise and dense; never invent; keep exact file paths, function/identifier names, commands, numbers, URLs, and error messages verbatim. Use this structure with markdown headings:
 ## Goal & constraints (the user's requests, key phrases verbatim)
 ## Done so far (files created/edited with paths and what changed; commands run and their outcomes; tests/eval results)
 ## Key facts & findings (config values, APIs, gotchas, exact errors)
 ## Decisions & reasons
 ## Current state & remaining work (ordered next steps; open questions)
 ## Notes for the user (anything promised or to report)
-Max ~900 words. Output only the note.";
+Output only the note.";
+    let system = format!("{system_base}\nHard limit: at most {max_words} words — the note MUST be much shorter than the transcript it replaces; drop detail before exceeding it.");
     let mut user = format!("Transcript to compact ({} messages):
 
 {transcript}", old.len());
@@ -86,10 +91,10 @@ Focus especially on: {f}")); }
     // stream the note so progress is real. Thinking phase: 5% → 40% (asymptotic in reasoning length);
     // writing phase: 40% → 98% (expected note ≈ 900 words ≈ 5500 chars). Label shows elapsed + tokens.
     let mut got = 0usize; let mut thought = 0usize;
-    let expected = 5500.0f64;
+    let expected = (max_words as f64) * 6.0;
     let t0 = Instant::now();
     let mut last_emit = Instant::now();
-    let (reply, _) = client.chat_stream(&[Message::system(system), Message::user(user)], &[], |d| {
+    let (reply, _) = client.chat_stream(&[Message::system(&system), Message::user(user)], &[], |d| {
         match d { Delta::Content(t) => got += t.chars().count(), Delta::Reasoning(t) => thought += t.chars().count() }
         if last_emit.elapsed() < Duration::from_millis(150) { return; }
         last_emit = Instant::now();
@@ -99,6 +104,8 @@ Focus especially on: {f}")); }
     }).await?;
     let summary = reply.text().trim().to_string();
     if summary.chars().count() < 80 { bail!("compaction summary too short"); }
+    let note_tokens = (summary.chars().count() / 4) as u64 + 60;
+    if note_tokens * 10 >= old_tokens * 8 { bail!("compaction would not shrink the context (note ≈{note_tokens} tokens vs {old_tokens} replaced) — kept the transcript as is"); }
     let mut new_msgs = vec![msgs[0].clone(), Message::user(format!("[Context compacted — handoff note replacing {} earlier messages]\n\n{summary}\n\n[Continue from the state above; the most recent messages follow verbatim.]", old.len()))];
     new_msgs.extend_from_slice(&msgs[cut..]);
     let removed = old.len();

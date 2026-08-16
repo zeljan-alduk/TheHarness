@@ -3,6 +3,7 @@
 
 pub mod agent;
 pub mod arbiter;
+pub mod claude_code;
 pub mod config;
 pub mod eval;
 pub mod events;
@@ -10,6 +11,7 @@ pub mod hooks;
 pub mod llm;
 pub mod lsp;
 pub mod mcp;
+pub mod mcp_bridge;
 pub mod memory;
 pub mod permissions;
 pub mod plugins;

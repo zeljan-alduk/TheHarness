@@ -125,6 +125,9 @@ enum Cmd {
     },
     /// List saved sessions
     Sessions,
+    /// (internal) stdio↔socket proxy used to expose harness tools to Claude Code
+    #[command(name = "mcp-proxy", hide = true)]
+    McpProxy { addr: String },
     /// List models on the configured server
     Models,
     /// Print the effective configuration
@@ -253,6 +256,7 @@ async fn main() -> Result<()> {
             for n in &ts.notes { println!("· {n}"); }
             for d in ts.registry.defs().into_iter().filter(|d| d.function.name.starts_with("mcp__")) { println!("  {:<40} {}", d.function.name, llm::truncate_for_log(&d.function.description, 90)); }
         }
+        Cmd::McpProxy { addr } => { harness::mcp_bridge::proxy(&addr).await?; }
         Cmd::Models => {
             for m in client.list_models().await? { println!("{m}"); }
         }
@@ -338,9 +342,20 @@ async fn run_agent(cfg: &config::Config, client: &llm::Client, workdir: &std::pa
     let approver: std::sync::Arc<dyn harness::permissions::Approver> = std::sync::Arc::new(harness::permissions::AutoApprover { yes });
     if !yes && policy.mode() != harness::permissions::Mode::Bypass { eprintln!("· permissions: {} (non-interactive: prompts are denied; pass -y to approve, or --permissions bypass)", policy.mode().label()); }
     let ctx = tools::ToolCtx { subagent: Some(std::sync::Arc::new(agent::SubAgentEnv::new(client.clone(), registry.clone(), policy.clone(), approver.clone(), sink.clone(), budget, true))), ..ctx };
-    let a = agent::Agent { client, registry, ctx: &ctx, max_turns: cfg.agent.max_turns, context_budget: budget, sink: sink.as_ref(), stream: true, policy: &policy, approver: approver.as_ref() };
     let mut msgs = Vec::new();
-    let out = a.run_turn(&mut msgs, &system, task).await;
+    let out = if client.provider() == llm::Provider::ClaudeCode {
+        // Claude Code backend: our tools bridged over MCP; the claude CLI drives the loop
+        let host = std::sync::Arc::new(harness::mcp_bridge::BridgeHost { registry: registry.clone(), ctx: ctx.clone(), policy: policy.clone(), approver: approver.clone(), sink: sink.clone() });
+        let session = harness::claude_code::ClaudeCodeSession::start(workdir, Some(client.model()), &system, host, None).await?;
+        msgs.push(llm::Message::system(system.clone())); msgs.push(llm::Message::user(task));
+        let r = session.run_turn(task, &[], sink.as_ref()).await;
+        if let Ok((t, _)) = &r { msgs.push(llm::Message { role: "assistant".into(), content: Some(llm::Content::Text(t.clone())), ..Default::default() }); }
+        session.stop().await;
+        r
+    } else {
+        let a = agent::Agent { client, registry, ctx: &ctx, max_turns: cfg.agent.max_turns, context_budget: budget, sink: sink.as_ref(), stream: true, policy: &policy, approver: approver.as_ref() };
+        a.run_turn(&mut msgs, &system, task).await
+    };
     // always persist the transcript (also on error) — it is the run log
     if let Ok(store_s) = harness::sessions::SessionStore::open() {
         let mut meta = harness::sessions::Meta { id: harness::sessions::SessionStore::new_id(), workdir: workdir.display().to_string(), model: client.model().to_string(), ..Default::default() };

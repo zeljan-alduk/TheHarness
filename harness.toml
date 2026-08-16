@@ -7,6 +7,10 @@
 base_url = "http://localhost:1234/v1"
 model = "qwen3.8-27b-mlx"
 # provider = "openai"
+# Use your Anthropic subscription through the official Claude Code CLI (must be installed & logged in);
+# the harness bridges its own tools to it over MCP. In the TUI: /backend claude
+# provider = "claude-code"
+# model = "claude-fable-5"
 temperature = 0.2
 # Reasoning models spend a lot of this budget on thinking; keep it generous.
 max_tokens = 16384

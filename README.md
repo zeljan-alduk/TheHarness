@@ -9,6 +9,14 @@ tools) **and its own source**, but only let it improve itself through an
 **eval-gated loop** — proposals land on git branches and are judged by a benchmark score,
 never by the agent's own opinion.
 
+## Backends
+- **Local / OpenAI-compatible** (default): LM Studio, llama.cpp, Ollama, OpenAI, OpenRouter… (`base_url`, `api_key`).
+- **Claude Code (subscription)**: `provider = "claude-code"` or `/backend claude [model]` (default `claude-fable-5`).
+  The harness runs the official `claude` CLI headlessly (`--print`, stream-json in/out) and exposes its own tools
+  to it over an MCP bridge, so permissions, hooks, memory, redaction and the UI all still apply while your
+  Anthropic subscription is used through the official client. Requires Claude Code installed and logged in.
+- **Anthropic API**: `provider = "anthropic"` + `ANTHROPIC_API_KEY`.
+
 ## Platforms
 macOS (primary; Kitty for inline images, seatbelt sandbox, temps via macmon), Linux (notify-send,
 wl-paste/xclip for clipboard), Windows (`harness.exe`; install **Git for Windows** so the `bash` tool has a

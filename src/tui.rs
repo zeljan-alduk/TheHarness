@@ -58,7 +58,7 @@ fn pal() -> Pal {
 const SPINNER: [&str; 10] = ["✻", "✼", "✽", "✾", "✿", "❀", "✿", "✾", "✽", "✼"];
 const WORDS: [&str; 12] = ["Thinking", "Pondering", "Working", "Reasoning", "Cooking", "Tinkering", "Brewing", "Mulling", "Crunching", "Percolating", "Noodling", "Computing"];
 
-enum Msg { Block(Block), Ask(harness::permissions::ApprovalRequest, tokio::sync::oneshot::Sender<harness::permissions::Approval>), Ev(Event), Done(Result<(String, harness::agent::RunStats), String>), Sys(SysSample), CtxLen(u64), Pasted(Result<PathBuf, String>), Frames(Result<(PathBuf, f64, Vec<(f64, PathBuf)>), String>), Toolset(Arc<Toolset>), Catalog(Result<harness::plugins::Catalog, String>), Notice(String) }
+enum Msg { CcSession(Arc<harness::claude_code::ClaudeCodeSession>), CcSid(String), Block(Block), Ask(harness::permissions::ApprovalRequest, tokio::sync::oneshot::Sender<harness::permissions::Approval>), Ev(Event), Done(Result<(String, harness::agent::RunStats), String>), Sys(SysSample), CtxLen(u64), Pasted(Result<PathBuf, String>), Frames(Result<(PathBuf, f64, Vec<(f64, PathBuf)>), String>), Toolset(Arc<Toolset>), Catalog(Result<harness::plugins::Catalog, String>), Notice(String) }
 
 /// Video scrubber state (modal over the transcript).
 struct VideoPicker { path: PathBuf, duration: f64, frames: Vec<(f64, PathBuf, String)>, cur: usize, selected: std::collections::BTreeSet<usize>, loading: bool, error: Option<String> }
@@ -335,6 +335,8 @@ struct App {
     think_scroll: usize,
     toolset: Option<Arc<Toolset>>,
     perm_mode: harness::permissions::Mode,
+    cc: Option<Arc<harness::claude_code::ClaudeCodeSession>>,
+    cc_last_session: Option<String>,
     compact_progress: Option<(f64, String, Instant)>,
     session_meta: harness::sessions::Meta,
     todos: Arc<std::sync::Mutex<Vec<harness::tools::todo::TodoItem>>>,
@@ -362,7 +364,7 @@ pub async fn run(cfg: Config, resume: Option<String>) -> Result<()> {
         quit: false, tick: 0, word: 0, models: vec![],
         metrics: Metrics::new(0), panel: None, attachments: vec![], tool_previews: Default::default(),
         picker, images: Default::default(), img_seq: 0,
-        think_scroll: 0, toolset: None, perm_mode: harness::permissions::Mode::Auto, compact_progress: None, session_meta: harness::sessions::Meta::default(), todos: Default::default(), event_log: None, pending_ask: None, video: None, strip_rects: vec![], tr_rect: Rect::default(), panel_rect: Rect::default(), tr_start: 0, line_map: vec![],
+        think_scroll: 0, toolset: None, perm_mode: harness::permissions::Mode::Auto, cc: None, cc_last_session: None, compact_progress: None, session_meta: harness::sessions::Meta::default(), todos: Default::default(), event_log: None, pending_ask: None, video: None, strip_rects: vec![], tr_rect: Rect::default(), panel_rect: Rect::default(), tr_start: 0, line_map: vec![],
     };
     app.metrics.ctx_len = app.cfg.llm.context_budget_tokens.unwrap_or(0);
     app.perm_mode = app.cfg.permissions.mode;
@@ -414,7 +416,7 @@ impl App {
         self.blocks.push(Block::Banner(vec![
             format!("✻ TheHarness — local coding agent"),
             format!("  model  {}", self.model),
-            format!("  server {}", self.cfg.llm.base_url),
+            if self.cfg.llm.provider.as_deref() == Some("claude-code") { "  server claude-code (official CLI, your Anthropic subscription; tools bridged over MCP)".to_string() } else { format!("  server {}", self.cfg.llm.base_url) },
             format!("  cwd    {}", wd),
             {
                 let st = harness::setup::check();
@@ -657,6 +659,7 @@ impl App {
             }
             "/resume" => { if self.running.is_some() { self.set_status("finish or interrupt the current task first"); } else { self.resume_session(&arg); } }
             "/clear" | "/new" => {
+                if let Some(cc) = self.cc.take() { tokio::spawn(async move { cc.stop().await; }); } self.cc_last_session = None;
                 self.session_meta = harness::sessions::Meta::default();
                 if let Ok(mut t) = self.todos.lock() { t.clear(); }
                 let s = self.session.clone(); tokio::spawn(async move { s.lock().await.clear(); });
@@ -669,7 +672,7 @@ impl App {
                     for m in &self.models { lines.push(format!("  {}{}", if *m == self.model { "● " } else { "  " }, m)); }
                     lines.push("usage: /model <name>".into());
                     self.blocks.push(Block::Banner(lines));
-                } else { self.model = arg.clone(); self.cfg.llm.model = arg.clone(); self.blocks.push(Block::System(format!("model → {arg}"))); tokio::spawn(fetch_ctx_len(self.cfg.llm.base_url.clone(), arg.clone(), self.tx.clone())); }
+                } else { self.model = arg.clone(); self.cfg.llm.model = arg.clone(); self.blocks.push(Block::System(format!("model → {arg}"))); if self.cfg.llm.provider.as_deref() == Some("claude-code") { if let Some(cc) = self.cc.take() { tokio::spawn(async move { cc.stop().await; }); } self.cc_last_session = None; } else { tokio::spawn(fetch_ctx_len(self.cfg.llm.base_url.clone(), arg.clone(), self.tx.clone())); } }
             }
             "/cd" => {
                 let p = if arg.is_empty() { harness::setup::home_dir().display().to_string() } else { arg.clone() };
@@ -847,6 +850,16 @@ impl App {
                     }
                 }
             }
+            "/backend" | "/provider" => {
+                let mut it = arg.split_whitespace(); let which = it.next().unwrap_or("").to_string(); let model = it.next().map(String::from);
+                match which.as_str() {
+                    "" => { self.blocks.push(Block::Banner(vec![format!("backend: {} · model {}", self.cfg.llm.provider.clone().unwrap_or("openai (local/compatible server)".into()), self.model), "switch: /backend local [model]  ·  /backend claude [model]   (claude = official Claude Code CLI on your subscription, default claude-fable-5)".into(), "        /backend anthropic <model>  (Anthropic API key from ANTHROPIC_API_KEY)".into()])); }
+                    "local" | "openai" | "lmstudio" => { self.cfg.llm.provider = None; if let Some(m) = model { self.cfg.llm.model = m; } self.model = self.cfg.llm.model.clone(); if let Some(cc) = self.cc.take() { tokio::spawn(async move { cc.stop().await; }); } self.cc_last_session = None; self.blocks.push(Block::System(format!("backend → local server {} · model {}", self.cfg.llm.base_url, self.model))); tokio::spawn(fetch_ctx_len(self.cfg.llm.base_url.clone(), self.model.clone(), self.tx.clone())); }
+                    "claude" | "claude-code" | "cc" => { self.cfg.llm.provider = Some("claude-code".into()); self.cfg.llm.model = model.unwrap_or("claude-fable-5".into()); self.model = self.cfg.llm.model.clone(); if let Some(cc) = self.cc.take() { tokio::spawn(async move { cc.stop().await; }); } self.cc_last_session = None; self.metrics.ctx_len = 200_000; self.blocks.push(Block::System(format!("backend → Claude Code (subscription) · model {} · tools bridged over MCP", self.model))); }
+                    "anthropic" => { self.cfg.llm.provider = Some("anthropic".into()); self.cfg.llm.base_url = "https://api.anthropic.com".into(); if let Some(m) = model { self.cfg.llm.model = m; } self.model = self.cfg.llm.model.clone(); self.metrics.ctx_len = 200_000; self.blocks.push(Block::System(format!("backend → Anthropic API · model {}", self.model))); }
+                    other => self.blocks.push(Block::Error(format!("unknown backend '{other}' (local | claude | anthropic)"))),
+                }
+            }
             "/queue" => {
                 if self.queued.is_empty() { self.blocks.push(Block::System("queue is empty".into())); }
                 else { let mut lines = vec![format!("Queued tasks ({}) — /next skips the current one, /queue clear empties the queue", self.queued.len())]; for (i, q) in self.queued.iter().enumerate() { lines.push(format!("  {}. {}", i + 1, truncate(q, 120))); } self.blocks.push(Block::Banner(lines)); }
@@ -978,6 +991,9 @@ impl App {
         let toolset = self.toolset.clone();
         let todos = self.todos.clone();
         let perm_mode = self.perm_mode;
+        let cc_existing = self.cc.clone(); let cc_resume = self.cc_last_session.clone();
+        let cc_images: Vec<(String, String)> = atts.iter().map(|a| (a.mime.clone(), a.b64.clone())).collect();
+        let user_text = text.clone();
         let budget = self.cfg.llm.effective_budget(if self.metrics.ctx_len > 0 { Some(self.metrics.ctx_len) } else { None });
         self.run_started = Instant::now();
         self.metrics.turn_start = Some(Instant::now()); self.metrics.live_peak = 0.0; self.metrics.live_chars.clear(); self.turn_tokens = 0;
@@ -997,6 +1013,18 @@ impl App {
                 let extra = format!("You are in an interactive session: the user can see everything and will reply; keep final answers concise.{extra_prompt}");
                 let system = harness::agent::system_prompt_with_memory(&workdir.display().to_string(), &registry.names(), Some(&extra), store.as_ref());
                 let mut msgs = session.lock().await;
+                if client.provider() == harness::llm::Provider::ClaudeCode {
+                    // Claude Code backend: our tools bridged over MCP; the claude CLI drives the loop
+                    let cc = match cc_existing { Some(c) => c, None => {
+                        let host = Arc::new(harness::mcp_bridge::BridgeHost { registry: registry.clone(), ctx: ctx.clone(), policy: policy.clone(), approver: approver.clone(), sink: sink.clone() });
+                        let c = harness::claude_code::ClaudeCodeSession::start(&workdir, Some(cfg.llm.model.as_str()), &system, host, cc_resume.as_deref()).await.map_err(|e| format!("{e:#}"))?;
+                        let _ = tx.send(Msg::CcSession(c.clone())); c } };
+                    if msgs.is_empty() { msgs.push(Message::system(&system)); }
+                    msgs.push(user_msg);
+                    let (t, st) = cc.run_turn(&user_text, &cc_images, sink.as_ref()).await.map_err(|e| format!("{e:#}"))?;
+                    msgs.push(Message { role: "assistant".into(), content: Some(Content::Text(t.clone())), ..Default::default() });
+                    return Ok((t, st));
+                }
                 let out = agent.run_turn_message(&mut msgs, &system, user_msg).await.map_err(|e| format!("{e:#}"))?;
                 Ok(out)
             }.await;
@@ -1083,6 +1111,7 @@ impl App {
     }
 
     fn interrupt(&mut self) {
+        if let Some(cc) = self.cc.take() { let tx = self.tx.clone(); tokio::spawn(async move { let sid = cc.session_id.lock().await.clone(); cc.stop().await; if let Some(s) = sid { let _ = tx.send(Msg::Notice(format!("claude session {s} stopped; next turn resumes it"))); } }); }
         if let Some(h) = self.running.take() {
             h.abort();
             self.save_session();
@@ -1102,6 +1131,8 @@ impl App {
     fn on_msg(&mut self, m: Msg) {
         match m {
             Msg::Block(b) => self.blocks.push(b),
+            Msg::CcSession(s) => { self.cc = Some(s); }
+            Msg::CcSid(id) => { self.cc_last_session = Some(id); }
             Msg::Ask(req, tx) => { self.blocks.push(Block::System(format!("🔒 approval needed — {}({}) · {}", req.tool, truncate(&req.summary, 100), req.reason))); self.pending_ask = Some((req, tx)); }
             Msg::Ev(e) => self.on_event(e),
             Msg::Sys(s) => self.metrics.on_sys(s),
@@ -1120,6 +1151,7 @@ impl App {
             Msg::Pasted(Err(e)) => self.set_status(e),
             Msg::Done(res) => {
                 self.running = None;
+                if let Some(cc) = self.cc.clone() { let tx = self.tx.clone(); tokio::spawn(async move { if let Some(id) = cc.session_id.lock().await.clone() { let _ = tx.send(Msg::CcSid(id)); } }); }
                 if self.cfg.ui.notify && self.run_started.elapsed() > Duration::from_secs(20) {
                     let title = match &res { Ok(_) => "Harness: task finished", Err(_) => "Harness: task stopped" };
                     let body = truncate(&self.blocks.iter().rev().find_map(|b| if let Block::User(t, _) = b { Some(t.clone()) } else { None }).unwrap_or_default(), 80).replace('"', "'");
@@ -1188,7 +1220,8 @@ impl App {
             Event::Compacted { count, prompt_tokens, summary, map_before, map_after } => {
                 self.compact_progress = None;
                 let (tb, ta): (u64, u64) = (map_before.iter().map(|x| x.1).sum(), map_after.iter().map(|x| x.1).sum());
-                self.blocks.push(Block::System(format!("⟲ context compacted: {count} messages → handoff note · ~{} → ~{} tokens ({}% smaller){}", fmt_k(tb), fmt_k(ta), if tb > 0 { 100 - ta * 100 / tb } else { 0 }, if prompt_tokens > 0 { format!(" · measured prompt was {}", fmt_k(prompt_tokens)) } else { String::new() })));
+                let pct = if tb > 0 { 100.0 - (ta as f64) * 100.0 / (tb as f64) } else { 0.0 };
+                self.blocks.push(Block::System(format!("⟲ context compacted: {count} messages → handoff note · ~{} → ~{} tokens ({}{:.0}%){}", fmt_k(tb), fmt_k(ta), if pct >= 0.0 { "−" } else { "+" }, pct.abs(), if prompt_tokens > 0 { format!(" · measured prompt was {}", fmt_k(prompt_tokens)) } else { String::new() })));
                 self.blocks.push(Block::CompactMap { before: map_before, after: map_after });
                 if !summary.is_empty() { self.blocks.push(Block::Assistant { text: format!("Handoff note (context compaction)\n{summary}"), streaming: false, folded: true }); }
             }
@@ -1240,6 +1273,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ("/sessions", "list saved sessions"),
     ("/resume", "resume a saved session: /resume <n|id|last>"),
     ("/model", "show or switch the model: /model <name>"),
+    ("/backend", "switch backend: local (LM Studio etc.) | claude [model] (Claude Code CLI, subscription) | anthropic <model>"),
     ("/cd", "change working directory"),
     ("/pwd", "print working directory"),
     ("/tools", "list the tools the model can call"),

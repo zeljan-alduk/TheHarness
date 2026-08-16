@@ -22,6 +22,7 @@ use serde_json::Value;
 use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
+#[derive(Clone)]
 pub struct ToolCtx {
     pub workdir: PathBuf,
     pub timeout: Duration,
