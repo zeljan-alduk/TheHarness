@@ -18,6 +18,7 @@ pub mod pdf;
 pub mod plan;
 pub mod process;
 pub mod repomap;
+pub mod run_code;
 pub mod run_workflow;
 pub mod schedule;
 pub mod search;
@@ -159,6 +160,7 @@ impl Registry {
             Arc::new(archive::ExtractArchive),
             Arc::new(subagent::SpawnAgent),
             Arc::new(process::Process),
+            Arc::new(run_code::RunCode),
             Arc::new(terminal::Terminal),
             Arc::new(todo::Todo),
             Arc::new(ask_user::AskUser),

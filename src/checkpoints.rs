@@ -49,7 +49,7 @@ pub fn configure(cfg: &CheckpointsConfig) {
 pub fn enabled() -> bool { ENABLED.load(std::sync::atomic::Ordering::Relaxed) }
 
 /// Tools that can change files on disk — a snapshot is taken before these run.
-pub const MUTATING_TOOLS: [&str; 10] = ["bash", "write_file", "edit_file", "apply_patch", "notebook_edit", "pdf_edit", "extract_archive", "download_file", "run_workflow", "terminal"];
+pub const MUTATING_TOOLS: [&str; 11] = ["bash", "write_file", "edit_file", "apply_patch", "notebook_edit", "pdf_edit", "extract_archive", "download_file", "run_workflow", "terminal", "run_code"];
 
 pub struct Checkpoints {
     pub git_dir: PathBuf,
