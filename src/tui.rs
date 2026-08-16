@@ -57,7 +57,7 @@ fn pal() -> Pal {
 const SPINNER: [&str; 10] = ["✻", "✼", "✽", "✾", "✿", "❀", "✿", "✾", "✽", "✼"];
 const WORDS: [&str; 12] = ["Thinking", "Pondering", "Working", "Reasoning", "Cooking", "Tinkering", "Brewing", "Mulling", "Crunching", "Percolating", "Noodling", "Computing"];
 
-enum Msg { Ask(harness::permissions::ApprovalRequest, tokio::sync::oneshot::Sender<harness::permissions::Approval>), Ev(Event), Done(Result<(String, harness::agent::RunStats), String>), Sys(SysSample), CtxLen(u64), Pasted(Result<PathBuf, String>), Frames(Result<(PathBuf, f64, Vec<(f64, PathBuf)>), String>), Toolset(Arc<Toolset>), Catalog(Result<harness::plugins::Catalog, String>), Notice(String) }
+enum Msg { Block(Block), Ask(harness::permissions::ApprovalRequest, tokio::sync::oneshot::Sender<harness::permissions::Approval>), Ev(Event), Done(Result<(String, harness::agent::RunStats), String>), Sys(SysSample), CtxLen(u64), Pasted(Result<PathBuf, String>), Frames(Result<(PathBuf, f64, Vec<(f64, PathBuf)>), String>), Toolset(Arc<Toolset>), Catalog(Result<harness::plugins::Catalog, String>), Notice(String) }
 
 /// Video scrubber state (modal over the transcript).
 struct VideoPicker { path: PathBuf, duration: f64, frames: Vec<(f64, PathBuf, String)>, cur: usize, selected: std::collections::BTreeSet<usize>, loading: bool, error: Option<String> }
@@ -279,6 +279,8 @@ enum Block {
     Memory(String),
     /// Context map before/after compaction: (label, tokens) segments.
     CompactMap { before: Vec<(String, u64)>, after: Vec<(String, u64)> },
+    /// /context report: segments (label, tokens), window size, measured prompt tokens, top items, hints.
+    ContextReport { segments: Vec<(String, u64)>, window: u64, measured: u64, top: Vec<String>, hints: Vec<String> },
 }
 
 struct App {
@@ -756,6 +758,82 @@ impl App {
             }
             "/theme" => { let light = match arg.as_str() { "light" => true, "dark" => false, _ => !LIGHT.load(std::sync::atomic::Ordering::Relaxed) }; LIGHT.store(light, std::sync::atomic::Ordering::Relaxed); self.blocks.push(Block::System(format!("theme → {}", if light { "light" } else { "dark" }))); }
             "/plan" => { self.perm_mode = if self.perm_mode == harness::permissions::Mode::Plan { harness::permissions::Mode::Auto } else { harness::permissions::Mode::Plan }; self.blocks.push(Block::System(format!("permissions → {}", self.perm_mode.label()))); }
+            "/context" | "/ctx" => {
+                let tx = self.tx.clone(); let session = self.session.clone(); let cfg = self.cfg.clone(); let workdir = self.workdir.clone(); let toolset = self.toolset.clone();
+                let window = self.metrics.ctx_len; let measured = self.last_prompt_tokens;
+                tokio::spawn(async move {
+                    let msgs = session.lock().await.clone();
+                    let store = if cfg.memory.enabled { harness::memory::MemoryStore::open(&cfg.memory).ok() } else { None };
+                    let (defs_json, extra_prompt, names): (usize, String, Vec<String>) = match &toolset { Some(ts) => (serde_json::to_string(&ts.registry.defs()).map(|s| s.len()).unwrap_or(0), ts.prompt_extra.clone(), ts.registry.names().into_iter().map(String::from).collect()), None => { let r = Registry::defaults(cfg.net.enabled); (serde_json::to_string(&r.defs()).map(|s| s.len()).unwrap_or(0), String::new(), r.names().into_iter().map(String::from).collect()) } };
+                    let tok = |c: usize| (c / 4) as u64;
+                    let base = harness::agent::base_prompt_template().len() + harness::setup::summary_line().len() + names.iter().map(|n| n.len() + 2).sum::<usize>();
+                    let mem_block = store.as_ref().map(|m| m.prompt_block(&workdir).len()).unwrap_or(0);
+                    let mut segs: Vec<(String, u64)> = vec![("system prompt".into(), tok(base)), ("tool schemas".into(), tok(defs_json)), ("memory files".into(), tok(mem_block)), ("skills/plugins".into(), tok(extra_prompt.len()))];
+                    let mut user = 0u64; let mut asst = 0u64; let mut tools = 0u64; let mut imgs = 0u64; let mut note = 0u64;
+                    let mut items: Vec<(u64, String)> = Vec::new();
+                    for m in msgs.iter().skip(1) {
+                        let t = m.text(); let n = tok(t.chars().count());
+                        match m.role.as_str() {
+                            "user" => { if t.starts_with("[Context compacted") { note += n; items.push((n, "handoff note".into())); } else { user += n; items.push((n, format!("user: {}", truncate(t.lines().next().unwrap_or(""), 50)))); } if let Some(Content::Parts(p)) = &m.content { let k = p.iter().filter(|x| x["type"] == "image_url").count() as u64; imgs += k * 1200; } }
+                            "assistant" => { let mut a = n; if let Some(c) = &m.tool_calls { a += c.iter().map(|c| tok(c.function.arguments.chars().count())).sum::<u64>(); } asst += a; if a > 0 { items.push((a, format!("assistant: {}", truncate(t.lines().next().unwrap_or("(tool calls)"), 50)))); } }
+                            "tool" => { tools += n; items.push((n, format!("tool result {}: {}", m.name.clone().unwrap_or_default(), truncate(t.lines().next().unwrap_or(""), 44)))); }
+                            _ => {}
+                        }
+                    }
+                    segs.push(("handoff notes".into(), note)); segs.push(("user messages".into(), user)); segs.push(("assistant".into(), asst)); segs.push(("tool results".into(), tools)); segs.push(("images".into(), imgs));
+                    items.sort_by(|a, b| b.0.cmp(&a.0));
+                    let top: Vec<String> = items.iter().take(10).map(|(n, l)| format!("{:>6}  {}", fmt_k(*n), l)).collect();
+                    let total: u64 = segs.iter().map(|x| x.1).sum();
+                    let mut hints = Vec::new();
+                    if window > 0 && total * 100 / window > 60 { hints.push("context above 60% — /compact keeps recent messages verbatim and summarizes the rest".into()); }
+                    if tools > total / 2 && total > 5000 { hints.push("tool results dominate — prefer grep/glob with tighter patterns and read_file with offset/limit".into()); }
+                    if imgs > 0 { hints.push(format!("{} image(s) ≈ {} tokens; old images are dropped on compaction", imgs / 1200, fmt_k(imgs))); }
+                    if defs_json / 4 > 6000 { hints.push("tool schemas are large (many MCP tools) — disable unused MCP servers/plugins to save context per call".into()); }
+                    if mem_block / 4 > 4000 { hints.push("memory files are large — /brain, /memory: consolidate or lower [memory] max_inject_chars".into()); }
+                    let _ = tx.send(Msg::Block(Block::ContextReport { segments: segs, window, measured, top, hints }));
+                });
+            }
+            "/workflow" | "/wf" => {
+                let mut it = arg.splitn(2, ' '); let name = it.next().unwrap_or("").to_string(); let wargs = it.next().unwrap_or("").to_string();
+                if name.is_empty() || name == "list" {
+                    let l = harness::workflow::list(&self.workdir);
+                    let mut lines = vec!["Workflows — /workflow <name> [args]   (files: ~/.config/harness/workflows/*.toml, .harness/workflows/*.toml)".to_string()];
+                    for (n, d, _) in l { lines.push(format!("  {:<14} {}", n, truncate(&d, 100))); }
+                    self.blocks.push(Block::Banner(lines));
+                } else if self.running.is_some() { self.set_status("finish or interrupt the current task first"); }
+                else {
+                    match harness::workflow::find(&name, &self.workdir) {
+                        Err(e) => self.blocks.push(Block::Error(e.to_string())),
+                        Ok(wf) => {
+                            self.blocks.push(Block::User(format!("/workflow {name} {wargs}"), vec![]));
+                            let tx = self.tx.clone(); let cfg = self.cfg.clone(); let workdir = self.workdir.clone(); let toolset = self.toolset.clone(); let perm_mode = self.perm_mode; let todos = self.todos.clone();
+                            let budget = self.cfg.llm.effective_budget(if self.metrics.ctx_len > 0 { Some(self.metrics.ctx_len) } else { None });
+                            self.run_started = Instant::now(); self.metrics.turn_start = Some(Instant::now());
+                            let handle = tokio::spawn(async move {
+                                let res: Result<(String, harness::agent::RunStats), String> = async {
+                                    let client = Client::new(&cfg.llm).map_err(|e| e.to_string())?;
+                                    let store = if cfg.memory.enabled { harness::memory::MemoryStore::open(&cfg.memory).ok() } else { None };
+                                    let fallback = Registry::defaults(cfg.net.enabled);
+                                    let (registry, extra_prompt): (Registry, String) = match &toolset { Some(ts) => (ts.registry.clone(), ts.prompt_extra.clone()), None => (fallback, String::new()) };
+                                    let sink: Arc<dyn Sink> = Arc::new(TuiSink(tx.clone()));
+                                    let mut pcfg = cfg.permissions.clone(); pcfg.mode = perm_mode; pcfg.allow.extend(harness::permissions::persisted_rules());
+                                    let policy = Arc::new(harness::permissions::Policy::new(pcfg, &workdir));
+                                    let approver: Arc<dyn harness::permissions::Approver> = Arc::new(TuiApprover(tx.clone()));
+                                    let env = Arc::new(harness::agent::SubAgentEnv::new(client.clone(), registry.clone(), policy.clone(), approver.clone(), sink.clone(), budget, true));
+                                    let ctx = ToolCtx { memory: store.clone(), subagent: Some(env.clone()), redact_secrets: cfg.security.redact_secrets, hooks: cfg.hooks.clone(), lsp_servers: cfg.lsp.servers.clone(), todos, timeout: Duration::from_secs(cfg.agent.tool_timeout_secs), max_output: cfg.agent.max_tool_output_chars, net: cfg.net.clone(), ..ToolCtx::basic(workdir.clone()) };
+                                    let base_system = harness::agent::system_prompt_with_memory(&workdir.display().to_string(), &registry.names(), Some(&extra_prompt), store.as_ref());
+                                    let wenv = harness::workflow::WorkflowEnv { env, ctx, sink: sink.clone(), base_system };
+                                    let out = harness::workflow::run(&wf, &wargs, &wenv).await.map_err(|e| format!("{e:#}"))?;
+                                    sink.emit(&Event::Assistant { text: format!("Workflow `{}` finished.\n\n{out}", wf.name) });
+                                    Ok((out, harness::agent::RunStats { stop_reason: "done".into(), ..Default::default() }))
+                                }.await;
+                                let _ = tx.send(Msg::Done(res));
+                            });
+                            self.running = Some(handle);
+                        }
+                    }
+                }
+            }
             "/queue" => {
                 if self.queued.is_empty() { self.blocks.push(Block::System("queue is empty".into())); }
                 else { let mut lines = vec![format!("Queued tasks ({}) — /next skips the current one, /queue clear empties the queue", self.queued.len())]; for (i, q) in self.queued.iter().enumerate() { lines.push(format!("  {}. {}", i + 1, truncate(q, 120))); } self.blocks.push(Block::Banner(lines)); }
@@ -1009,6 +1087,7 @@ impl App {
 
     fn on_msg(&mut self, m: Msg) {
         match m {
+            Msg::Block(b) => self.blocks.push(b),
             Msg::Ask(req, tx) => { self.blocks.push(Block::System(format!("🔒 approval needed — {}({}) · {}", req.tool, truncate(&req.summary, 100), req.reason))); self.pending_ask = Some((req, tx)); }
             Msg::Ev(e) => self.on_event(e),
             Msg::Sys(s) => self.metrics.on_sys(s),
@@ -1152,6 +1231,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ("/panel", "toggle the dashboard panel (ctrl+p)"),
     ("/cost", "token usage for this session"),
     ("/compact", "compact the context into a precise handoff note: /compact [focus]"),
+    ("/context", "context map: what fills the window (prompt, tools, memory, messages) + heaviest items"),
     ("/config", "effective configuration"),
     ("/memory", "show MEMORY.md (settings · preferences · ideas)"),
     ("/brain", "show BRAIN.md (what the agent learned)"),
@@ -1165,6 +1245,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ("/permissions", "show or set permission mode: bypass|auto|ask|plan"),
     ("/plan", "toggle plan mode (read-only)"),
     ("/theme", "switch theme: /theme light|dark"),
+    ("/workflow", "run a workflow: /workflow <name> [args]  (list with /workflow)"),
     ("/queue", "show queued tasks (/queue clear)"),
     ("/next", "stop the current task and start the next queued one (ctrl+n)"),
     ("/exit", "quit"),
@@ -1544,6 +1625,30 @@ fn render_block(b: &Block, app: &App, width: usize, out: &mut Vec<Line<'static>>
             }
         }
         Block::System(t) => { push_wrapped(out, vec![Span::styled("· ", Style::default().fg(pal().dim)), Span::styled(t.clone(), Style::default().fg(pal().dim))], w, 2); }
+        Block::ContextReport { segments, window, measured, top, hints } => {
+            let colors = |label: &str| match label { "system prompt" => pal().blue, "tool schemas" => pal().cyan, "memory files" => pal().pink, "skills/plugins" => pal().think, "handoff notes" => pal().orange, "user messages" => pal().fg, "assistant" => pal().ok, "tool results" => pal().dim, "images" => pal().think, _ => pal().dim };
+            let total: u64 = segments.iter().map(|x| x.1).sum();
+            let win = (*window).max(total).max(1);
+            let barw = w.saturating_sub(6).clamp(20, 100) as u64;
+            out.push(Line::from(vec![Span::styled("Context map ", Style::default().fg(pal().orange).bold()), Span::styled(format!("≈{} of {} tokens ({}%){}", fmt_k(total), fmt_k(*window), total * 100 / win, if *measured > 0 { format!(" · last measured prompt {}", fmt_k(*measured)) } else { String::new() }), Style::default().fg(pal().dim))]));
+            // stacked bar
+            let mut spans = vec![Span::raw("  ")]; let mut used = 0u64;
+            for (label, n) in segments { let cells = (n * barw / win).max(if *n > 0 { 1 } else { 0 }); used += cells; spans.push(Span::styled("█".repeat(cells as usize), Style::default().fg(colors(label)))); }
+            if used < barw { spans.push(Span::styled("░".repeat((barw - used) as usize), Style::default().fg(pal().panel_bg))); }
+            out.push(Line::from(spans));
+            // rows
+            for (label, n) in segments {
+                if *n == 0 { continue; }
+                let pct = *n as f64 * 100.0 / win as f64;
+                let mini = ((*n * 20) / win.max(1)).max(1) as usize;
+                out.push(Line::from(vec![Span::raw("  "), Span::styled("■ ", Style::default().fg(colors(label))), Span::styled(format!("{:<15}", label), Style::default()), Span::styled(format!("{:>7} ", fmt_k(*n)), Style::default().bold()), Span::styled(format!("{:>5.1}%  ", pct), Style::default().fg(pal().dim)), Span::styled("▮".repeat(mini.min(20)), Style::default().fg(colors(label)))]));
+            }
+            let free = win.saturating_sub(total);
+            out.push(Line::from(vec![Span::raw("  "), Span::styled("□ free           ", Style::default().fg(pal().dim)), Span::styled(format!("{:>7} ", fmt_k(free)), Style::default().bold()), Span::styled(format!("{:>5.1}%", free as f64 * 100.0 / win as f64), Style::default().fg(pal().dim))]));
+            if !top.is_empty() { out.push(Line::from(Span::styled("  heaviest items", Style::default().fg(pal().orange)))); for t in top { out.push(Line::from(vec![Span::raw("   "), Span::styled(t.clone(), Style::default().fg(pal().dim))])); } }
+            for h in hints { out.push(Line::from(vec![Span::styled("  ▸ ", Style::default().fg(pal().orange)), Span::raw(h.clone())])); }
+            out.push(Line::raw(""));
+        }
         Block::CompactMap { before, after } => {
             let colors = |label: &str| match label { "system" => pal().blue, "handoff note" => pal().orange, "user" => pal().fg, "assistant" => pal().ok, "tool results" => pal().dim, "images" => pal().think, _ => pal().dim };
             let tb: u64 = before.iter().map(|x| x.1).sum::<u64>().max(1);

@@ -117,12 +117,29 @@ enum Cmd {
         #[arg(long, default_value = "127.0.0.1:7878")]
         bind: String,
     },
+    /// Workflows: list | run <name|path> [args]
+    Workflow {
+        #[command(subcommand)]
+        action: WorkflowCmd,
+    },
     /// List saved sessions
     Sessions,
     /// List models on the configured server
     Models,
     /// Print the effective configuration
     Config,
+}
+
+#[derive(Subcommand)]
+enum WorkflowCmd {
+    List,
+    Run {
+        #[arg(short = 'C', long)]
+        dir: Option<PathBuf>,
+        name: String,
+        /// arguments available as {args} in the workflow
+        args: Vec<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -158,6 +175,26 @@ async fn main() -> Result<()> {
             if !v.green { std::process::exit(1); }
         }
         Cmd::Serve { bind } => { harness::serve::serve(cfg, &bind).await?; }
+        Cmd::Workflow { action } => match action {
+            WorkflowCmd::List => { for (n, d, p) in harness::workflow::list(&std::env::current_dir()?) { println!("{:<16} {:<70} {}", n, llm::truncate_for_log(&d, 70), p.display()); } }
+            WorkflowCmd::Run { dir, name, args } => {
+                let workdir = dir.unwrap_or(std::env::current_dir()?).canonicalize()?;
+                let wf = harness::workflow::find(&name, &workdir)?;
+                let sink: std::sync::Arc<dyn events::Sink> = if cli.json { std::sync::Arc::new(events::JsonlSink) } else { std::sync::Arc::new(events::StderrSink { verbose: cli.verbose }) };
+                let ts = tools::build_toolset(cfg.net.enabled, &workdir, true).await;
+                let budget = cfg.llm.effective_budget(llm::detect_context_length(&cfg.llm.base_url, &cfg.llm.model).await.map(|d| d.0));
+                let mut pcfg = cfg.permissions.clone(); pcfg.allow.extend(harness::permissions::persisted_rules());
+                let policy = std::sync::Arc::new(harness::permissions::Policy::new(pcfg, &workdir));
+                let approver: std::sync::Arc<dyn harness::permissions::Approver> = std::sync::Arc::new(harness::permissions::AutoApprover { yes: cli.yes });
+                let env = std::sync::Arc::new(agent::SubAgentEnv::new(client.clone(), ts.registry.clone(), policy.clone(), approver, sink.clone(), budget, true));
+                let store = if cfg.memory.enabled { harness::memory::MemoryStore::open(&cfg.memory).ok() } else { None };
+                let ctx = tools::ToolCtx { memory: store.clone(), subagent: Some(env.clone()), redact_secrets: cfg.security.redact_secrets, hooks: cfg.hooks.clone(), lsp_servers: cfg.lsp.servers.clone(), timeout: Duration::from_secs(cfg.agent.tool_timeout_secs), max_output: cfg.agent.max_tool_output_chars, net: cfg.net.clone(), ..tools::ToolCtx::basic(workdir.clone()) };
+                let base_system = agent::system_prompt_with_memory(&workdir.display().to_string(), &ts.registry.names(), Some(&ts.prompt_extra), store.as_ref());
+                let wenv = harness::workflow::WorkflowEnv { env, ctx, sink, base_system };
+                let out = harness::workflow::run(&wf, &args.join(" "), &wenv).await?;
+                println!("\n{out}");
+            }
+        },
         Cmd::Sessions => {
             let store = harness::sessions::SessionStore::open()?;
             for (i, m) in store.list(None).iter().take(40).enumerate() { println!("{:>2}. {}  {:<50} {:<30} {} turns · {}", i + 1, m.id, llm::truncate_for_log(&m.title, 50), m.workdir, m.turns, harness::sessions::fmt_age(m.updated)); }

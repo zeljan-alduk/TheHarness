@@ -66,7 +66,8 @@ for cmd, marker in [("/help", "Commands"), ("/tools", "download_file"), ("/confi
                     ("/permissions", "permission mode"), ("/permissions plan", "plan mode"), ("/permissions auto", "auto permissions"), ("/plan", "plan mode"), ("/plan", "auto permissions"),
                     ("/queue", "queue is empty"), ("/sessions", "Sessions"), ("/theme light", "theme → light"), ("/theme dark", "theme → dark"),
                     ("/mcp", "MCP servers configured"), ("/memory", "MEMORY"), ("/brain", "BRAIN"), ("/workflows", "WORKFLOWS"),
-                    ("/remember e2e marker preference", "MEMORY › Preferences"), ("/plugin bogus", "usage: /plugin"), ("/reload", "reloading tools")]:
+                    ("/remember e2e marker preference", "MEMORY › Preferences"), ("/plugin bogus", "usage: /plugin"), ("/reload", "reloading tools"),
+                    ("/context", "Context map"), ("/workflow", "Workflows"), ("/workflow nope", "no workflow named")]:
     send(cmd + "\r"); pump(0.8)
     step(f"{cmd}", marker is None or marker in screen())
 send("/mod\t"); pump(0.3); step("tab-completes /model", "/model " in screen()); send("\x15")  # ctrl+u clears line
