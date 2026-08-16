@@ -58,7 +58,7 @@ fn pal() -> Pal {
 const SPINNER: [&str; 10] = ["✻", "✼", "✽", "✾", "✿", "❀", "✿", "✾", "✽", "✼"];
 const WORDS: [&str; 12] = ["Thinking", "Pondering", "Working", "Reasoning", "Cooking", "Tinkering", "Brewing", "Mulling", "Crunching", "Percolating", "Noodling", "Computing"];
 
-enum Msg { Question(harness::permissions::Question, tokio::sync::oneshot::Sender<harness::permissions::Answer>), SubEnv(Arc<harness::agent::SubAgentEnv>), Policy(Arc<harness::permissions::Policy>), CcSession(Arc<harness::claude_code::ClaudeCodeSession>), CcSid(String), Block(Block), Ask(harness::permissions::ApprovalRequest, tokio::sync::oneshot::Sender<harness::permissions::Approval>), Ev(Event), Done(Result<(String, harness::agent::RunStats), String>), Sys(SysSample), CtxLen(u64), Pasted(Result<PathBuf, String>), Frames(Result<(PathBuf, f64, Vec<(f64, PathBuf)>), String>), Toolset(Arc<Toolset>), Catalog(Result<harness::plugins::Catalog, String>), Notice(String) }
+enum Msg { Title(String), Question(harness::permissions::Question, tokio::sync::oneshot::Sender<harness::permissions::Answer>), SubEnv(Arc<harness::agent::SubAgentEnv>), Policy(Arc<harness::permissions::Policy>), CcSession(Arc<harness::claude_code::ClaudeCodeSession>), CcSid(String), Block(Block), Ask(harness::permissions::ApprovalRequest, tokio::sync::oneshot::Sender<harness::permissions::Approval>), Ev(Event), Done(Result<(String, harness::agent::RunStats), String>), Sys(SysSample), CtxLen(u64), Pasted(Result<PathBuf, String>), Frames(Result<(PathBuf, f64, Vec<(f64, PathBuf)>), String>), Toolset(Arc<Toolset>), Catalog(Result<harness::plugins::Catalog, String>), Notice(String) }
 
 /// Video scrubber state (modal over the transcript).
 struct VideoPicker { path: PathBuf, duration: f64, frames: Vec<(f64, PathBuf, String)>, cur: usize, selected: std::collections::BTreeSet<usize>, loading: bool, error: Option<String> }
@@ -1229,6 +1229,21 @@ impl App {
         self.running = Some(handle);
     }
 
+    /// Ask the aux model for a short session title after the first turn (local/API backends).
+    fn spawn_title(&mut self) {
+        if !self.session_meta.title.is_empty() && self.session_meta.title.len() < 40 && !self.session_meta.title.ends_with('…') { return; }
+        if self.cfg.llm.provider.as_deref() == Some("claude-code") { return; }
+        let session = self.session.clone(); let cfg = self.cfg.clone(); let tx = self.tx.clone();
+        tokio::spawn(async move {
+            let msgs = session.lock().await.clone();
+            let first = msgs.iter().find(|m| m.role == "user").map(|m| m.text()).unwrap_or_default();
+            if first.trim().is_empty() { return; }
+            let Ok(client) = Client::new(&cfg.llm) else { return };
+            let req = vec![Message::system("Reply with a 3–6 word title for a coding session that starts with the following request. Title only, no quotes, no trailing period."), Message::user(truncate(&first, 600))];
+            if let Ok((r, _)) = client.aux().chat(&req, &[]).await { let t = r.text().lines().next().unwrap_or("").trim().trim_matches('"').to_string(); if (3..=80).contains(&t.len()) { let _ = tx.send(Msg::Title(t)); } }
+        });
+    }
+
     /// Reflection runs *after* Done so the next queued task starts immediately; skipped when tasks are waiting.
     fn spawn_reflection(&mut self, stats: &harness::agent::RunStats) {
         if !self.cfg.memory.enabled || !self.cfg.memory.auto_reflect || stats.tool_calls < self.cfg.memory.reflect_min_tool_calls || stats.stop_reason != "done" { return; }
@@ -1275,7 +1290,12 @@ impl App {
         let Ok(store) = harness::sessions::SessionStore::open() else { return };
         let id = if which == "last" || which == "latest" || which.is_empty() { match store.latest_for(&self.workdir.display().to_string()).or_else(|| store.list(None).into_iter().next()) { Some(m) => m.id, None => { self.blocks.push(Block::Error("no saved sessions".into())); return; } } }
             else if let Ok(n) = which.parse::<usize>() { match store.list(None).get(n.saturating_sub(1)) { Some(m) => m.id.clone(), None => { self.blocks.push(Block::Error(format!("no session #{n}"))); return; } } }
-            else { which.to_string() };
+            else {
+                // fuzzy: exact id, id prefix, or title/workdir substring (case-insensitive); ambiguous → show matches
+                let all = store.list(None); let q = which.to_lowercase();
+                let hits: Vec<&harness::sessions::Meta> = if let Some(m) = all.iter().find(|m| m.id == which) { vec![m] } else { all.iter().filter(|m| m.id.starts_with(which) || m.title.to_lowercase().contains(&q) || m.workdir.to_lowercase().contains(&q)).collect() };
+                match hits.len() { 1 => hits[0].id.clone(), 0 => { self.blocks.push(Block::Error(format!("no session matches '{which}' — /sessions"))); return; } _ => { let mut lines = vec![format!("{} sessions match '{which}' — pick one: /resume <id>", hits.len())]; for m in hits.iter().take(15) { lines.push(format!("  {}  {:<50} {}", m.id, truncate(&m.title, 50), harness::sessions::fmt_age(m.updated))); } self.blocks.push(Block::Banner(lines)); return; } }
+            };
         match store.load(&id) {
             Ok((meta, msgs)) => {
                 self.blocks.clear(); self.banner();
@@ -1330,6 +1350,7 @@ impl App {
             Msg::CcSession(s) => { self.cc = Some(s); }
             Msg::Policy(p) => { p.set_mode(self.perm_mode); self.live_policy = Some(p); }
             Msg::SubEnv(e) => { self.subenv = Some(e); }
+            Msg::Title(t) => { self.session_meta.title = t; self.save_session(); }
             Msg::Question(q, tx) => {
                 let mut lines = vec![format!("❓ {}", q.question)];
                 for (i, o) in q.options.iter().enumerate() { lines.push(format!("   [{}] {}{}", i + 1, o.label, if o.description.is_empty() { String::new() } else { format!(" — {}", o.description) })); }
@@ -1370,7 +1391,7 @@ impl App {
                 }
                 self.save_session();
                 match res {
-                    Ok((_, stats)) => { self.spawn_reflection(&stats); }
+                    Ok((_, stats)) => { if self.history.len() <= 1 { self.spawn_title(); } self.spawn_reflection(&stats); }
                     Err(e) => { if !e.contains("interrupted") { self.blocks.push(Block::Error(e)); } }
                 }
                 if !self.queued.is_empty() {
