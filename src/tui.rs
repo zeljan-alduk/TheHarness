@@ -1,7 +1,7 @@
 //! Interactive terminal UI — the Claude-Code-style front end for a local model.
 //! Everything here is presentation; the agent loop lives in the `harness` library.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use crossterm::event::{Event as CEvent, EventStream, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind};
 use futures_util::StreamExt;
 use harness::agent::Agent;
@@ -364,6 +364,8 @@ struct App {
     last_ctrl_c: Option<Instant>,
     status_msg: Option<(String, Instant)>,
     quit: bool,
+    /// /restart: after quitting, exec the (possibly rebuilt) harness binary with `--resume <this session>`
+    restart: bool,
     tick: u64,
     word: usize,
     models: Vec<String>,
@@ -414,7 +416,7 @@ pub async fn run(cfg: Config, resume: Option<String>) -> Result<()> {
         scroll_up: 0, running: None, run_started: Instant::now(), queued: vec![], expand_tools: false, show_thinking: false,
         session: Arc::new(tokio::sync::Mutex::new(Vec::new())), tx: tx.clone(),
         total_prompt: 0, total_completion: 0, last_prompt_tokens: 0, turn_tokens: 0, last_ctrl_c: None, status_msg: None,
-        quit: false, tick: 0, word: 0, models: vec![],
+        quit: false, restart: false, tick: 0, word: 0, models: vec![],
         metrics: Metrics::new(0), panel: None, attachments: vec![], tool_previews: Default::default(),
         picker, images: Default::default(), img_seq: 0,
         think_scroll: 0, toolset: None, perm_mode: harness::permissions::Mode::Auto, vim: false, vim_normal: false, keymap: Keymap::load(), live_policy: None, cc_rate: None, extra_roots: vec![], wt_cwd: harness::worktree::new_cell(), cc: None, cc_last_session: None, compact_progress: None, session_meta: harness::sessions::Meta::default(), todos: Default::default(), inbox: Default::default(), event_log: None, pending_ask: None, pending_q: None, subenv: None, attached: None, video: None, strip_rects: vec![], tr_rect: Rect::default(), panel_rect: Rect::default(), tr_start: 0, line_map: vec![],
@@ -469,7 +471,40 @@ pub async fn run(cfg: Config, resume: Option<String>) -> Result<()> {
     if !app.session_meta.id.is_empty() { harness::mailbox::unregister(&app.session_meta.id); }
     if !app.cfg.hooks.session_end.is_empty() { let _ = harness::hooks::run_event(&app.cfg.hooks, "session_end", "", serde_json::json!({"session": app.session_meta.id}), &app.workdir).await; }
     if let Some(h) = app.running.take() { h.abort(); }
+    if app.restart && res.is_ok() { restart_process(&mut app).await?; }
     res
+}
+
+/// Replace this process with the harness binary on disk (picks up a rebuilt/installed binary),
+/// resuming the current session. Original CLI args are kept, minus any previous --resume/--continue.
+async fn restart_process(app: &mut App) -> Result<()> {
+    // persist the transcript synchronously so the new process can resume it
+    let msgs = app.session.lock().await.clone();
+    let mut resume: Option<String> = None;
+    if msgs.len() >= 2 {
+        if app.session_meta.id.is_empty() { app.session_meta.id = harness::sessions::SessionStore::new_id(); }
+        app.session_meta.workdir = app.workdir.display().to_string();
+        app.session_meta.model = app.model.clone();
+        let store = harness::sessions::SessionStore::open()?;
+        store.save(&mut app.session_meta, &msgs)?;
+        resume = Some(app.session_meta.id.clone());
+    }
+    let exe = std::env::var_os("HARNESS_ORIG_EXE").map(PathBuf::from).or_else(|| std::env::current_exe().ok()).context("cannot locate the harness executable")?;
+    let mut args: Vec<std::ffi::OsString> = Vec::new();
+    let mut skip = false;
+    for a in std::env::args_os().skip(1) {
+        if skip { skip = false; continue; }
+        let s = a.to_string_lossy();
+        if s == "--resume" || s == "-r" { skip = true; continue; }
+        if s.starts_with("--resume=") || s == "--continue" || s == "-c" || s == "chat" { continue; }
+        args.push(a);
+    }
+    if let Some(id) = &resume { args.push("--resume".into()); args.push(id.into()); }
+    eprintln!("· restarting {} {}", exe.display(), args.iter().map(|a| a.to_string_lossy().to_string()).collect::<Vec<_>>().join(" "));
+    let mut cmd = std::process::Command::new(&exe);
+    cmd.args(&args).env_remove("HARNESS_SELF_EXEC").current_dir(&app.workdir);
+    #[cfg(unix)] { use std::os::unix::process::CommandExt; let err = cmd.exec(); anyhow::bail!("failed to re-exec {}: {err}", exe.display()) }
+    #[cfg(not(unix))] { let st = cmd.status().with_context(|| format!("failed to run {}", exe.display()))?; std::process::exit(st.code().unwrap_or(1)); }
 }
 
 // ───────────────────────── behaviour ─────────────────────────
@@ -1159,6 +1194,10 @@ impl App {
             }
             "/next" | "/skip" => self.next_task(),
             "/exit" | "/quit" | "/q" => self.quit = true,
+            "/restart" => {
+                if self.running.is_some() { self.set_status("finish or interrupt the current task first (esc)"); }
+                else { self.restart = true; self.quit = true; }
+            }
             _ => {
                 let name = cmd.trim_start_matches('/');
                 let found = harness::plugins::Plugins::open().ok().and_then(|p| p.commands().into_iter().find(|c| c.name == name));
@@ -1637,6 +1676,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ("/plugin", "plugins: list · install <owner/repo> · enable|disable|remove|update|info <name>"),
     ("/mcp", "show configured MCP servers and live MCP tools"),
     ("/reload", "restart tools, MCP servers and plugins"),
+    ("/restart", "restart the harness (re-exec the installed binary) and resume this session"),
     ("/permissions", "show or set permission mode: bypass|auto|ask|plan"),
     ("/plan", "toggle plan mode (read-only)"),
     ("/trust", "remember this directory as trusted (no first-time notice)"),

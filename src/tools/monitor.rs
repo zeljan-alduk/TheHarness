@@ -60,7 +60,7 @@ pub async fn start(inbox: Arc<Inbox>, cmd: &str, cwd: &std::path::Path, filter: 
             if !chunk.is_empty() || (exited && !partial.is_empty()) {
                 partial.push_str(&chunk);
                 let mut rest = String::new();
-                let mut it = partial.split_inclusive('\n').peekable();
+                let it = partial.split_inclusive('\n').peekable();
                 for l in it {
                     if !l.ends_with('\n') && !exited { rest = l.to_string(); break; }
                     let line = l.trim_end_matches(['\n', '\r']);
