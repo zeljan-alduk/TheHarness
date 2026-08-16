@@ -1719,7 +1719,7 @@ fn draw(f: &mut Frame, app: &mut App) {
         f.render_widget(Paragraph::new(divider), div);
         draw_panel(f, app, pa);
     }
-    let width = area.width as usize;
+    let width = (area.width as usize).saturating_sub(1).max(10); // 1 column reserved for the scrollbar
     // input geometry
     let input_lines = wrap_input(&app.input, width.saturating_sub(2).max(1));
     let sugg = suggestions(&app.input);
@@ -1730,7 +1730,7 @@ fn draw(f: &mut Frame, app: &mut App) {
                   Span::styled(format!("  {}", if q.options.is_empty() { String::new() } else { format!("[1-{}] choose · ", q.options.len()) }), Style::default().fg(pal().cyan)),
                   Span::styled(if q.allow_free_text { format!("type + enter: {buf}▏") } else { String::new() }, Style::default().fg(pal().fg)), Span::styled("  esc declines", Style::default().fg(pal().dim))])
     } else if let Some((req, _)) = &app.pending_ask {
-        Some(vec![Span::styled(" 🔒 ", Style::default().fg(Color::Black).bg(pal().orange)), Span::styled(format!(" {}({}) ", req.tool, truncate(&req.summary, width.saturating_sub(70))), Style::default().fg(Color::Black).bg(pal().orange).bold()),
+        Some(vec![Span::styled(" 🔒 ", Style::default().fg(Color::Black).bg(pal().orange)), Span::styled(format!(" {}({}) ", req.tool, truncate(&req.summary, 240)), Style::default().fg(Color::Black).bg(pal().orange).bold()),
                   Span::styled(format!("  {} · ", req.reason), Style::default().fg(pal().orange)),
                   Span::styled("[y] once  ", Style::default().fg(pal().ok).bold()), Span::styled(format!("[a] always ({})  ", req.suggested_rule), Style::default().fg(pal().cyan)), Span::styled("[p] always in this project  ", Style::default().fg(pal().cyan)), Span::styled("[n] deny", Style::default().fg(pal().err).bold())])
     } else if let Some((f, phase, _)) = &app.compact_progress {
@@ -1743,7 +1743,9 @@ fn draw(f: &mut Frame, app: &mut App) {
         Some(vec![Span::styled(format!("{sp} {}… ", WORDS[app.word]), Style::default().fg(pal().orange)),
                   Span::styled(format!("({el}s · {} tok/s · esc to interrupt{})", if live > 0.0 { format!("{live:.0}") } else { "–".into() }, if app.queued.is_empty() { String::new() } else { format!(" · {} queued", app.queued.len()) }), Style::default().fg(pal().dim))])
     } else if let Some((m, t)) = &app.status_msg { if t.elapsed() < Duration::from_secs(4) { Some(vec![Span::styled(format!("· {m}"), Style::default().fg(pal().orange))]) } else { None } } else { None };
-    let notice_h = if notice.is_some() { 1 } else { 0 };
+    // wrap the notice into up to 4 lines
+    let notice_lines: Vec<Line> = match &notice { Some(spans) => { let mut v = Vec::new(); push_wrapped(&mut v, spans.clone(), width.max(10), 4); v.truncate(4); v } None => vec![] };
+    let notice_h = notice_lines.len() as u16;
     let chunks = Layout::vertical([Constraint::Min(1), Constraint::Length(notice_h), Constraint::Length(1), Constraint::Length(input_h), Constraint::Length(1), Constraint::Length(1)]).split(area);
     let (tr_area, no_area, top_area, in_area, bot_area, st_area) = (chunks[0], chunks[1], chunks[2], chunks[3], chunks[4], chunks[5]);
 
@@ -1777,12 +1779,17 @@ fn draw(f: &mut Frame, app: &mut App) {
             if let Some((proto, _)) = app.images.get_mut(&p.slot.key) { f.render_stateful_widget(StatefulImage::default(), rect, proto); }
         }
     }
+    if total > h && tr_area.width > 2 {
+        use ratatui::widgets::{Scrollbar, ScrollbarOrientation, ScrollbarState};
+        let mut st = ScrollbarState::new(max_up).position(start);
+        f.render_stateful_widget(Scrollbar::new(ScrollbarOrientation::VerticalRight).begin_symbol(None).end_symbol(None).track_symbol(Some("│")).thumb_symbol("█").track_style(Style::default().fg(pal().panel_bg)).thumb_style(Style::default().fg(pal().dim)), tr_area, &mut st);
+    }
     if app.scroll_up > 0 {
         let tag = format!(" ↓ {} more lines ", app.scroll_up);
         let r = Rect { x: area.x + area.width.saturating_sub(tag.len() as u16 + 1), y: tr_area.bottom().saturating_sub(1), width: tag.len() as u16, height: 1 };
         f.render_widget(Paragraph::new(Span::styled(tag, Style::default().fg(Color::Black).bg(pal().orange))), r);
     }
-    if let Some(n) = notice { f.render_widget(Paragraph::new(Line::from(n)), no_area); }
+    if !notice_lines.is_empty() { f.render_widget(Paragraph::new(notice_lines), no_area); }
 
     // input box: rule / › text / rule
     let rule = Line::from(Span::styled("─".repeat(width), Style::default().fg(pal().dim)));
@@ -1910,7 +1917,7 @@ fn draw_panel(f: &mut Frame, app: &App, area: Rect) {
     // ── Thinking ──
     f.render_widget(Paragraph::new(title(&format!("{}{}", if running { "Thinking · live" } else { "Thinking · last" }, if app.think_scroll > 0 { " ↑" } else { "" }))), rows[0]);
     let think = app.blocks.iter().rev().find_map(|b| if let Block::Reasoning { text, .. } = b { Some(text.clone()) } else { None }).unwrap_or_default();
-    let tw = rows[1].width as usize;
+    let tw = (rows[1].width as usize).saturating_sub(1).max(10);
     let mut tl: Vec<Line> = Vec::new();
     for l in think.lines().filter(|l| !l.trim().is_empty()) { push_wrapped(&mut tl, vec![Span::styled(l.trim().to_string(), Style::default().fg(pal().think))], tw, 0); }
     let th = rows[1].height as usize;
@@ -1918,7 +1925,10 @@ fn draw_panel(f: &mut Frame, app: &App, area: Rect) {
     let up = app.think_scroll.min(max_up);
     let skip = max_up - up;
     let tail: Vec<Line> = tl.into_iter().skip(skip).take(th).collect();
-    if tail.is_empty() { f.render_widget(Paragraph::new(Span::styled("(reasoning will stream here)", dim)), rows[1]); } else { f.render_widget(Paragraph::new(tail), rows[1]); }
+    if tail.is_empty() { f.render_widget(Paragraph::new(Span::styled("(reasoning will stream here)", dim)), rows[1]); } else {
+        f.render_widget(Paragraph::new(tail), rows[1]);
+        if max_up > 0 { use ratatui::widgets::{Scrollbar, ScrollbarOrientation, ScrollbarState}; let mut st = ScrollbarState::new(max_up).position(skip); f.render_stateful_widget(Scrollbar::new(ScrollbarOrientation::VerticalRight).begin_symbol(None).end_symbol(None).track_symbol(Some("│")).thumb_symbol("█").track_style(Style::default().fg(pal().panel_bg)).thumb_style(Style::default().fg(pal().dim)), rows[1], &mut st); }
+    }
 
     // ── Tokens ──
     f.render_widget(Paragraph::new(title("Tokens")), r_tokens_t);
@@ -2060,11 +2070,12 @@ fn render_block(b: &Block, app: &App, width: usize, out: &mut Vec<Line<'static>>
                     continue;
                 }
                 if let Some((lang, state)) = &mut in_code {
+                    let lc = clean(l);
                     let mut spans = vec![bullet, Span::styled("  ", Style::default().bg(pal().panel_bg))];
-                    spans.extend(highlight_line(lang, l, state).into_iter().map(|sp| Span::styled(sp.content.to_string(), sp.style.bg(pal().panel_bg))));
-                    let used: usize = spans.iter().map(|sp| sp.content.chars().count()).sum();
-                    if used < w { spans.push(Span::styled(" ".repeat(w - used), Style::default().bg(pal().panel_bg))); }
-                    out.push(Line::from(spans));
+                    spans.extend(highlight_line(lang, &lc, state).into_iter().map(|sp| Span::styled(sp.content.to_string(), sp.style.bg(pal().panel_bg))));
+                    // wrap long code lines instead of overflowing
+                    let flat: Vec<Span<'static>> = spans; let mut tmp: Vec<Line<'static>> = Vec::new(); push_wrapped(&mut tmp, flat, w, 4);
+                    for mut line in tmp { let used: usize = line.spans.iter().map(|sp| sp.content.chars().count()).sum(); if used < w { line.spans.push(Span::styled(" ".repeat(w - used), Style::default().bg(pal().panel_bg))); } out.push(line); }
                     continue;
                 }
                 // light markdown: **bold**, `code`
@@ -2209,13 +2220,17 @@ fn args_summary(name: &str, args: &str, max: usize) -> String {
 }
 
 /// Wrap spans to `width`, continuation lines indented by `indent`. Char/width aware.
+/// Make text safe for cell-accurate rendering: tabs → 4 spaces, control chars dropped (they would desync width math and spill into neighbouring areas).
+fn clean(s: &str) -> String { let mut o = String::with_capacity(s.len()); for ch in s.chars() { match ch { '\t' => o.push_str("    "), c if c.is_control() => {}, c => o.push(c) } } o }
+
 fn push_wrapped(out: &mut Vec<Line<'static>>, spans: Vec<Span<'static>>, width: usize, indent: usize) {
     let mut cur: Vec<Span<'static>> = Vec::new();
     let mut col = 0usize;
     for sp in spans {
         let style = sp.style;
         let mut buf = String::new();
-        for ch in sp.content.chars() {
+        let content = clean(&sp.content);
+        for ch in content.chars() {
             let cw = UnicodeWidthChar::width(ch).unwrap_or(1);
             if col + cw > width {
                 if !buf.is_empty() { cur.push(Span::styled(std::mem::take(&mut buf), style)); }

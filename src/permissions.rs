@@ -71,7 +71,8 @@ const BENIGN: &[&str] = &["todo", "ask_user", "notify"];
 /// Tools whose primary argument is a shell command (RISKY-pattern checked in auto mode).
 const SHELL_TOOLS: &[&str] = &["bash", "monitor", "run_workflow"];
 
-pub struct Policy { pub cfg: PermissionsConfig, pub workdir: PathBuf, session_allow: std::sync::Mutex<Vec<String>>, mode: std::sync::Mutex<Mode> }
+pub struct Policy { pub cfg: PermissionsConfig, pub workdir: PathBuf, session_allow: std::sync::Mutex<Vec<String>>, mode: std::sync::Mutex<Mode>, /// parent policy (sub-agents): if the parent is in bypass, so are we
+    pub parent: Option<std::sync::Arc<Policy>> }
 
 impl Policy {
     pub fn new(cfg: PermissionsConfig, workdir: &Path) -> Self {
@@ -79,8 +80,11 @@ impl Policy {
         // project-scoped always-rules are merged in automatically
         let mut session = project_rules(workdir);
         session.retain(|r| !cfg.allow.contains(r));
-        Self { cfg, workdir: workdir.to_path_buf(), session_allow: std::sync::Mutex::new(session), mode: std::sync::Mutex::new(mode) }
+        Self { cfg, workdir: workdir.to_path_buf(), session_allow: std::sync::Mutex::new(session), mode: std::sync::Mutex::new(mode), parent: None }
     }
+    /// A child policy (sub-agent): its own mode, but the parent's live bypass/allow-rules always apply.
+    pub fn child_of(parent: std::sync::Arc<Policy>, cfg: PermissionsConfig, workdir: &Path) -> Self { let mut p = Self::new(cfg, workdir); p.parent = Some(parent); p }
+    fn effective_mode(&self) -> Mode { if let Some(p) = &self.parent { if p.mode() == Mode::Bypass { return Mode::Bypass; } } self.mode() }
     pub fn session_rules(&self) -> Vec<String> { self.session_allow.lock().unwrap().clone() }
     /// Current mode (live: `set_mode` takes effect for running sessions too).
     pub fn mode(&self) -> Mode { *self.mode.lock().unwrap() }
@@ -129,14 +133,15 @@ impl Policy {
         let arg = Self::primary_arg(tool, args);
         for r in &self.cfg.deny { if Self::rule_matches(r, tool, &arg) { return Decision::Deny(format!("denied by rule '{r}'")); } }
         for r in self.session_allow.lock().unwrap().iter().chain(self.cfg.allow.iter()) { if Self::rule_matches(r, tool, &arg) { return Decision::Allow; } }
+        if let Some(p) = &self.parent { for r in p.session_rules() { if Self::rule_matches(&r, tool, &arg) { return Decision::Allow; } } }
         for r in &self.cfg.ask { if Self::rule_matches(r, tool, &arg) { return Decision::Ask(format!("matches rule '{r}'")); } }
         // mutating iff the registry does not declare the tool read-only (benign UI tools excepted)
         let mutating = !read_only_tool && !BENIGN.contains(&tool);
-        match self.mode() {
+        match self.effective_mode() {
             Mode::Bypass => Decision::Allow,
             Mode::Plan => {
                 if read_only_tool || tool == "load_skill" || tool == "web_search" || tool == "web_fetch" { return Decision::Allow; }
-                if tool == "bash" { let a = arg.trim(); if PLAN_OK.iter().any(|ok| a.starts_with(ok)) && !a.contains('>') && !a.contains("&&") && !a.contains(';') { return Decision::Allow; } return Decision::Ask("plan mode: shell command that may modify state".into()); }
+                if tool == "bash" { if plan_safe_shell(&arg) { return Decision::Allow; } return Decision::Ask("plan mode: shell command that may modify state".into()); }
                 if tool == "memory" { return Decision::Allow; }
                 Decision::Deny("plan mode is read-only; switch with /permissions auto".into())
             }
@@ -149,6 +154,18 @@ impl Policy {
             }
         }
     }
+}
+
+/// Plan mode: a shell line is safe if every segment (split on ; && || |) starts with an inspection command,
+/// there is no output redirection, and no obviously mutating word.
+pub fn plan_safe_shell(cmd: &str) -> bool {
+    let a = cmd.trim();
+    if a.contains('>') || a.contains("<<") { return false; }
+    let lower = a.to_lowercase();
+    if ["rm ", "mv ", "cp ", "mkdir", "touch", "chmod", "chown", "git commit", "git push", "git checkout", "git reset", "git add", "git rm", "npm i", "npm install", "pip install", "cargo build", "cargo run", "cargo test", "make", "sed -i", "tee ", "install ", "curl ", "wget ", "python3 -c", "python -c", "node -e", "eval "].iter().any(|w| lower.contains(w)) { return false; }
+    let segments: Vec<&str> = a.split(|c| c == ';' || c == '|' || c == '&' || c == '\n').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
+    if segments.is_empty() { return false; }
+    segments.iter().all(|seg| { let seg = seg.trim_start_matches("cd ").trim(); PLAN_OK.iter().any(|ok| seg.starts_with(ok)) || seg.starts_with("cd ") || ["xargs", "cut ", "tr ", "head", "tail", "wc", "grep", "rg", "sort", "uniq", "awk", "sed -n", "cat", "less", "more", "basename", "dirname", "realpath", "test ", "[ ", "true", "false", "printf", "date", "whoami", "id", "uname", "sw_vers", "sysctl", "nproc", "column", "paste", "comm", "diff", "od", "xxd", "hexdump", "strings", "file", "stat", "ls", "find", "fd", "git ", "cargo metadata", "cargo tree", "cargo check", "python3 --version", "node --version", "which", "type ", "command -v", "env", "echo"].iter().any(|ok| seg.starts_with(ok)) })
 }
 
 /// Simple glob: `*` matches any sequence, `?` one char; case-sensitive.
@@ -213,6 +230,10 @@ mod tests {
         assert!(matches!(plan.check("write_file", &json!({"path":"a"}), false), Decision::Deny(_)));
         assert!(matches!(plan.check("bash", &json!({"cmd":"git status"}), false), Decision::Allow));
         assert!(matches!(plan.check("bash", &json!({"cmd":"touch x"}), false), Decision::Ask(_)));
+        assert!(matches!(plan.check("bash", &json!({"cmd":"ls -l /tmp | head -30; sed -n 5,10p a.rs"}), false), Decision::Allow));
+        assert!(matches!(plan.check("bash", &json!({"cmd":"ls > out.txt"}), false), Decision::Ask(_)));
+        let child = Policy::child_of(std::sync::Arc::new(pol(Mode::Bypass)), PermissionsConfig { mode: Mode::Plan, ..Default::default() }, Path::new("/tmp"));
+        assert!(matches!(child.check("write_file", &json!({"path":"a"}), false), Decision::Allow), "parent bypass wins");
         let by = pol(Mode::Bypass);
         assert!(matches!(by.check("bash", &json!({"cmd":"sudo rm -rf build"}), false), Decision::Allow));
     }

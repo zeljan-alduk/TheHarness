@@ -167,7 +167,7 @@ pub async fn run(wf: &Workflow, args: &str, wenv: &WorkflowEnv) -> Result<String
 async fn run_agent_step(wenv: &WorkflowEnv, sid: &str, label: &str, task: &str, step: &Step, check: Option<&str>) -> Result<String> {
     let env = &wenv.env;
     let mut pcfg = env.policy.cfg.clone(); if step.read_only { pcfg.mode = crate::permissions::Mode::Plan; }
-    let policy = crate::permissions::Policy::new(pcfg, &wenv.ctx.workdir);
+    let policy = crate::permissions::Policy::child_of(env.policy.clone(), pcfg, &wenv.ctx.workdir);
     let registry = env.registry.without("spawn_agent");
     let sink = crate::agent::PrefixSink { inner: wenv.sink.clone(), prefix: format!("wf {} ", crate::llm::truncate_for_log(label, 24)), info: None };
     let mut task_now = task.to_string();

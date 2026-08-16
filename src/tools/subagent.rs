@@ -41,7 +41,7 @@ impl Tool for SpawnAgent {
         let sub_ctx = ToolCtx { workdir: workdir.clone(), timeout: ctx.timeout, max_output: ctx.max_output, net: ctx.net.clone(), memory: ctx.memory.clone(), subagent: None, redact_secrets: ctx.redact_secrets, hooks: ctx.hooks.clone(), todos: ctx.todos.clone(), lsp_servers: ctx.lsp_servers.clone(), extra_roots: ctx.extra_roots.clone(), approver: ctx.approver.clone(), inbox: info.inbox.clone(), cancel: Some(info.cancel.clone()), cwd: None, session_id: ctx.session_id.clone() };
         let mut pcfg = env.policy.cfg.clone(); pcfg.mode = env.policy.mode();
         if read_only { pcfg.mode = crate::permissions::Mode::Plan; }
-        let policy = crate::permissions::Policy::new(pcfg, &workdir);
+        let policy = crate::permissions::Policy::child_of(env.policy.clone(), pcfg, &workdir);
         let sink = crate::agent::PrefixSink { inner: env.sink.clone(), prefix: format!("↳{label} "), info: Some(info.clone()) };
         let system = crate::agent::system_prompt_with_memory(&workdir.display().to_string(), &registry.names(), Some("You are a SUB-AGENT working on one delegated task. Do exactly the task, then reply with a concise, complete report of results (facts, file paths, what changed, what failed) — the parent agent only sees this report."), ctx.memory.as_ref());
         let finish = |status: &str| { *info.finished.lock().unwrap() = Some(std::time::Instant::now()); *info.status.lock().unwrap() = status.to_string(); if !ctx.hooks.subagent_stop.is_empty() { let h = ctx.hooks.clone(); let wd = ctx.workdir.clone(); let (l, st) = (info.label.clone(), status.to_string()); tokio::spawn(async move { let _ = crate::hooks::run_event(&h, "subagent_stop", &l, serde_json::json!({"label": l, "status": st}), &wd).await; }); } };
