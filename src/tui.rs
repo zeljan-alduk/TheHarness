@@ -631,7 +631,7 @@ impl App {
                 let extra = plugins.as_ref().map(|p| p.mcp_files()).unwrap_or_default();
                 let servers = harness::mcp::discover(&wd, &extra);
                 let mut lines = vec![format!("MCP servers configured: {}  (edit ~/.config/harness/mcp.json or <project>/.mcp.json, then /reload)", servers.len())];
-                for (n, c, f) in servers { lines.push(format!("  {:<18} {} {}   ← {}", n, c.command, c.args.join(" "), short_path(&f))); }
+                for (n, c, f) in servers { lines.push(format!("  {:<18} {} {}   ← {}", n, if c.command.is_empty() { c.url.clone().unwrap_or_default() } else { c.command.clone() }, c.args.join(" "), short_path(&f))); }
                 let live: Vec<String> = self.toolset.as_ref().map(|ts| ts.registry.names().into_iter().filter(|n| n.starts_with("mcp__")).map(String::from).collect()).unwrap_or_default();
                 lines.push(format!("live MCP tools: {}", live.len()));
                 for t in live.iter().take(40) { lines.push(format!("  {t}")); }

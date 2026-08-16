@@ -18,7 +18,14 @@ use tokio::sync::Mutex;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ServerConfig {
+    /// stdio transport: program to run (omit when `url` is set)
+    #[serde(default)]
     pub command: String,
+    /// streamable-HTTP transport: endpoint URL (e.g. http://localhost:3000/mcp)
+    #[serde(default)]
+    pub url: Option<String>,
+    #[serde(default)]
+    pub headers: HashMap<String, String>,
     #[serde(default)]
     pub args: Vec<String>,
     #[serde(default)]
@@ -56,17 +63,29 @@ pub fn discover(workdir: &Path, extra_files: &[PathBuf]) -> Vec<(String, ServerC
 #[derive(Debug, Clone)]
 pub struct McpToolInfo { pub name: String, pub description: String, pub input_schema: Value }
 
+enum Transport {
+    Stdio { child: Child, stdin: ChildStdin, reader: BufReader<ChildStdout> },
+    Http { http: reqwest::Client, url: String, headers: HashMap<String, String>, session: Option<String> },
+}
+
 pub struct McpServer {
     pub name: String,
-    child: Child,
-    stdin: ChildStdin,
-    reader: BufReader<ChildStdout>,
+    transport: Transport,
     next_id: u64,
     pub tools: Vec<McpToolInfo>,
 }
 
 impl McpServer {
     pub async fn spawn(name: &str, cfg: &ServerConfig, workdir: &Path) -> Result<Self> {
+        if let Some(url) = &cfg.url {
+            let http = reqwest::Client::builder().timeout(Duration::from_secs(120)).build()?;
+            let mut headers = cfg.headers.clone();
+            for v in headers.values_mut() { *v = expand_env(v); }
+            let mut s = Self { name: name.to_string(), transport: Transport::Http { http, url: url.clone(), headers, session: None }, next_id: 1, tools: vec![] };
+            s.handshake().await?;
+            return Ok(s);
+        }
+        if cfg.command.is_empty() { bail!("mcp '{name}': needs `command` (stdio) or `url` (http)"); }
         let mut c = Command::new(&cfg.command);
         c.args(&cfg.args).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).kill_on_drop(true);
         c.env("PATH", crate::setup::path_with_bin_dir(workdir));
@@ -75,48 +94,85 @@ impl McpServer {
         let mut child = c.spawn().with_context(|| format!("mcp '{name}': cannot start `{}` (is it installed? try `harness setup`)", cfg.command))?;
         let stdin = child.stdin.take().context("no stdin")?;
         let stdout = child.stdout.take().context("no stdout")?;
-        let mut s = Self { name: name.to_string(), child, stdin, reader: BufReader::new(stdout), next_id: 1, tools: vec![] };
-        let init = s.request("initialize", json!({"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "harness", "version": env!("CARGO_PKG_VERSION")}}), Duration::from_secs(30)).await
+        let mut s = Self { name: name.to_string(), transport: Transport::Stdio { child, stdin, reader: BufReader::new(stdout) }, next_id: 1, tools: vec![] };
+        s.handshake().await?;
+        Ok(s)
+    }
+
+    async fn handshake(&mut self) -> Result<()> {
+        let name = self.name.clone();
+        self.request("initialize", json!({"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "harness", "version": env!("CARGO_PKG_VERSION")}}), Duration::from_secs(30)).await
             .with_context(|| format!("mcp '{name}': initialize failed"))?;
-        let _ = init;
-        s.notify("notifications/initialized", json!({})).await?;
-        let list = s.request("tools/list", json!({}), Duration::from_secs(30)).await.with_context(|| format!("mcp '{name}': tools/list failed"))?;
+        self.notify("notifications/initialized", json!({})).await?;
+        let list = self.request("tools/list", json!({}), Duration::from_secs(30)).await.with_context(|| format!("mcp '{name}': tools/list failed"))?;
         for t in list["tools"].as_array().cloned().unwrap_or_default() {
-            s.tools.push(McpToolInfo {
+            self.tools.push(McpToolInfo {
                 name: t["name"].as_str().unwrap_or("").to_string(),
                 description: t["description"].as_str().unwrap_or("").to_string(),
                 input_schema: t.get("inputSchema").cloned().unwrap_or(json!({"type": "object", "properties": {}})),
             });
         }
-        Ok(s)
+        Ok(())
     }
 
     async fn notify(&mut self, method: &str, params: Value) -> Result<()> {
         let msg = json!({"jsonrpc": "2.0", "method": method, "params": params});
-        self.stdin.write_all(format!("{}\n", msg).as_bytes()).await?;
-        self.stdin.flush().await?;
+        match &mut self.transport {
+            Transport::Stdio { stdin, .. } => { stdin.write_all(format!("{}\n", msg).as_bytes()).await?; stdin.flush().await?; }
+            Transport::Http { http, url, headers, session } => {
+                let mut req = http.post(url.as_str()).header("Content-Type", "application/json").header("Accept", "application/json, text/event-stream").json(&msg);
+                for (k, v) in headers.iter() { req = req.header(k, v); }
+                if let Some(sid) = session.as_ref() { req = req.header("Mcp-Session-Id", sid.as_str()); }
+                let _ = req.send().await;
+            }
+        }
         Ok(())
     }
 
     async fn request(&mut self, method: &str, params: Value, timeout: Duration) -> Result<Value> {
         let id = self.next_id; self.next_id += 1;
         let msg = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
-        self.stdin.write_all(format!("{}\n", msg).as_bytes()).await?;
-        self.stdin.flush().await?;
-        let deadline = tokio::time::Instant::now() + timeout;
-        loop {
-            let mut line = String::new();
-            let n = tokio::time::timeout_at(deadline, self.reader.read_line(&mut line)).await.map_err(|_| anyhow::anyhow!("timeout waiting for {method}"))??;
-            if n == 0 { bail!("mcp server '{}' closed its stdout", self.name); }
-            let Ok(v) = serde_json::from_str::<Value>(line.trim()) else { continue }; // logs / non-JSON lines
-            if v.get("id").and_then(|i| i.as_u64()) == Some(id) {
-                if let Some(err) = v.get("error") { bail!("mcp error: {}", err); }
-                return Ok(v.get("result").cloned().unwrap_or(Value::Null));
+        let name = self.name.clone();
+        match &mut self.transport {
+            Transport::Stdio { stdin, reader, .. } => {
+                stdin.write_all(format!("{}\n", msg).as_bytes()).await?;
+                stdin.flush().await?;
+                let deadline = tokio::time::Instant::now() + timeout;
+                loop {
+                    let mut line = String::new();
+                    let n = tokio::time::timeout_at(deadline, reader.read_line(&mut line)).await.map_err(|_| anyhow::anyhow!("timeout waiting for {method}"))??;
+                    if n == 0 { bail!("mcp server '{}' closed its stdout", name); }
+                    let Ok(v) = serde_json::from_str::<Value>(line.trim()) else { continue }; // logs / non-JSON lines
+                    if v.get("id").and_then(|i| i.as_u64()) == Some(id) {
+                        if let Some(err) = v.get("error") { bail!("mcp error: {}", err); }
+                        return Ok(v.get("result").cloned().unwrap_or(Value::Null));
+                    }
+                    if v.get("method").is_some() && v.get("id").is_some() {
+                        let resp = json!({"jsonrpc": "2.0", "id": v["id"], "error": {"code": -32601, "message": "not supported by harness"}});
+                        let _ = stdin.write_all(format!("{}\n", resp).as_bytes()).await;
+                    }
+                }
             }
-            // server-initiated requests (e.g. roots/list, sampling) → respond with method-not-found
-            if v.get("method").is_some() && v.get("id").is_some() {
-                let resp = json!({"jsonrpc": "2.0", "id": v["id"], "error": {"code": -32601, "message": "not supported by harness"}});
-                let _ = self.stdin.write_all(format!("{}\n", resp).as_bytes()).await;
+            Transport::Http { http, url, headers, session } => {
+                let mut req = http.post(url.as_str()).header("Content-Type", "application/json").header("Accept", "application/json, text/event-stream").json(&msg).timeout(timeout);
+                for (k, v) in headers.iter() { req = req.header(k, v); }
+                if let Some(sid) = session.as_ref() { req = req.header("Mcp-Session-Id", sid.as_str()); }
+                let resp = req.send().await.with_context(|| format!("mcp '{name}': POST {url}"))?;
+                if let Some(sid) = resp.headers().get("mcp-session-id").and_then(|v| v.to_str().ok()) { *session = Some(sid.to_string()); }
+                let status = resp.status();
+                let ctype = resp.headers().get(reqwest::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
+                let body = resp.text().await?;
+                if !status.is_success() { bail!("mcp '{name}': HTTP {status}: {}", crate::llm::truncate_for_log(&body, 300)); }
+                let candidates: Vec<Value> = if ctype.contains("text/event-stream") {
+                    body.lines().filter_map(|l| l.strip_prefix("data:")).filter_map(|d| serde_json::from_str::<Value>(d.trim()).ok()).collect()
+                } else { serde_json::from_str::<Value>(&body).ok().into_iter().collect() };
+                for v in candidates {
+                    if v.get("id").and_then(|i| i.as_u64()) == Some(id) {
+                        if let Some(err) = v.get("error") { bail!("mcp error: {}", err); }
+                        return Ok(v.get("result").cloned().unwrap_or(Value::Null));
+                    }
+                }
+                bail!("mcp '{name}': no response for {method} (id {id}) in HTTP reply")
             }
         }
     }
@@ -138,7 +194,7 @@ impl McpServer {
         Ok((text.trim_end().to_string(), images))
     }
 
-    pub async fn shutdown(mut self) { let _ = self.child.kill().await; }
+    pub async fn shutdown(mut self) { if let Transport::Stdio { child, .. } = &mut self.transport { let _ = child.kill().await; } }
 }
 
 fn expand_env(s: &str) -> String {

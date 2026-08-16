@@ -194,7 +194,7 @@ async fn main() -> Result<()> {
             let extra = harness::plugins::Plugins::open().map(|p| p.mcp_files()).unwrap_or_default();
             let servers = harness::mcp::discover(&workdir, &extra);
             println!("configured servers: {}", servers.len());
-            for (n, c, f) in &servers { println!("  {:<18} {} {}   ← {}", n, c.command, c.args.join(" "), f.display()); }
+            for (n, c, f) in &servers { println!("  {:<18} {} {}   ← {}", n, if c.command.is_empty() { c.url.clone().unwrap_or_default() } else { c.command.clone() }, c.args.join(" "), f.display()); }
             let ts = tools::build_toolset(cfg.net.enabled, &workdir, true).await;
             for n in &ts.notes { println!("· {n}"); }
             for d in ts.registry.defs().into_iter().filter(|d| d.function.name.starts_with("mcp__")) { println!("  {:<40} {}", d.function.name, llm::truncate_for_log(&d.function.description, 90)); }
