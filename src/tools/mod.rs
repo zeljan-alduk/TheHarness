@@ -23,6 +23,7 @@ pub mod search;
 pub mod sessions;
 pub mod skill;
 pub mod subagent;
+pub mod terminal;
 pub mod todo;
 pub mod web;
 pub mod worktree;
@@ -50,6 +51,8 @@ pub struct ToolCtx {
     pub todos: std::sync::Arc<std::sync::Mutex<Vec<todo::TodoItem>>>,
     /// Language servers ([lsp] config; empty = built-in defaults).
     pub lsp_servers: std::collections::HashMap<String, crate::lsp::LspServerConfig>,
+    /// Formatter / post-edit diagnostics settings ([format]).
+    pub format: crate::format::FormatConfig,
     /// Additional directories file tools may access (/add-dir).
     pub extra_roots: Vec<PathBuf>,
     /// Who answers questions / approvals for the model (None = headless: ask_user gets no answer).
@@ -67,7 +70,7 @@ pub struct ToolCtx {
 impl ToolCtx {
     /// A context with defaults (no memory/sub-agents/hooks) — tests, `harness tool`, sub-processes.
     pub fn basic(workdir: PathBuf) -> Self {
-        Self { workdir, timeout: Duration::from_secs(120), max_output: 16000, net: crate::config::NetConfig::default(), memory: None, subagent: None, redact_secrets: true, hooks: Default::default(), todos: Default::default(), lsp_servers: Default::default(), extra_roots: vec![], approver: None, inbox: Default::default(), cancel: None, cwd: None, session_id: None }
+        Self { workdir, timeout: Duration::from_secs(120), max_output: 16000, net: crate::config::NetConfig::default(), memory: None, subagent: None, redact_secrets: true, hooks: Default::default(), todos: Default::default(), lsp_servers: Default::default(), format: Default::default(), extra_roots: vec![], approver: None, inbox: Default::default(), cancel: None, cwd: None, session_id: None }
     }
     /// The context tools actually run in: if the session entered a worktree, workdir is the worktree and
     /// the original tree stays reachable as an extra root.
@@ -154,6 +157,7 @@ impl Registry {
             Arc::new(archive::ExtractArchive),
             Arc::new(subagent::SpawnAgent),
             Arc::new(process::Process),
+            Arc::new(terminal::Terminal),
             Arc::new(todo::Todo),
             Arc::new(ask_user::AskUser),
             Arc::new(sessions::ListSessions),
@@ -226,6 +230,13 @@ impl Registry {
             Err(p) => { let msg = p.downcast_ref::<String>().cloned().or_else(|| p.downcast_ref::<&str>().map(|s| s.to_string())).unwrap_or_else(|| "unknown panic".into()); format!("error: tool panicked: {msg}").into() }
         };
         if ctx.redact_secrets { out.text = crate::security::redact(&out.text); }
+        // formatter + fresh diagnostics after a successful file edit (like an editor's format-on-save)
+        if matches!(name, "write_file" | "edit_file" | "apply_patch" | "notebook_edit") && !out.text.starts_with("error:") {
+            let base = ctx.effective();
+            if let Some(p) = crate::instructions::touched_path(name, &args_for_rules) {
+                if let Ok(abs) = base.resolve(&p) { if let Some(note) = crate::format::after_edit(&abs, &base).await { out.text.push_str(&note); } }
+            }
+        }
         // path-scoped rules / sub-directory instruction files, injected the first time a call touches a match
         if let Some(p) = crate::instructions::touched_path(name, &args_for_rules) {
             let base = ctx.effective();

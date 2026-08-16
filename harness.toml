@@ -68,6 +68,16 @@ allow = []   # e.g. "formatters, linters and test runners for this project"
 ask = []     # e.g. "anything that pushes to a remote or opens a PR"
 deny = []    # e.g. "uploading files anywhere"
 
+[format]
+# Format files after the agent edits them (like an editor's format-on-save) and report fresh
+# diagnostics from a language server that is already running for this project.
+enabled = true
+diagnostics_after_edit = true
+# Per-extension overrides; "" disables that extension. {file} is the edited file.
+# [format.commands]
+# rs = "rustfmt --edition 2021 {file}"
+# py = ""
+
 [hooks]
 # Shell hooks (JSON on stdin). Entries are commands or { command, matcher, timeout_secs } where matcher is a
 # glob / "a|b" on the tool name (tool events) or subject. pre_tool exit code 2 blocks the call. See src/hooks.rs.

@@ -48,6 +48,11 @@ static STARTING: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 fn uri_of(p: &Path) -> String { format!("file://{}", p.display()) }
 
 impl LspServer {
+    /// An already-running server for (language, root) — never starts one (post-edit diagnostics).
+    pub fn running(name: &str, root: &Path) -> Option<Arc<LspServer>> {
+        table().lock().ok()?.get(&format!("{name}@{}", root.display())).cloned()
+    }
+
     pub async fn get_or_start(name: &str, cfg: &LspServerConfig, root: &Path) -> Result<Arc<LspServer>> {
         let key = format!("{name}@{}", root.display());
         if let Some(s) = table().lock().unwrap().get(&key) { return Ok(s.clone()); }

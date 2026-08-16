@@ -10,6 +10,7 @@ pub mod claude_code;
 pub mod config;
 pub mod eval;
 pub mod events;
+pub mod format;
 pub mod headless;
 pub mod hooks;
 pub mod inbox;

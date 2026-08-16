@@ -39,6 +39,7 @@ sysinfo = "0.33"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }
 ratatui-image = "8.0.1"
 syntect = { version = "5", default-features = false, features = ["default-fancy"] }
+portable-pty = "0.9.0"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

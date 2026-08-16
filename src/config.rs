@@ -26,6 +26,8 @@ pub struct Config {
     pub lsp: LspConfig,
     #[serde(default)]
     pub checkpoints: crate::checkpoints::CheckpointsConfig,
+    #[serde(default)]
+    pub format: crate::format::FormatConfig,
     /// Smart self-improvement loop (`harness improve`, `/improve`).
     #[serde(default, rename = "self")]
     pub selfimprove: SelfConfig,
@@ -286,6 +288,8 @@ impl Config {
             "net.enabled" => self.net.enabled = b(val),
             "sandbox.mode" => self.sandbox.mode = if val == "none" { String::new() } else { val.into() },
             "checkpoints.enabled" => self.checkpoints.enabled = b(val),
+            "format.enabled" => self.format.enabled = b(val),
+            "format.diagnostics_after_edit" => self.format.diagnostics_after_edit = b(val),
             _ => anyhow::bail!("unknown setting {key}"),
         }
         Ok(())

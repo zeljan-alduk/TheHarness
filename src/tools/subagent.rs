@@ -55,7 +55,7 @@ impl Tool for SpawnAgent {
         let registry = match &def { Some(d) => env.registry.only(&d.filter_tools(&env.registry.names())).without("spawn_agent"), None => env.registry.without("spawn_agent") };
         let label = env.next_label();
         let info = env.register(format!("↳{label}"), task.clone());
-        let sub_ctx = ToolCtx { workdir: workdir.clone(), timeout: ctx.timeout, max_output: ctx.max_output, net: ctx.net.clone(), memory: ctx.memory.clone(), subagent: None, redact_secrets: ctx.redact_secrets, hooks: ctx.hooks.clone(), todos: ctx.todos.clone(), lsp_servers: ctx.lsp_servers.clone(), extra_roots: ctx.extra_roots.clone(), approver: ctx.approver.clone(), inbox: info.inbox.clone(), cancel: Some(info.cancel.clone()), cwd: None, session_id: ctx.session_id.clone() };
+        let sub_ctx = ToolCtx { workdir: workdir.clone(), timeout: ctx.timeout, max_output: ctx.max_output, net: ctx.net.clone(), memory: ctx.memory.clone(), subagent: None, redact_secrets: ctx.redact_secrets, hooks: ctx.hooks.clone(), todos: ctx.todos.clone(), lsp_servers: ctx.lsp_servers.clone(), format: ctx.format.clone(), extra_roots: ctx.extra_roots.clone(), approver: ctx.approver.clone(), inbox: info.inbox.clone(), cancel: Some(info.cancel.clone()), cwd: None, session_id: ctx.session_id.clone() };
         let mut pcfg = env.policy.cfg.clone(); pcfg.mode = env.policy.mode();
         if let Some(m) = def.as_ref().and_then(|d| d.permission_mode) { pcfg.mode = m; }
         if read_only { pcfg.mode = crate::permissions::Mode::Plan; }

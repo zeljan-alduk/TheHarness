@@ -101,7 +101,7 @@ const PLAN_OK: &[&str] = &["git status", "git log", "git diff", "git show", "git
 /// Tools that are not read-only per the registry but never touch files/state outside the harness itself.
 const BENIGN: &[&str] = &["todo", "ask_user", "notify"];
 /// Tools whose primary argument is a shell command (RISKY-pattern checked in auto mode).
-const SHELL_TOOLS: &[&str] = &["bash", "monitor", "run_workflow"];
+const SHELL_TOOLS: &[&str] = &["bash", "monitor", "run_workflow", "terminal"];
 
 pub struct Policy { pub cfg: PermissionsConfig, pub workdir: PathBuf, session_allow: std::sync::Mutex<Vec<String>>, mode: std::sync::Mutex<Mode>, /// parent policy (sub-agents): if the parent is in bypass, so are we
     pub parent: Option<std::sync::Arc<Policy>> }
@@ -136,6 +136,7 @@ impl Policy {
         let g = |k: &str| args.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
         match tool {
             "bash" | "monitor" => g("cmd"),
+            "terminal" => { let (a, c, i) = (g("action"), g("cmd"), g("input")); format!("{a} {c}{i}").trim().to_string() }
             "run_workflow" => format!("{} {}", g("name"), g("args")),
             "read_file" | "write_file" | "edit_file" | "list_dir" | "view_image" | "read_pdf" | "pdf_edit" | "extract_archive" | "apply_patch" => g("path"),
             "web_fetch" | "download_file" => g("url"),

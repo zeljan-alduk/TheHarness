@@ -64,6 +64,8 @@ const SETTINGS: &[(&str, &str, &[&str], &str)] = &[
     ("ui.event_log", "Event log", &["on", "off"], "~/.config/harness/logs/<date>/"),
     ("ui.font_size", "Font size (pt)", &["0", "11", "12", "13", "14", "15", "16", "18", "20"], "0 = leave the terminal alone · ctrl+= / ctrl+- / ctrl+0 (kitty, iTerm2, Terminal.app)"),
     ("sandbox.mode", "Sandbox", &["none", "seatbelt", "bwrap"], "confine shell writes (macOS seatbelt / Linux bubblewrap)"),
+    ("format.enabled", "Format after edits", &["on", "off"], "run the project formatter (rustfmt, ruff, prettier, gofmt…) on files the agent writes"),
+    ("format.diagnostics_after_edit", "Diagnostics after edits", &["on", "off"], "report language-server errors for the edited file (only when a server is already running)"),
     ("checkpoints.enabled", "File checkpoints", &["on", "off"], "snapshot the working tree before every change so /undo and /rewind can restore it"),
     ("llm.tool_shim", "Tool-call shim", &["auto", "on", "off"], "text <tool_call> protocol for servers/models without function calling (auto switches on demand)"),
     ("llm.provider", "Backend", &[], "change with /backend"),
@@ -1592,7 +1594,7 @@ impl App {
                 let _ = tx.send(Msg::Policy(policy.clone()));
                 let approver: Arc<dyn harness::permissions::Approver> = Arc::new(TuiApprover(tx.clone()));
                 let mut env_ = harness::agent::SubAgentEnv::new(client.clone(), registry.clone(), policy.clone(), approver.clone(), sink.clone(), budget, true); env_.cc_effort = cfg.llm.effort.clone(); let env = Arc::new(env_); let _ = tx.send(Msg::SubEnv(env.clone()));
-                let ctx = ToolCtx { workdir: workdir.clone(), timeout: Duration::from_secs(cfg.agent.tool_timeout_secs), max_output: cfg.agent.max_tool_output_chars, net: cfg.net.clone(), memory: store.clone(), subagent: Some(env), redact_secrets: cfg.security.redact_secrets, hooks: cfg.hooks.clone(), todos: todos.clone(), lsp_servers: cfg.lsp.servers.clone(), extra_roots: extra_roots.clone(), approver: Some(approver.clone()), inbox: inbox.clone(), cancel: None, cwd: Some(cwd.clone()), session_id: Some(session_id.clone()) };
+                let ctx = ToolCtx { workdir: workdir.clone(), timeout: Duration::from_secs(cfg.agent.tool_timeout_secs), max_output: cfg.agent.max_tool_output_chars, net: cfg.net.clone(), memory: store.clone(), subagent: Some(env), redact_secrets: cfg.security.redact_secrets, hooks: cfg.hooks.clone(), todos: todos.clone(), lsp_servers: cfg.lsp.servers.clone(), format: cfg.format.clone(), extra_roots: extra_roots.clone(), approver: Some(approver.clone()), inbox: inbox.clone(), cancel: None, cwd: Some(cwd.clone()), session_id: Some(session_id.clone()) };
                 let agent = Agent { client: &client, registry, ctx: &ctx, max_turns: cfg.agent.max_turns, context_budget: budget, sink: sink.as_ref(), stream: true, policy: &policy, approver: approver.as_ref() };
                 let extra = format!("You are in an interactive session: the user can see everything and will reply; keep final answers concise.{extra_prompt}");
                 let system = harness::agent::system_prompt_with_memory(&workdir.display().to_string(), &registry.names(), Some(&extra), store.as_ref());

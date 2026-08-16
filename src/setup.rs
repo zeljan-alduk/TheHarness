@@ -57,6 +57,16 @@ pub fn which(bin: &str) -> Option<PathBuf> {
     dirs.into_iter().flat_map(|d| exts.iter().map(move |e| d.join(format!("{bin}{e}")))).find(|p| p.is_file())
 }
 
+/// `which`, but also honouring the harness bin dir and the project's own `node_modules/.bin`
+/// (that is where prettier/biome/eslint live in a JS project).
+pub fn which_in(bin: &str, workdir: &Path) -> Option<PathBuf> {
+    let local = workdir.join("node_modules").join(".bin").join(bin);
+    if local.is_file() { return Some(local); }
+    let hb = bin_dir().join(bin);
+    if hb.is_file() { return Some(hb); }
+    which(bin)
+}
+
 pub fn check() -> Vec<Status> {
     TOOLS.iter().map(|t| {
         let mut found = Vec::new(); let mut missing = Vec::new();
