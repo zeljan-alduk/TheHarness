@@ -175,6 +175,24 @@ enum Cmd {
     },
     /// List saved sessions
     Sessions,
+    /// Import Claude Code / Codex transcripts into the session store (then `harness --resume <id>`)
+    Import {
+        /// A .jsonl transcript, a directory of them, or nothing to scan ~/.claude and ~/.codex
+        path: Option<PathBuf>,
+        /// How many of the newest transcripts to import when scanning (default 10)
+        #[arg(long, default_value_t = 10)]
+        limit: usize,
+        /// Only this source when scanning: claude | codex
+        #[arg(long)]
+        source: Option<String>,
+    },
+    /// Export a session to markdown or a self-contained HTML page
+    Export {
+        /// Session id (default: the most recent one)
+        id: Option<String>,
+        #[arg(long)]
+        html: bool,
+    },
     /// (internal) stdio↔socket proxy used to expose harness tools to Claude Code
     #[command(name = "mcp-proxy", hide = true)]
     McpProxy { addr: String },
@@ -329,6 +347,33 @@ async fn main() -> Result<()> {
                 CheckpointCmd::Restore { which } => { let (c, n) = cp.restore(&which)?; println!("restored '{}' ({n} file(s) changed)", c.label); }
                 CheckpointCmd::Diff { which } => println!("{}", cp.diff(&which)?),
             }
+        }
+        Cmd::Import { path, limit, source } => {
+            let files: Vec<PathBuf> = match path {
+                Some(p) if p.is_file() => vec![p],
+                Some(p) if p.is_dir() => { let mut v: Vec<PathBuf> = walkdir_jsonl(&p); v.truncate(limit); v }
+                Some(p) => bail!("no such file or directory: {}", p.display()),
+                None => {
+                    let sources: Vec<&str> = match source.as_deref() { Some("claude") => vec!["claude"], Some("codex") => vec!["codex"], Some(o) => bail!("--source must be claude or codex (got {o})"), None => vec!["claude", "codex"] };
+                    let mut v = harness::import::discover(&sources); v.truncate(limit); v
+                }
+            };
+            if files.is_empty() { println!("no transcripts found (looked in {} and {})", harness::import::claude_root().display(), harness::import::codex_root().display()); return Ok(()); }
+            let (mut ok, mut failed) = (0, 0);
+            for f in files {
+                match harness::import::import_file(&f) {
+                    Ok(i) => { ok += 1; println!("{:<8} {:<26} {:>4} msgs  {:<40} {}", i.source, i.id, i.messages, llm::truncate_for_log(&i.title, 40), i.workdir); }
+                    Err(e) => { failed += 1; eprintln!("skip {}: {e:#}", f.display()); }
+                }
+            }
+            println!("\nimported {ok} session(s){} — resume one with: harness --resume <id>", if failed > 0 { format!(", {failed} skipped") } else { String::new() });
+        }
+        Cmd::Export { id, html } => {
+            let store = harness::sessions::SessionStore::open()?;
+            let id = match id { Some(i) => i, None => store.list(None).first().map(|m| m.id.clone()).context("no saved sessions")? };
+            let (meta, msgs) = store.load(&id)?;
+            let path = harness::export::write(&meta, &msgs, html)?;
+            println!("{}", path.display());
         }
         Cmd::Tool { dir, session, name, args } => {
             let workdir = dir.unwrap_or(std::env::current_dir()?).canonicalize().context("workdir does not exist")?;
@@ -520,6 +565,23 @@ fn reexec_from_temp_copy() -> Result<()> {
     cmd.args(std::env::args_os().skip(1)).env("HARNESS_SELF_EXEC", "1").env("HARNESS_ORIG_EXE", &exe);
     #[cfg(unix)] { let err = cmd.exec(); bail!("failed to re-exec {}: {err}", tmp.display()) }
     #[cfg(not(unix))] { let st = cmd.status().with_context(|| format!("failed to run {}", tmp.display()))?; std::process::exit(st.code().unwrap_or(1)); }
+}
+
+/// Every .jsonl under a directory, newest first.
+fn walkdir_jsonl(root: &std::path::Path) -> Vec<PathBuf> {
+    let mut v: Vec<(std::time::SystemTime, PathBuf)> = Vec::new();
+    fn rec(dir: &std::path::Path, depth: usize, out: &mut Vec<(std::time::SystemTime, PathBuf)>) {
+        if depth > 5 { return; }
+        let Ok(rd) = std::fs::read_dir(dir) else { return };
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.is_dir() { rec(&p, depth + 1, out); }
+            else if p.extension().map(|x| x == "jsonl").unwrap_or(false) { out.push((e.metadata().and_then(|m| m.modified()).unwrap_or(std::time::UNIX_EPOCH), p)); }
+        }
+    }
+    rec(root, 0, &mut v);
+    v.sort_by(|a, b| b.0.cmp(&a.0));
+    v.into_iter().map(|(_, p)| p).collect()
 }
 
 fn repo_root() -> Result<PathBuf> {

@@ -1288,16 +1288,54 @@ impl App {
                 match p.canonicalize() { Ok(p) if p.is_dir() => { self.extra_roots.push(p.clone()); self.blocks.push(Block::System(format!("added {} — file tools may now read/write there (this session)", short_path(&p)))); } _ => self.blocks.push(Block::Error(format!("usage: /add-dir <existing directory>  ({arg})"))) }
             }
             "/rename" => { if arg.is_empty() { self.blocks.push(Block::Error("usage: /rename <title>".into())); } else { self.session_meta.title = arg.clone(); self.save_session(); self.blocks.push(Block::System(format!("session renamed: {arg}"))); } }
-            "/export" => {
-                let session = self.session.clone(); let tx = self.tx.clone(); let name = if arg.is_empty() { format!("session-{}.md", if self.session_meta.id.is_empty() { "unsaved".into() } else { self.session_meta.id.clone() }) } else { arg.clone() };
-                let out = harness::setup::config_dir().join("exports").join(&name);
+            "/export" | "/share" => {
+                let as_html = cmd == "/share" || arg.contains("html");
+                let gist = arg.contains("gist");
+                let session = self.session.clone(); let tx = self.tx.clone();
+                let mut meta = self.session_meta.clone();
+                meta.workdir = self.workdir.display().to_string(); meta.model = self.model.clone();
                 tokio::spawn(async move {
                     let msgs = session.lock().await.clone();
-                    let mut md = String::from("# Harness session export\n\n");
-                    for m in msgs.iter().skip(1) { match m.role.as_str() { "user" => md.push_str(&format!("## User\n\n{}\n\n", m.text())), "assistant" => { let t = m.text(); if !t.trim().is_empty() { md.push_str(&format!("## Assistant\n\n{}\n\n", t)); } if let Some(c) = &m.tool_calls { for c in c { md.push_str(&format!("**tool** `{}` `{}`\n\n", c.function.name, truncate(&c.function.arguments, 300))); } } } "tool" => md.push_str(&format!("```\n{}\n```\n\n", truncate(&m.text(), 1500))), _ => {} } }
-                    let _ = std::fs::create_dir_all(out.parent().unwrap());
-                    let r = std::fs::write(&out, md).map(|_| out.display().to_string()).map_err(|e| e.to_string());
-                    let _ = tx.send(Msg::Notice(match r { Ok(p) => format!("exported to {p}"), Err(e) => format!("export failed: {e}") }));
+                    meta.turns = msgs.iter().filter(|m| m.role == "user").count();
+                    let r = harness::export::write(&meta, &msgs, as_html);
+                    let msg = match r {
+                        Err(e) => format!("export failed: {e}"),
+                        Ok(path) => {
+                            let mut m = format!("exported to {}", path.display());
+                            if gist {
+                                let o = tokio::process::Command::new("gh").args(["gist", "create", "--desc", "harness session"]).arg(&path).output().await;
+                                match o {
+                                    Ok(o) if o.status.success() => m.push_str(&format!(" · gist: {}", String::from_utf8_lossy(&o.stdout).trim())),
+                                    Ok(o) => m.push_str(&format!(" · gh gist failed: {}", String::from_utf8_lossy(&o.stderr).trim())),
+                                    Err(e) => m.push_str(&format!(" · gh not available ({e})")),
+                                }
+                            } else if as_html {
+                                m.push_str(" — open it in a browser, or /share gist to upload it with gh");
+                            }
+                            m
+                        }
+                    };
+                    let _ = tx.send(Msg::Notice(msg));
+                });
+            }
+            "/import" => {
+                let arg2 = arg.clone(); let tx = self.tx.clone();
+                tokio::spawn(async move {
+                    let files = tokio::task::spawn_blocking(move || {
+                        let p = std::path::PathBuf::from(&arg2);
+                        if !arg2.is_empty() && p.is_file() { return vec![p]; }
+                        let sources: Vec<&str> = match arg2.trim() { "claude" => vec!["claude"], "codex" => vec!["codex"], _ => vec!["claude", "codex"] };
+                        let mut v = harness::import::discover(&sources); v.truncate(10); v
+                    }).await.unwrap_or_default();
+                    if files.is_empty() { let _ = tx.send(Msg::Notice("no Claude Code / Codex transcripts found".into())); return; }
+                    let mut lines = vec![format!("Imported sessions (newest {}): resume one with /resume <id>", files.len())];
+                    for f in files {
+                        match harness::import::import_file(&f) {
+                            Ok(i) => lines.push(format!("  {:<7} {:<24} {:>4} msgs  {}", i.source, i.id, i.messages, truncate(&i.title, 60))),
+                            Err(e) => lines.push(format!("  skip {}: {e:#}", f.display())),
+                        }
+                    }
+                    let _ = tx.send(Msg::Block(Block::Banner(lines)));
                 });
             }
             "/todos" => { let t = self.todos.lock().map(|t| t.clone()).unwrap_or_default(); if t.is_empty() { self.blocks.push(Block::System("no todos (the agent maintains them with the todo tool)".into())); } else { self.blocks.push(Block::Banner(std::iter::once("Todos".to_string()).chain(t.iter().map(|x| format!("  {}", x.line(&t)))).collect())); } }
@@ -2128,7 +2166,9 @@ const COMMANDS: &[(&str, &str)] = &[
     ("/init", "have the agent write HARNESS.md project instructions"),
     ("/add-dir", "allow file tools to access another directory this session"),
     ("/rename", "rename the current session"),
-    ("/export", "export the transcript to markdown (~/.config/harness/exports)"),
+    ("/export", "export the transcript to markdown (/export html for a page)"),
+    ("/share", "export a self-contained HTML page of this session (/share gist uploads it with gh)"),
+    ("/import", "import Claude Code / Codex transcripts into the session store (/import claude|codex|<file>)"),
     ("/todos", "show the agent's todo list"),
     ("/hooks", "show configured hooks"),
     ("/skills", "list installed skills"),
