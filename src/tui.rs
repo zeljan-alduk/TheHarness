@@ -123,7 +123,44 @@ fn pal() -> Pal {
 const SPINNER: [&str; 10] = ["✻", "✼", "✽", "✾", "✿", "❀", "✿", "✾", "✽", "✼"];
 const WORDS: [&str; 12] = ["Thinking", "Pondering", "Working", "Reasoning", "Cooking", "Tinkering", "Brewing", "Mulling", "Crunching", "Percolating", "Noodling", "Computing"];
 
-enum Msg { Toast(String), Title(String), Question(harness::permissions::Question, tokio::sync::oneshot::Sender<harness::permissions::Answer>), SubEnv(Arc<harness::agent::SubAgentEnv>), Policy(Arc<harness::permissions::Policy>), CcSession(Arc<harness::claude_code::ClaudeCodeSession>), CcSid(String), Block(Block), Ask(harness::permissions::ApprovalRequest, tokio::sync::oneshot::Sender<harness::permissions::Approval>), Ev(Event), Done(Result<(String, harness::agent::RunStats), String>), Sys(SysSample), CtxLen(u64), Pasted(Result<PathBuf, String>), Frames(Result<(PathBuf, f64, Vec<(f64, PathBuf)>), String>), Toolset(Arc<Toolset>), Catalog(Result<harness::plugins::Catalog, String>), Notice(String), Improve(harness::selfimprove::Stage), GoalCheck(bool, String) }
+enum Msg { Toast(String), Title(String), Question(harness::permissions::Question, tokio::sync::oneshot::Sender<harness::permissions::Answer>), SubEnv(Arc<harness::agent::SubAgentEnv>), Policy(Arc<harness::permissions::Policy>), CcSession(Arc<harness::claude_code::ClaudeCodeSession>), CcSid(String), Block(Block), Ask(harness::permissions::ApprovalRequest, tokio::sync::oneshot::Sender<harness::permissions::Approval>), Ev(Event), Done(Result<(String, harness::agent::RunStats), String>), Sys(SysSample), CtxLen(u64), Pasted(Result<PathBuf, String>), Frames(Result<(PathBuf, f64, Vec<(f64, PathBuf)>), String>), Toolset(Arc<Toolset>), Catalog(Result<harness::plugins::Catalog, String>), Notice(String), Improve(harness::selfimprove::Stage), GoalCheck(bool, String), Review(String) }
+
+/// One hunk of the working-tree diff, as `/review-diff` shows it.
+#[derive(Clone, Debug)]
+struct Hunk { file: String, header: String, body: Vec<String>, plus: usize, minus: usize, reverted: bool, comment: Option<String> }
+
+impl Hunk {
+    /// A standalone patch for this hunk alone (what `git apply -R` needs to revert it).
+    fn patch(&self) -> String {
+        format!("--- a/{}\n+++ b/{}\n{}\n{}\n", self.file, self.file, self.header, self.body.join("\n"))
+    }
+}
+
+/// Split `git diff` output into per-file hunks.
+fn parse_hunks(diff: &str) -> Vec<Hunk> {
+    let mut out: Vec<Hunk> = Vec::new();
+    let mut file = String::new();
+    let mut cur: Option<Hunk> = None;
+    for line in diff.lines() {
+        if let Some(rest) = line.strip_prefix("+++ b/") { file = rest.trim().to_string(); continue; }
+        if line.starts_with("diff --git ") { if let Some(f) = line.split(" b/").nth(1) { file = f.trim().to_string(); } continue; }
+        if line.starts_with("@@") {
+            if let Some(h) = cur.take() { out.push(h); }
+            cur = Some(Hunk { file: file.clone(), header: line.to_string(), body: vec![], plus: 0, minus: 0, reverted: false, comment: None });
+            continue;
+        }
+        if let Some(h) = cur.as_mut() {
+            if line.starts_with("+++") || line.starts_with("---") || line.starts_with("index ") || line.starts_with("new file") || line.starts_with("deleted file") || line.starts_with("similarity ") { continue; }
+            if line.starts_with('+') { h.plus += 1; } else if line.starts_with('-') { h.minus += 1; }
+            h.body.push(line.to_string());
+        }
+    }
+    if let Some(h) = cur.take() { out.push(h); }
+    out
+}
+
+/// `/review-diff` modal state.
+struct DiffReview { hunks: Vec<Hunk>, cursor: usize, scroll: usize, comment: Option<String> }
 
 /// Video scrubber state (modal over the transcript).
 struct VideoPicker { path: PathBuf, duration: f64, frames: Vec<(f64, PathBuf, String)>, cur: usize, selected: std::collections::BTreeSet<usize>, loading: bool, error: Option<String> }
@@ -411,6 +448,12 @@ struct App {
     /// `/goal`: keep working until an aux-model checker says this condition is met.
     goal: Option<String>,
     goal_rounds: usize,
+    /// ctrl+r reverse history search: (query, saved input, match index).
+    hist_search: Option<(String, String, usize)>,
+    /// ctrl+g: the main loop suspends the TUI and opens $EDITOR on the prompt.
+    edit_external: bool,
+    /// `/review-diff`: per-hunk accept/revert/comment over the working tree.
+    review: Option<DiffReview>,
     expand_tools: bool,
     show_thinking: bool,
     session: Arc<tokio::sync::Mutex<Vec<Message>>>,
@@ -485,7 +528,7 @@ pub async fn run(cfg: Config, resume: Option<String>) -> Result<()> {
     let mut app = App {
         model: cfg.llm.model.clone(), net: cfg.net.enabled, cfg, workdir,
         blocks: vec![], input: String::new(), cursor: 0, history: vec![], hist_idx: None, hist_draft: String::new(),
-        scroll_up: 0, running: None, run_started: Instant::now(), queued: vec![], goal: None, goal_rounds: 0, expand_tools: false, show_thinking: false,
+        scroll_up: 0, running: None, run_started: Instant::now(), queued: vec![], goal: None, goal_rounds: 0, hist_search: None, edit_external: false, review: None, expand_tools: false, show_thinking: false,
         session: Arc::new(tokio::sync::Mutex::new(Vec::new())), tx: tx.clone(),
         total_prompt: 0, total_completion: 0, last_prompt_tokens: 0, turn_tokens: 0, last_ctrl_c: None, status_msg: None,
         quit: false, restart: false, improve: None, improve_cancel: Default::default(), restart_at: None, tick: 0, word: 0, models: vec![],
@@ -545,6 +588,20 @@ pub async fn run(cfg: Config, resume: Option<String>) -> Result<()> {
                 }
                 Some(msg) = rx.recv() => { app.on_msg(msg); while let Ok(m) = rx.try_recv() { app.on_msg(m); } }
                 Some(ev) = events.next() => { match ev { Ok(ev) => app.on_term(ev), Err(e) => { app.blocks.push(Block::Error(format!("terminal: {e}"))); } } }
+            }
+            // ctrl+g: suspend the UI, edit the prompt in $EDITOR, come back
+            if app.edit_external {
+                app.edit_external = false;
+                let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableMouseCapture, crossterm::event::DisableBracketedPaste);
+                ratatui::restore();
+                let edited = tokio::task::block_in_place(|| external_edit(&app.input));
+                terminal = ratatui::init();
+                let _ = crossterm::execute!(std::io::stdout(), crossterm::event::EnableBracketedPaste, crossterm::event::EnableMouseCapture);
+                let _ = terminal.clear();
+                match edited {
+                    Ok(t) => { app.input = t; app.cursor = app.input.chars().count(); app.set_status("prompt edited in $EDITOR"); }
+                    Err(e) => app.set_status(format!("editor: {e:#}")),
+                }
             }
             if app.quit { break; }
         }
@@ -795,6 +852,40 @@ impl App {
                     _ => {}
                 }
             }
+            CEvent::Key(k) if k.kind == KeyEventKind::Press && self.review.is_some() => {
+                let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+                let n = self.review.as_ref().map(|r| r.hunks.len()).unwrap_or(0);
+                // typing a comment for the current hunk
+                if self.review.as_ref().map(|r| r.comment.is_some()).unwrap_or(false) {
+                    let mut done: Option<String> = None;
+                    if let Some(r) = &mut self.review {
+                        match k.code {
+                            KeyCode::Esc => { r.comment = None; }
+                            KeyCode::Enter => { done = r.comment.take(); }
+                            KeyCode::Backspace => { if let Some(c) = &mut r.comment { c.pop(); } }
+                            KeyCode::Char(c) if !ctrl => { if let Some(b) = &mut r.comment { b.push(c); } }
+                            _ => {}
+                        }
+                    }
+                    if let Some(text) = done {
+                        if let Some(r) = &mut self.review { let i = r.cursor; if !text.trim().is_empty() { r.hunks[i].comment = Some(text.trim().to_string()); } }
+                        self.set_status("comment saved — q sends the review to the agent");
+                    }
+                    return;
+                }
+                match k.code {
+                    KeyCode::Esc | KeyCode::Char('q') => self.close_review(k.code == KeyCode::Char('q')),
+                    KeyCode::Char('c') if ctrl => self.close_review(false),
+                    KeyCode::Up | KeyCode::Char('k') => { if let Some(r) = &mut self.review { r.cursor = r.cursor.saturating_sub(1); r.scroll = 0; } }
+                    KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => { if let Some(r) = &mut self.review { if n > 0 { r.cursor = (r.cursor + 1).min(n - 1); r.scroll = 0; } } }
+                    KeyCode::PageDown => { if let Some(r) = &mut self.review { r.scroll += 10; } }
+                    KeyCode::PageUp => { if let Some(r) = &mut self.review { r.scroll = r.scroll.saturating_sub(10); } }
+                    KeyCode::Char('a') => { if let Some(r) = &mut self.review { if n > 0 { let i = r.cursor; r.hunks[i].reverted = false; r.cursor = (i + 1).min(n - 1); } } }
+                    KeyCode::Char('r') => self.revert_hunk(),
+                    KeyCode::Char('m') => { if let Some(r) = &mut self.review { r.comment = Some(String::new()); } }
+                    _ => {}
+                }
+            }
             CEvent::Key(k) if k.kind == KeyEventKind::Press => {
                 let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
                 let alt = k.modifiers.contains(KeyModifiers::ALT);
@@ -843,7 +934,21 @@ impl App {
                     }
                     return;
                 }
+                // ctrl+r: reverse history search (a mode of its own — keys mean different things)
+                if self.hist_search.is_some() {
+                    match (k.code, ctrl) {
+                        (KeyCode::Esc, _) | (KeyCode::Char('c'), true) => { if let Some((_, saved, _)) = self.hist_search.take() { self.input = saved; self.cursor = self.input.chars().count(); } self.set_status(""); }
+                        (KeyCode::Enter, _) => { self.hist_search = None; self.set_status(""); }
+                        (KeyCode::Char('r'), true) => { if let Some((_, _, n)) = &mut self.hist_search { *n += 1; } self.apply_hist_search(); }
+                        (KeyCode::Backspace, _) => { if let Some((q, _, n)) = &mut self.hist_search { q.pop(); *n = 0; } self.apply_hist_search(); }
+                        (KeyCode::Char(c), false) => { if let Some((q, _, n)) = &mut self.hist_search { q.push(c); *n = 0; } self.apply_hist_search(); }
+                        _ => {}
+                    }
+                    return;
+                }
                 match (k.code, ctrl, alt) {
+                    (KeyCode::Char('r'), true, _) => { self.hist_search = Some((String::new(), self.input.clone(), 0)); self.apply_hist_search(); }
+                    (KeyCode::Char('g'), true, _) => { self.edit_external = true; }
                     (KeyCode::Char('c'), true, _) => {
                         if self.running.is_some() { self.interrupt(); }
                         else if !self.input.is_empty() { self.input.clear(); self.cursor = 0; }
@@ -888,10 +993,118 @@ impl App {
         else { self.hist_idx = Some(i + 1); self.input = self.history[i + 1].clone(); }
         self.cursor = self.input.chars().count();
     }
+    /// Open the hunk-by-hunk review over a `git diff` blob.
+    fn open_review(&mut self, diff: String) {
+        let hunks = parse_hunks(&diff);
+        if hunks.is_empty() { self.blocks.push(Block::System("nothing to review — the working tree matches HEAD".into())); return; }
+        self.set_status("");
+        self.review = Some(DiffReview { hunks, cursor: 0, scroll: 0, comment: None });
+    }
+
+    /// `r`: revert the selected hunk on disk with `git apply -R`.
+    fn revert_hunk(&mut self) {
+        let Some(r) = &mut self.review else { return };
+        if r.hunks.is_empty() { return; }
+        let i = r.cursor;
+        if r.hunks[i].reverted { self.set_status("already reverted"); return; }
+        let patch = r.hunks[i].patch();
+        let file = r.hunks[i].file.clone();
+        let path = std::env::temp_dir().join(format!("harness-hunk-{}.patch", std::process::id()));
+        if let Err(e) = std::fs::write(&path, &patch) { self.set_status(format!("cannot write the patch: {e}")); return; }
+        let out = std::process::Command::new("git").arg("-C").arg(&self.workdir).args(["apply", "-R", "--recount", "--unidiff-zero"]).arg(&path).output();
+        let _ = std::fs::remove_file(&path);
+        match out {
+            Ok(o) if o.status.success() => {
+                if let Some(r) = &mut self.review { r.hunks[i].reverted = true; let n = r.hunks.len(); r.cursor = (i + 1).min(n - 1); }
+                self.set_status(format!("reverted a hunk in {file}"));
+            }
+            Ok(o) => self.set_status(format!("git apply -R failed: {}", truncate(String::from_utf8_lossy(&o.stderr).trim(), 160))),
+            Err(e) => self.set_status(format!("git apply -R: {e}")),
+        }
+    }
+
+    /// Close the review; with `send`, hand the comments and reverts to the agent as a new turn.
+    fn close_review(&mut self, send: bool) {
+        let Some(r) = self.review.take() else { return };
+        let comments: Vec<&Hunk> = r.hunks.iter().filter(|h| h.comment.is_some()).collect();
+        let reverted: Vec<&Hunk> = r.hunks.iter().filter(|h| h.reverted).collect();
+        if reverted.is_empty() && comments.is_empty() { self.set_status("review closed — nothing changed"); return; }
+        let mut lines = vec![format!("review: {} hunk(s) reverted, {} comment(s)", reverted.len(), comments.len())];
+        for h in &reverted { lines.push(format!("  reverted {} {}", h.file, h.header)); }
+        for h in &comments { lines.push(format!("  {} {} — {}", h.file, h.header, h.comment.clone().unwrap_or_default())); }
+        self.blocks.push(Block::Banner(lines));
+        if !send || comments.is_empty() {
+            if !comments.is_empty() { self.set_status("comments kept in the transcript (q sends them to the agent)"); }
+            return;
+        }
+        let mut prompt = String::from("I reviewed your changes hunk by hunk. Address these comments (and do not undo my reverts):\n");
+        for h in &comments {
+            prompt.push_str(&format!("\n## {} {}\n{}\ncomment: {}\n", h.file, h.header, h.body.iter().take(40).cloned().collect::<Vec<_>>().join("\n"), h.comment.clone().unwrap_or_default()));
+        }
+        if !reverted.is_empty() {
+            prompt.push_str("\nHunks I reverted on disk (they are gone; do not reapply them unless I ask):\n");
+            for h in &reverted { prompt.push_str(&format!("- {} {}\n", h.file, h.header)); }
+        }
+        self.start_run(prompt);
+    }
+
+    /// ctrl+r: show the newest history entry containing the query (ctrl+r again cycles older ones).
+    fn apply_hist_search(&mut self) {
+        let Some((q, saved, n)) = self.hist_search.clone() else { return };
+        let hits: Vec<&String> = if q.is_empty() { self.history.iter().rev().collect() } else { self.history.iter().rev().filter(|h| h.to_lowercase().contains(&q.to_lowercase())).collect() };
+        if hits.is_empty() {
+            self.input = saved.clone(); self.cursor = self.input.chars().count();
+            self.set_status(format!("(reverse-i-search) '{q}': no match — esc cancels"));
+            return;
+        }
+        let idx = n % hits.len();
+        self.input = hits[idx].clone();
+        self.cursor = self.input.chars().count();
+        self.set_status(format!("(reverse-i-search) '{q}' [{}/{}] — ctrl+r older · enter accepts · esc cancels", idx + 1, hits.len()));
+    }
+
+    /// tab: complete a leading /command, or an @path anywhere in the prompt.
     fn complete_slash(&mut self) {
-        if !self.input.starts_with('/') || self.input.contains(' ') { return; }
-        let m: Vec<&str> = COMMANDS.iter().map(|c| c.0).filter(|c| c.starts_with(&self.input)).collect();
-        if m.len() == 1 { self.input = format!("{} ", m[0]); self.cursor = self.input.chars().count(); }
+        if self.input.starts_with('/') && !self.input.contains(' ') {
+            let m: Vec<&str> = COMMANDS.iter().map(|c| c.0).filter(|c| c.starts_with(&self.input)).collect();
+            if m.len() == 1 { self.input = format!("{} ", m[0]); self.cursor = self.input.chars().count(); }
+            else if m.len() > 1 {
+                if let Some(common) = common_prefix(&m) { if common.len() > self.input.len() { self.input = common; self.cursor = self.input.chars().count(); } }
+                self.set_status(m.iter().take(12).cloned().collect::<Vec<_>>().join("  "));
+            }
+            return;
+        }
+        self.complete_path();
+    }
+
+    /// `@src/to` → completes against the working directory (files and dirs, ignoring dot/vendored ones).
+    fn complete_path(&mut self) {
+        let cs: Vec<char> = self.input.chars().collect();
+        let mut start = self.cursor;
+        while start > 0 && !cs[start - 1].is_whitespace() { start -= 1; }
+        let token: String = cs[start..self.cursor].iter().collect();
+        let Some(frag) = token.strip_prefix('@') else { return };
+        let (dir_part, file_part) = match frag.rsplit_once('/') { Some((d, f)) => (d.to_string(), f.to_string()), None => (String::new(), frag.to_string()) };
+        let base = if dir_part.is_empty() { self.workdir.clone() } else { self.workdir.join(&dir_part) };
+        let Ok(rd) = std::fs::read_dir(&base) else { self.set_status(format!("no such directory: {}", base.display())); return };
+        let mut names: Vec<String> = rd.flatten().filter_map(|e| {
+            let name = e.file_name().to_string_lossy().to_string();
+            if name.starts_with('.') || matches!(name.as_str(), "node_modules" | "target" | "dist" | "build") { return None; }
+            if !name.to_lowercase().starts_with(&file_part.to_lowercase()) { return None; }
+            Some(if e.path().is_dir() { format!("{name}/") } else { name })
+        }).collect();
+        names.sort();
+        if names.is_empty() { self.set_status(format!("no match for @{frag}")); return; }
+        let refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
+        let completion = if names.len() == 1 { names[0].clone() } else { common_prefix(&refs).unwrap_or_else(|| file_part.clone()) };
+        let full = if dir_part.is_empty() { completion.clone() } else { format!("{dir_part}/{completion}") };
+        let mut new_input: String = cs[..start].iter().collect();
+        new_input.push('@');
+        new_input.push_str(&full);
+        let tail: String = cs[self.cursor..].iter().collect();
+        self.cursor = new_input.chars().count();
+        self.input = format!("{new_input}{tail}");
+        if names.len() > 1 { self.set_status(names.iter().take(12).cloned().collect::<Vec<_>>().join("  ")); }
     }
 
     fn register_image(&mut self, img: image::DynamicImage) -> String {
@@ -962,6 +1175,20 @@ impl App {
         self.input.clear(); self.cursor = 0; self.hist_idx = None;
         if self.history.last() != Some(&text) { self.history.push(text.clone()); }
         if text.starts_with('/') { self.command(&text); return; }
+        // `!cmd` runs a shell command here and shows the output; the model never sees it
+        if let Some(cmd) = text.strip_prefix('!') {
+            let cmd = cmd.trim().to_string();
+            if cmd.is_empty() { self.blocks.push(Block::System("!<command> runs a shell command in the working directory (the model does not see it)".into())); return; }
+            self.blocks.push(Block::User(format!("!{cmd}"), vec![]));
+            let (wd, tx) = (self.workdir.clone(), self.tx.clone());
+            tokio::spawn(async move {
+                let o = harness::sandbox::run_shell(&cmd, &wd, Duration::from_secs(120), 20000).await;
+                let body = match o { Ok(o) => { let mut t = o.stdout.clone(); if !o.stderr.trim().is_empty() { t.push_str(&format!("\n{}", o.stderr)); } if !o.success() { t.push_str(&format!("\n[exit {}]", o.code.unwrap_or(-1))); } t } Err(e) => format!("{e:#}") };
+                let lines: Vec<String> = std::iter::once(format!("$ {cmd}")).chain(body.lines().take(200).map(String::from)).collect();
+                let _ = tx.send(Msg::Block(Block::Banner(lines)));
+            });
+            return;
+        }
         if let Some(id) = self.attached {
             if let Some(a) = self.subenv.as_ref().and_then(|e| e.list().into_iter().find(|a| a.id == id)) {
                 if a.running() { a.inbox.push("message from the user (attached)", text.clone()); self.blocks.push(Block::System(format!("→ {} (delivered before its next model call): {}", a.label, truncate(&text, 120)))); return; }
@@ -1480,6 +1707,16 @@ impl App {
                     }
                 });
             }
+            "/review-diff" | "/hunks" => {
+                if self.running.is_some() { self.set_status("finish or interrupt the current task first"); return; }
+                let (wd, tx) = (self.workdir.clone(), self.tx.clone());
+                self.set_status("collecting the diff…");
+                tokio::spawn(async move {
+                    let o = harness::sandbox::run_shell("git diff HEAD -- . 2>/dev/null || git diff", &wd, Duration::from_secs(30), 400_000).await;
+                    let diff = o.map(|o| o.stdout).unwrap_or_default();
+                    let _ = tx.send(Msg::Review(diff));
+                });
+            }
             "/jobs" => {
                 let store = harness::scheduler::Store::open();
                 match store {
@@ -1953,6 +2190,7 @@ impl App {
             }
             Msg::Frames(Err(e)) => { if let Some(v) = &mut self.video { v.loading = false; v.error = Some(e); } }
             Msg::Pasted(Err(e)) => self.set_status(e),
+            Msg::Review(diff) => self.open_review(diff),
             Msg::GoalCheck(met, reason) => {
                 let Some(goal) = self.goal.clone() else { return };
                 if met {
@@ -2147,6 +2385,61 @@ impl App {
     }
 }
 
+/// Longest common prefix of the candidates (tab completion).
+fn common_prefix(items: &[&str]) -> Option<String> {
+    let first = items.first()?;
+    let mut len = first.len();
+    for it in &items[1..] {
+        len = len.min(it.len());
+        while len > 0 && (!first.is_char_boundary(len) || !it.is_char_boundary(len) || first[..len] != it[..len]) { len -= 1; }
+    }
+    (len > 0).then(|| first[..len].to_string())
+}
+
+/// ctrl+g: hand the prompt to $EDITOR and take back whatever was saved.
+fn external_edit(current: &str) -> Result<String> {
+    let editor = std::env::var("VISUAL").or_else(|_| std::env::var("EDITOR")).unwrap_or_else(|_| "vi".into());
+    let path = std::env::temp_dir().join(format!("harness-prompt-{}.md", std::process::id()));
+    std::fs::write(&path, current)?;
+    let mut parts = editor.split_whitespace();
+    let prog = parts.next().unwrap_or("vi");
+    let status = std::process::Command::new(prog).args(parts).arg(&path).status()?;
+    if !status.success() { anyhow::bail!("{editor} exited with {status}"); }
+    let text = std::fs::read_to_string(&path)?;
+    let _ = std::fs::remove_file(&path);
+    Ok(text.trim_end().to_string())
+}
+
+#[cfg(test)]
+mod tui_tests {
+    use super::*;
+
+    const DIFF: &str = "diff --git a/src/a.rs b/src/a.rs\nindex 111..222 100644\n--- a/src/a.rs\n+++ b/src/a.rs\n@@ -1,3 +1,4 @@\n fn main() {\n-    old();\n+    new();\n+    extra();\n }\n@@ -20,2 +21,2 @@\n-    gone();\n+    kept();\ndiff --git a/b.txt b/b.txt\n--- a/b.txt\n+++ b/b.txt\n@@ -1 +1 @@\n-one\n+two\n";
+
+    #[test]
+    fn splits_diff_into_hunks() {
+        let h = parse_hunks(DIFF);
+        assert_eq!(h.len(), 3, "{h:#?}");
+        assert_eq!(h[0].file, "src/a.rs");
+        assert_eq!((h[0].plus, h[0].minus), (2, 1));
+        assert_eq!(h[1].file, "src/a.rs");
+        assert_eq!(h[2].file, "b.txt");
+        assert!(!h[0].body.iter().any(|l| l.starts_with("index ") || l.starts_with("+++")), "file headers are not part of the hunk body");
+        let patch = h[2].patch();
+        assert!(patch.starts_with("--- a/b.txt\n+++ b/b.txt\n@@ -1 +1 @@"), "{patch}");
+        assert!(patch.contains("-one") && patch.contains("+two"));
+        assert!(parse_hunks("").is_empty());
+    }
+
+    #[test]
+    fn completion_prefix() {
+        assert_eq!(common_prefix(&["/compact", "/config", "/context"]).as_deref(), Some("/co"));
+        assert_eq!(common_prefix(&["only"]).as_deref(), Some("only"));
+        assert_eq!(common_prefix(&["ab", "cd"]), None);
+        assert_eq!(common_prefix(&[]), None);
+    }
+}
+
 const COMMANDS: &[(&str, &str)] = &[
     ("/help", "show commands and keys"),
     ("/clear", "start a new session (forget the transcript)"),
@@ -2203,6 +2496,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ("/hooks", "show configured hooks"),
     ("/skills", "list installed skills"),
     ("/diff", "git status + diff stat of the working tree"),
+    ("/review-diff", "review the working tree hunk by hunk: keep · revert · comment, then send the comments to the agent"),
     ("/copy", "copy the last answer to the clipboard"),
     ("/review", "run the review workflow on the working-tree diff"),
     ("/pr-comments", "show PR comments via gh: /pr-comments [number]"),
@@ -2267,6 +2561,7 @@ fn draw(f: &mut Frame, app: &mut App) {
     if app.video.is_some() { draw_video(f, app, tr_area); }
     if app.settings_open { draw_settings(f, app, tr_area); }
     if app.sessions_pick.is_some() { draw_sessions(f, app, tr_area); }
+    if app.review.is_some() { draw_review(f, app, tr_area); }
     // transcript
     let mut lines: Vec<Line> = Vec::new();
     let mut ph: Vec<Placeholder> = Vec::new();
@@ -2449,6 +2744,44 @@ fn draw_sessions(f: &mut Frame, app: &mut App, area: Rect) {
         let mut st = ratatui::widgets::ScrollbarState::new(n.saturating_sub(avail)).position(top);
         f.render_stateful_widget(ratatui::widgets::Scrollbar::new(ratatui::widgets::ScrollbarOrientation::VerticalRight).thumb_style(Style::default().fg(pal().dim)).track_style(Style::default().fg(pal().dim)), sb_area, &mut st);
     }
+}
+
+fn draw_review(f: &mut Frame, app: &mut App, area: Rect) {
+    f.render_widget(ratatui::widgets::Clear, area);
+    let dim = Style::default().fg(pal().dim);
+    let Some(r) = &mut app.review else { return };
+    let n = r.hunks.len();
+    let reverted = r.hunks.iter().filter(|h| h.reverted).count();
+    let commented = r.hunks.iter().filter(|h| h.comment.is_some()).count();
+    let hdr = format!(" Review diff — hunk {}/{} · {reverted} reverted · {commented} commented ", r.cursor + 1, n);
+    let mut lines: Vec<Line> = vec![
+        Line::from(Span::styled(hdr, Style::default().fg(Color::Black).bg(pal().orange).bold())),
+        Line::from(Span::styled(" j/k move · a keep · r revert this hunk on disk · m comment · q send the review to the agent · esc close ", dim)),
+    ];
+    // hunk list (compact) — a window around the cursor
+    let list_h = 6usize;
+    let start = r.cursor.saturating_sub(list_h / 2).min(n.saturating_sub(list_h.min(n)));
+    for (i, h) in r.hunks.iter().enumerate().skip(start).take(list_h) {
+        let sel = i == r.cursor;
+        let mark = if h.reverted { "⨯" } else if h.comment.is_some() { "✎" } else { " " };
+        let row = format!("{mark} {:<40} {:<22} +{} -{}", truncate(&h.file, 40), truncate(&h.header, 22), h.plus, h.minus);
+        let st = if sel { Style::default().fg(Color::Black).bg(pal().orange).bold() } else if h.reverted { dim } else { Style::default() };
+        lines.push(Line::from(vec![Span::styled(if sel { " ▸ " } else { "   " }, Style::default().fg(pal().orange)), Span::styled(row, st)]));
+    }
+    lines.push(Line::from(Span::styled(" ─────", dim)));
+    // the selected hunk itself
+    if let Some(h) = r.hunks.get(r.cursor) {
+        let avail = (area.height as usize).saturating_sub(lines.len() + 3);
+        for l in h.body.iter().skip(r.scroll).take(avail) {
+            let st = if l.starts_with('+') { Style::default().fg(pal().ok) } else if l.starts_with('-') { Style::default().fg(pal().err) } else { dim };
+            lines.push(Line::from(Span::styled(format!("   {}", truncate(l, area.width as usize - 4)), st)));
+        }
+        if let Some(c) = &h.comment { lines.push(Line::from(Span::styled(format!("   ✎ {c}"), Style::default().fg(pal().cyan)))); }
+    }
+    if let Some(buf) = r.comment.as_ref() {
+        lines.push(Line::from(vec![Span::styled(" comment: ", Style::default().fg(Color::Black).bg(pal().cyan)), Span::raw(buf.clone()), Span::styled("▏", Style::default().fg(pal().cyan)), Span::styled("  enter saves · esc cancels", dim)]));
+    }
+    f.render_widget(Paragraph::new(lines), area);
 }
 
 fn draw_settings(f: &mut Frame, app: &mut App, area: Rect) {
