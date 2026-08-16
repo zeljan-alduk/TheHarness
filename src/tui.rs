@@ -386,6 +386,7 @@ pub async fn run(cfg: Config, resume: Option<String>) -> Result<()> {
     if app.cfg.ui.theme == "light" { LIGHT.store(true, std::sync::atomic::Ordering::Relaxed); }
     app.banner();
     if let Some(r) = resume { app.resume_session(&r); }
+    { let h = app.cfg.hooks.clone(); let wd = app.workdir.clone(); if !h.session_start.is_empty() { let tx = app.tx.clone(); tokio::spawn(async move { for o in harness::hooks::run_event(&h, "session_start", "", serde_json::json!({}), &wd).await { let _ = tx.send(Msg::Notice(format!("session_start hook: {}", o.trim()))); } }); } }
     app.reload_toolset();
     tokio::spawn(sampler(tx.clone()));
     tokio::spawn(fetch_ctx_len(app.cfg.llm.base_url.clone(), app.cfg.llm.model.clone(), tx.clone()));
@@ -421,6 +422,7 @@ pub async fn run(cfg: Config, resume: Option<String>) -> Result<()> {
     }.await;
     let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableMouseCapture, crossterm::event::DisableBracketedPaste);
     ratatui::restore();
+    if !app.cfg.hooks.session_end.is_empty() { let _ = harness::hooks::run_event(&app.cfg.hooks, "session_end", "", serde_json::json!({"session": app.session_meta.id}), &app.workdir).await; }
     if let Some(h) = app.running.take() { h.abort(); }
     res
 }
@@ -1348,6 +1350,7 @@ impl App {
                     let title = match &res { Ok(_) => "Harness: task finished", Err(_) => "Harness: task stopped" };
                     let body = truncate(&self.blocks.iter().rev().find_map(|b| if let Block::User(t, _) = b { Some(t.clone()) } else { None }).unwrap_or_default(), 80).replace('"', "'");
                     let title = title.to_string();
+                    { let h = self.cfg.hooks.clone(); let wd = self.workdir.clone(); let (t2, b2) = (title.clone(), body.clone()); if !h.notification.is_empty() { tokio::spawn(async move { let _ = harness::hooks::run_event(&h, "notification", &t2, serde_json::json!({"title": t2, "body": b2}), &wd).await; }); } }
                     tokio::spawn(async move {
                         if cfg!(target_os = "macos") { let script = format!("display notification \"{body}\" with title \"{title}\" sound name \"Glass\""); let _ = tokio::process::Command::new("osascript").arg("-e").arg(script).output().await; }
                         else if cfg!(target_os = "linux") { let _ = tokio::process::Command::new("notify-send").arg(&title).arg(&body).output().await; }

@@ -154,12 +154,6 @@ impl Registry {
             Arc::new(notify::Notify),
             Arc::new(findings::ReportFindings),
             Arc::new(mcp_resources::McpResources),
-            Arc::new(monitor::Monitor),
-            Arc::new(monitor::Schedule),
-            Arc::new(monitor::Monitor),
-            Arc::new(notify::Notify),
-            Arc::new(findings::ReportFindings),
-            Arc::new(mcp_resources::McpResources),
         ];
         if net_enabled {
             tools.push(Arc::new(web::WebFetch));

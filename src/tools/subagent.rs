@@ -44,7 +44,7 @@ impl Tool for SpawnAgent {
         let policy = crate::permissions::Policy::new(pcfg, &workdir);
         let sink = crate::agent::PrefixSink { inner: env.sink.clone(), prefix: format!("↳{label} "), info: Some(info.clone()) };
         let system = crate::agent::system_prompt_with_memory(&workdir.display().to_string(), &registry.names(), Some("You are a SUB-AGENT working on one delegated task. Do exactly the task, then reply with a concise, complete report of results (facts, file paths, what changed, what failed) — the parent agent only sees this report."), ctx.memory.as_ref());
-        let finish = |status: &str| { *info.finished.lock().unwrap() = Some(std::time::Instant::now()); *info.status.lock().unwrap() = status.to_string(); };
+        let finish = |status: &str| { *info.finished.lock().unwrap() = Some(std::time::Instant::now()); *info.status.lock().unwrap() = status.to_string(); if !ctx.hooks.subagent_stop.is_empty() { let h = ctx.hooks.clone(); let wd = ctx.workdir.clone(); let (l, st) = (info.label.clone(), status.to_string()); tokio::spawn(async move { let _ = crate::hooks::run_event(&h, "subagent_stop", &l, serde_json::json!({"label": l, "status": st}), &wd).await; }); } };
         // Claude Code backend: the sub-agent is another headless claude session with its own tool bridge
         if env.client.provider() == crate::llm::Provider::ClaudeCode {
             let policy = std::sync::Arc::new(policy);

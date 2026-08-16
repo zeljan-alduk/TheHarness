@@ -320,6 +320,7 @@ impl<'a> Agent<'a> {
             }
             if last_usage.prompt_tokens > self.context_budget {
                 let before = last_usage.prompt_tokens;
+                if !self.ctx.hooks.pre_compact.is_empty() { let _ = crate::hooks::run_event(&self.ctx.hooks, "pre_compact", "auto", serde_json::json!({"trigger": "auto", "prompt_tokens": before}), &self.ctx.workdir).await; }
                 match compact_llm_with(&self.client.aux(), msgs, 8, None, Some(self.sink)).await {
                     Ok((n, summary, mb, ma)) => { stats.compactions += 1; self.sink.emit(&Event::Compacted { count: n, prompt_tokens: before, summary, map_before: mb, map_after: ma }); }
                     Err(_) => { let mb = context_map(msgs); let n = compact(msgs, 6); if n > 0 { stats.compactions += 1; self.sink.emit(&Event::Compacted { count: n, prompt_tokens: before, summary: String::new(), map_before: mb, map_after: context_map(msgs) }); } }
