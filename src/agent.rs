@@ -393,6 +393,12 @@ impl<'a> Agent<'a> {
                 }
                 last_usage = Usage::default(); // re-measured on the next call
             }
+            if crate::pricing::over_budget() {
+                let spent = crate::pricing::fmt_usd(crate::pricing::spent_usd());
+                self.sink.emit(&Event::Error { message: format!("budget reached ({spent} of {}) — stopping", crate::pricing::budget_usd().map(crate::pricing::fmt_usd).unwrap_or_default()) });
+                stats.stop_reason = "budget".into(); stats.wall_secs = start.elapsed().as_secs_f64(); self.finish(&stats);
+                return Ok((last_text(msgs).unwrap_or_else(|| format!("(stopped: budget of {} reached)", crate::pricing::budget_usd().map(crate::pricing::fmt_usd).unwrap_or_default())), stats));
+            }
             if let Some(c) = &self.ctx.cancel { if c.load(std::sync::atomic::Ordering::Relaxed) { stats.stop_reason = "cancelled".into(); stats.wall_secs = start.elapsed().as_secs_f64(); self.finish(&stats); return Ok((last_text(msgs).unwrap_or_else(|| "(cancelled by user)".into()), stats)); } }
             if let Some(m) = self.ctx.inbox.take_message() { msgs.push(Message::user(m)); }
             stats.turns += 1;
@@ -433,6 +439,7 @@ impl<'a> Agent<'a> {
             };
             retries = 0;
             let secs = call_start.elapsed().as_secs_f64();
+            crate::pricing::record(self.client.model(), usage.prompt_tokens, usage.completion_tokens);
             if self.ctx.hooks.any("after_model") {
                 let _ = crate::hooks::run_event(&self.ctx.hooks, "after_model", self.client.model(), serde_json::json!({"turn": stats.turns, "secs": secs, "text": crate::llm::truncate_for_log(&msg.text(), 2000), "tool_calls": msg.tool_calls.as_ref().map(|c| c.len()).unwrap_or(0), "prompt_tokens": usage.prompt_tokens, "completion_tokens": usage.completion_tokens}), &self.ctx.workdir).await;
             }

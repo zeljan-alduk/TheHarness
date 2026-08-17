@@ -94,13 +94,16 @@ pub struct UiConfig {
     #[serde(default = "d_true")] pub fold_previous: bool,
     /// Typing while a task runs steers it (delivered at the next tool boundary) instead of queueing.
     #[serde(default = "d_true")] pub steer: bool,
+    /// Shell command whose first line of stdout is shown on the right of the mode line. It receives a
+    /// JSON snapshot (model, workdir, session, tokens, cost, permission mode) on stdin.
+    #[serde(default)] pub statusline: String,
     /// Terminal font size (pt) applied at start when the terminal can be driven (kitty, iTerm2, Terminal.app); 0 = leave alone. ctrl+= / ctrl+- / ctrl+0.
     #[serde(default)] pub font_size: u32,
 }
 fn d_theme() -> String { "dark".into() }
 fn d_tool_view() -> String { "summary".into() }
 fn d_panel() -> String { "auto".into() }
-impl Default for UiConfig { fn default() -> Self { Self { notify: true, theme: d_theme(), event_log: true, tool_view: d_tool_view(), show_thinking: false, panel: d_panel(), vim: false, fold_previous: true, steer: true, font_size: 0 } } }
+impl Default for UiConfig { fn default() -> Self { Self { notify: true, theme: d_theme(), event_log: true, tool_view: d_tool_view(), show_thinking: false, panel: d_panel(), vim: false, fold_previous: true, steer: true, statusline: String::new(), font_size: 0 } } }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct SecurityConfig {
@@ -151,6 +154,9 @@ pub struct LlmConfig {
     /// Anthropic prompt caching: mark the system prompt + tool catalogue as cacheable.
     #[serde(default = "d_true")]
     pub prompt_cache: bool,
+    /// Extra prices for `/cost`: `"my-model*" = { input = 1.0, output = 3.0 }` (USD per 1M tokens).
+    #[serde(default)]
+    pub pricing: std::collections::HashMap<String, crate::pricing::Price>,
 }
 
 /// One entry of `[llm.roles]`: just a model name, or a full endpoint.
@@ -377,6 +383,7 @@ impl Config {
             "ui.vim" => self.ui.vim = b(val),
             "ui.fold_previous" => self.ui.fold_previous = b(val),
             "ui.steer" => self.ui.steer = b(val),
+            "ui.statusline" => self.ui.statusline = val.into(),
             "ui.font_size" => self.ui.font_size = val.parse().context("bad size")?,
             "permissions.mode" => self.permissions.mode = crate::permissions::Mode::parse(val).context("bad mode")?,
             "llm.compact_at_fraction" => self.llm.compact_at_fraction = val.parse().context("bad fraction")?,

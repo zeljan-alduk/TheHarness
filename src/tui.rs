@@ -123,7 +123,7 @@ fn pal() -> Pal {
 const SPINNER: [&str; 10] = ["✻", "✼", "✽", "✾", "✿", "❀", "✿", "✾", "✽", "✼"];
 const WORDS: [&str; 12] = ["Thinking", "Pondering", "Working", "Reasoning", "Cooking", "Tinkering", "Brewing", "Mulling", "Crunching", "Percolating", "Noodling", "Computing"];
 
-enum Msg { Toast(String), Title(String), Question(harness::permissions::Question, tokio::sync::oneshot::Sender<harness::permissions::Answer>), SubEnv(Arc<harness::agent::SubAgentEnv>), Policy(Arc<harness::permissions::Policy>), CcSession(Arc<harness::claude_code::ClaudeCodeSession>), CcSid(String), Block(Block), Ask(harness::permissions::ApprovalRequest, tokio::sync::oneshot::Sender<harness::permissions::Approval>), Ev(Event), Done(Result<(String, harness::agent::RunStats), String>), Sys(SysSample), CtxLen(u64), Pasted(Result<PathBuf, String>), Frames(Result<(PathBuf, f64, Vec<(f64, PathBuf)>), String>), Toolset(Arc<Toolset>), Catalog(Result<harness::plugins::Catalog, String>), Notice(String), Improve(harness::selfimprove::Stage), GoalCheck(bool, String), Review(String), AcpSession(Arc<harness::acp_client::AcpSession>), RunTask(String), QueueTask(String) }
+enum Msg { Toast(String), Title(String), Question(harness::permissions::Question, tokio::sync::oneshot::Sender<harness::permissions::Answer>), SubEnv(Arc<harness::agent::SubAgentEnv>), Policy(Arc<harness::permissions::Policy>), CcSession(Arc<harness::claude_code::ClaudeCodeSession>), CcSid(String), Block(Block), Ask(harness::permissions::ApprovalRequest, tokio::sync::oneshot::Sender<harness::permissions::Approval>), Ev(Event), Done(Result<(String, harness::agent::RunStats), String>), Sys(SysSample), CtxLen(u64), Pasted(Result<PathBuf, String>), Frames(Result<(PathBuf, f64, Vec<(f64, PathBuf)>), String>), Toolset(Arc<Toolset>), Catalog(Result<harness::plugins::Catalog, String>), Notice(String), Improve(harness::selfimprove::Stage), GoalCheck(bool, String), Review(String), AcpSession(Arc<harness::acp_client::AcpSession>), RunTask(String), QueueTask(String), StatusLine(String) }
 
 /// One hunk of the working-tree diff, as `/review-diff` shows it.
 #[derive(Clone, Debug)]
@@ -456,6 +456,8 @@ struct App {
     review: Option<DiffReview>,
     /// External ACP agent driving this session (provider = "acp:…").
     acp: Option<Arc<harness::acp_client::AcpSession>>,
+    /// Output of the user's [ui] statusline command, refreshed every couple of seconds.
+    statusline: Option<String>,
     expand_tools: bool,
     show_thinking: bool,
     session: Arc<tokio::sync::Mutex<Vec<Message>>>,
@@ -530,7 +532,7 @@ pub async fn run(cfg: Config, resume: Option<String>) -> Result<()> {
     let mut app = App {
         model: cfg.llm.model.clone(), net: cfg.net.enabled, cfg, workdir,
         blocks: vec![], input: String::new(), cursor: 0, history: vec![], hist_idx: None, hist_draft: String::new(),
-        scroll_up: 0, running: None, run_started: Instant::now(), queued: vec![], goal: None, goal_rounds: 0, hist_search: None, edit_external: false, review: None, acp: None, expand_tools: false, show_thinking: false,
+        scroll_up: 0, running: None, run_started: Instant::now(), queued: vec![], goal: None, goal_rounds: 0, hist_search: None, edit_external: false, review: None, acp: None, statusline: None, expand_tools: false, show_thinking: false,
         session: Arc::new(tokio::sync::Mutex::new(Vec::new())), tx: tx.clone(),
         total_prompt: 0, total_completion: 0, last_prompt_tokens: 0, turn_tokens: 0, last_ctrl_c: None, status_msg: None,
         quit: false, restart: false, improve: None, improve_cancel: Default::default(), restart_at: None, tick: 0, word: 0, models: vec![],
@@ -581,6 +583,7 @@ pub async fn run(cfg: Config, resume: Option<String>) -> Result<()> {
                     if app.tick % 2 == 0 { if let Some(p) = &mut app.sessions_pick { p.marquee.1 += 1; } }
                     // cross-session: heartbeat every ~5s, poll our mailbox every ~2s
                     if app.tick % 60 == 0 { if app.session_meta.id.is_empty() { app.session_meta.id = harness::sessions::SessionStore::new_id(); } harness::mailbox::heartbeat(&harness::mailbox::Live { id: app.session_meta.id.clone(), title: if app.session_meta.title.is_empty() { "(new session)".into() } else { app.session_meta.title.clone() }, workdir: app.workdir.display().to_string(), pid: std::process::id(), backend: app.cfg.llm.provider.clone().unwrap_or("local".into()), updated: 0, busy: app.running.is_some() }); }
+                    if app.tick % 25 == 3 && !app.cfg.ui.statusline.trim().is_empty() { app.refresh_statusline(); }
                     if app.tick % 25 == 0 && !app.session_meta.id.is_empty() { for m in harness::mailbox::take(&app.session_meta.id) { app.blocks.push(Block::System(format!("✉ message from session {}: {}", m.from, truncate(&m.text, 200)))); app.inbox.push(format!("message from session {}", m.from), m.text); } }
                     // wakeups: inbox events (monitor lines, scheduled prompts, messages) start a turn when idle
                     if app.running.is_none() && app.pending_ask.is_none() && app.pending_q.is_none() && !app.inbox.is_empty() && app.tick % 12 == 0 { if let Some(m) = app.inbox.take_message() { app.set_status("inbox event → waking the agent"); app.start_run(m); } }
@@ -995,6 +998,37 @@ impl App {
         else { self.hist_idx = Some(i + 1); self.input = self.history[i + 1].clone(); }
         self.cursor = self.input.chars().count();
     }
+    /// Run the user's `[ui] statusline` command with a JSON snapshot on stdin; its first line is shown
+    /// on the right of the mode line (like Claude Code's statusline hook).
+    fn refresh_statusline(&mut self) {
+        let cmd = self.cfg.ui.statusline.clone();
+        if cmd.trim().is_empty() { return; }
+        let payload = serde_json::json!({
+            "model": self.model,
+            "provider": self.cfg.llm.provider.clone().unwrap_or_else(|| "local".into()),
+            "workdir": self.workdir.display().to_string(),
+            "session_id": self.session_meta.id,
+            "permission_mode": self.perm_mode.id(),
+            "running": self.running.is_some(),
+            "queued": self.queued.len(),
+            "tokens": {"prompt": self.total_prompt, "completion": self.total_completion, "context": self.last_prompt_tokens, "window": self.metrics.ctx_len},
+            "cost_usd": harness::pricing::spent_usd(),
+            "version": harness::VERSION,
+        });
+        let (wd, tx) = (self.workdir.clone(), self.tx.clone());
+        tokio::spawn(async move {
+            let (prog, flag) = harness::sandbox::shell_program();
+            let mut c = tokio::process::Command::new(prog);
+            c.arg(flag).arg(&cmd).current_dir(&wd).stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::null()).kill_on_drop(true);
+            let Ok(mut child) = c.spawn() else { return };
+            if let Some(mut si) = child.stdin.take() { use tokio::io::AsyncWriteExt; let _ = si.write_all(payload.to_string().as_bytes()).await; }
+            if let Ok(Ok(out)) = tokio::time::timeout(Duration::from_secs(5), child.wait_with_output()).await {
+                let text = String::from_utf8_lossy(&out.stdout).lines().next().unwrap_or("").to_string();
+                let _ = tx.send(Msg::StatusLine(text));
+            }
+        });
+    }
+
     /// Open the hunk-by-hunk review over a `git diff` blob.
     fn open_review(&mut self, diff: String) {
         let hunks = parse_hunks(&diff);
@@ -1323,7 +1357,25 @@ impl App {
             "/thinking" => { self.show_thinking = !self.show_thinking; self.blocks.push(Block::System(format!("thinking {}", if self.show_thinking { "shown" } else { "hidden" }))); }
             "/expand" => { self.expand_tools = !self.expand_tools; }
             "/panel" => { self.panel = Some(!self.panel_visible(200)); }
-            "/cost" | "/stats" => self.blocks.push(Block::System(format!("session tokens: {} prompt + {} completion · last context {} · turns in history {}", self.total_prompt, self.total_completion, self.last_prompt_tokens, self.history.len()))),
+            "/cost" | "/stats" => {
+                let mut lines = vec![format!("session tokens: {} prompt + {} completion · last context {} · turns in history {}", self.total_prompt, self.total_completion, self.last_prompt_tokens, self.history.len())];
+                match harness::pricing::price_of(&self.model) {
+                    Some(p) => {
+                        let spent = harness::pricing::spent_usd();
+                        lines.push(format!("cost: {} so far ({} in / {} out per 1M tokens for {}){}",
+                            harness::pricing::fmt_usd(spent), harness::pricing::fmt_usd(p.input), harness::pricing::fmt_usd(p.output), self.model,
+                            harness::pricing::budget_usd().map(|b| format!(" · budget {}", harness::pricing::fmt_usd(b))).unwrap_or_default()));
+                        if !arg.trim().is_empty() {
+                            match arg.trim().parse::<f64>() {
+                                Ok(b) => { harness::pricing::set_budget(Some(b)); lines.push(format!("budget set: the agent stops once this session costs {}", harness::pricing::fmt_usd(b))); }
+                                Err(_) => lines.push("usage: /cost <max-usd> to set a budget".into()),
+                            }
+                        }
+                    }
+                    None => lines.push(format!("cost: {} runs locally — no token cost (add [llm.pricing] to price a hosted model)", self.model)),
+                }
+                self.blocks.push(Block::Banner(lines));
+            }
             "/config" if !arg.is_empty() => self.blocks.push(Block::Banner(vec![format!("server  {}", self.cfg.llm.base_url), format!("model   {}", self.model), format!("context {} · compaction at {} tokens · max_turns {} · tool timeout {}s", fmt_k(self.metrics.ctx_len), fmt_k(self.cfg.llm.effective_budget(if self.metrics.ctx_len > 0 { Some(self.metrics.ctx_len) } else { None })), self.cfg.agent.max_turns, self.cfg.agent.tool_timeout_secs), format!("net {} · segments {}", self.net, self.cfg.net.download_segments)])),
             "/memory" | "/brain" | "/workflows" => {
                 let file = match cmd { "/memory" => "MEMORY", "/brain" => "BRAIN", _ => "WORKFLOWS" };
@@ -2297,6 +2349,7 @@ impl App {
             Msg::RunTask(t) => { if self.running.is_some() { self.queued.push(t); } else { self.start_run(t); } }
             Msg::QueueTask(t) => { self.queued.push(t); self.set_status(format!("queued ({} waiting)", self.queued.len())); }
             Msg::AcpSession(s) => self.acp = Some(s),
+            Msg::StatusLine(t) => self.statusline = (!t.trim().is_empty()).then(|| t.trim().to_string()),
             Msg::GoalCheck(met, reason) => {
                 let Some(goal) = self.goal.clone() else { return };
                 if met {
@@ -2562,7 +2615,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ("/thinking", "toggle showing the model's reasoning"),
     ("/expand", "toggle expanded tool output (ctrl+o)"),
     ("/panel", "toggle the dashboard panel (ctrl+p)"),
-    ("/cost", "token usage for this session"),
+    ("/cost", "token usage and $ for this session · /cost <max-usd> caps the spend"),
     ("/usage", "Claude backend: subscription usage (proxied Claude Code /usage); otherwise same as /cost"),
     ("/compact", "compact the context into a precise handoff note: /compact [focus]"),
     ("/context", "context map: what fills the window (prompt, tools, memory, messages) + heaviest items"),
@@ -2771,7 +2824,13 @@ fn draw(f: &mut Frame, app: &mut App) {
     if app.vim { st.push(dot()); st.push(Span::styled(if app.vim_normal { "-- NORMAL --" } else { "-- INSERT --" }, Style::default().fg(if app.vim_normal { pal().orange } else { pal().ok }).bold())); }
     if let Some(wt) = app.wt_cwd.lock().unwrap().as_ref() { st.push(dot()); st.push(Span::styled(format!("worktree {}", wt.name), Style::default().fg(pal().orange))); }
     let lw: usize = st.iter().map(|s| s.content.chars().count()).sum();
-    let right = if app.running.is_none() { "" } else { "esc to interrupt" };
+    let custom = app.statusline.clone().unwrap_or_default();
+    let right_owned = match (app.running.is_none(), custom.is_empty()) {
+        (_, false) => custom,
+        (false, true) => "esc to interrupt".to_string(),
+        _ => String::new(),
+    };
+    let right = right_owned.as_str();
     let pad = width.saturating_sub(lw + right.chars().count() + 1);
     st.push(Span::raw(" ".repeat(pad))); st.push(Span::styled(right, Style::default().fg(pal().dim)));
     f.render_widget(Paragraph::new(Line::from(st)), st_area);

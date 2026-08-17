@@ -105,6 +105,15 @@ diagnostics_after_edit = true
 # rs = "rustfmt --edition 2021 {file}"
 # py = ""
 
+# Optional statusline: a command whose first stdout line is shown on the right of the mode line.
+# It gets a JSON snapshot on stdin (model, workdir, session_id, tokens, cost_usd, permission_mode…).
+# [ui]
+# statusline = "jq -r '\"\\(.model) · \\(.tokens.context) ctx\"'"
+
+# Prices for /cost and --max-budget-usd (USD per 1M tokens); built-ins cover the common hosted models.
+# [llm.pricing]
+# "my-hosted-model*" = { input = 1.0, output = 3.0 }
+
 [hooks]
 # Hooks get the event as JSON and may answer with JSON:
 #   {"decision":"block"|"allow","reason":"…","updatedInput":{…},"context":"…"}

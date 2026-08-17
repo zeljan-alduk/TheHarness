@@ -29,6 +29,7 @@ pub mod mcp_bridge;
 pub mod memory;
 pub mod permissions;
 pub mod plugins;
+pub mod pricing;
 pub mod procs;
 pub mod proxy;
 pub mod repomap;

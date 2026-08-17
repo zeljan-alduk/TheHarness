@@ -70,6 +70,9 @@ enum Cmd {
         /// Keep working until this condition holds (checked by the aux model after every turn)
         #[arg(long)]
         goal: Option<String>,
+        /// Stop when the run has cost this much (needs a priced model; local models are free)
+        #[arg(long)]
+        max_budget_usd: Option<f64>,
         /// The task, in natural language. Use '-' to read from stdin. Omit with --input-format stream-json.
         task: Option<String>,
     },
@@ -340,6 +343,7 @@ async fn main() -> Result<()> {
     let mut cfg = config::Config::load_layered(cli.config.as_deref(), cli.setting_sources.as_deref(), &cli.sets)?;
     if let Some(m) = &cli.permissions { cfg.permissions.mode = harness::permissions::Mode::parse(m).context("--permissions must be bypass|auto|ask|plan")?; }
     harness::checkpoints::configure(&cfg.checkpoints);
+    if !cfg.llm.pricing.is_empty() { harness::pricing::configure(cfg.llm.pricing.iter().map(|(k, v)| (k.clone(), *v)).collect()); }
     if cfg.net.proxy.enabled { harness::proxy::configure(cfg.net.proxy.clone()).await.context("starting the network allow-list proxy")?; }
     sandbox::configure_seatbelt(cfg.sandbox.mode == "seatbelt" || cfg.sandbox.mode == "bwrap", cfg.sandbox.deny_network, cfg.sandbox.allow_write.clone());
     let client = llm::Client::new(&cfg.llm)?;
@@ -572,7 +576,7 @@ async fn main() -> Result<()> {
         Cmd::Config => {
             println!("{cfg:#?}");
         }
-        Cmd::Run { dir, max_turns, no_net, output_format, input_format, json_schema, goal, task } => {
+        Cmd::Run { dir, max_turns, no_net, output_format, input_format, json_schema, goal, max_budget_usd, task } => {
             let input_stream = harness::headless::OutputFormat::parse(&input_format) == Some(harness::headless::OutputFormat::StreamJson);
             let task = match task {
                 Some(t) if t == "-" => { let mut s = String::new(); std::io::Read::read_to_string(&mut std::io::stdin(), &mut s)?; Some(s) }
@@ -581,6 +585,7 @@ async fn main() -> Result<()> {
                 None => bail!("no task given (pass one, use '-' to read stdin, or --input-format stream-json)"),
             };
             if no_net { cfg.net.enabled = false; }
+            harness::pricing::set_budget(max_budget_usd);
             let workdir = dir.unwrap_or(std::env::current_dir()?).canonicalize().context("workdir does not exist")?;
             let mut output = harness::headless::OutputFormat::parse(&output_format).context("--output-format must be text|json|stream-json")?;
             if cli.json && output == harness::headless::OutputFormat::Text { output = harness::headless::OutputFormat::StreamJson; }
