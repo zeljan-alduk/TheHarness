@@ -55,6 +55,19 @@ max_fetch_bytes = 2000000
 download_segments = 4
 download_timeout_secs = 3600
 
+# The local model the harness downloads and serves itself (first run writes these; shown here for reference).
+# [local_model]
+# build = "Qwen3.8-27B-MLX-4bit"   # 4 | 6 | 8 bit; /localmodel picks and downloads
+# port = 8890
+# server = "auto"                  # auto (mlx_vlm, sees images) | mlx-vlm | mlx-lm (text-only)
+# autostart = true                 # start (and keep warm) the MLX server when the TUI opens
+# Speculative decoding (mlx_vlm only): a small drafter proposes tokens the 27B verifies in a batch.
+# Opt-in; ~1.4–1.6× faster generation on code, ~1.15× on prose (measured on the 27B 4-bit). Off = empty.
+# /localmodel draft z-lab/Qwen3.5-27B-DFlash  turns it on (downloads ~4.3GB to the HF cache on first serve).
+# draft_model = ""                 # HF id or local path of a drafter for the same family
+# draft_kind = "auto"              # auto | dflash | eagle3 | mtp
+# draft_block_size = 0             # 0 = the drafter's default
+
 # Per-role models: use a small/fast local model for the auxiliary calls and keep the big one for coding.
 # A role may be just a model name, or a table pointing at another server entirely.
 # [llm.roles]

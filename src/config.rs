@@ -58,12 +58,21 @@ pub struct LocalModelConfig {
     #[serde(default = "d_segments")] pub download_segments: usize,
     /// Offer the download/backend dialog when there is no local model yet.
     #[serde(default = "d_true")] pub first_run_prompt: bool,
+    /// Speculative decoding (mlx_vlm.server only): a drafter model — HF id or local path — proposes tokens
+    /// the 27B verifies in a batch, speeding up generation on high-acceptance text (code). Empty = off.
+    /// Must match the target family (e.g. a Qwen3.5 DFlash drafter for the qwen3_5 build). `/localmodel draft`.
+    #[serde(default)] pub draft_model: String,
+    /// Drafter family: "auto" (from the drafter's model_type), or "dflash" | "eagle3" | "mtp".
+    #[serde(default = "d_auto")] pub draft_kind: String,
+    /// Override the drafter's block size (0 = the drafter's own default).
+    #[serde(default)] pub draft_block_size: u32,
 }
+fn d_auto() -> String { "auto".into() }
 fn d_mlx_port() -> u16 { 8890 }
 fn d_mlx_server() -> String { "auto".into() }
 fn d_segments() -> usize { 8 }
 impl Default for LocalModelConfig {
-    fn default() -> Self { Self { build: String::new(), port: d_mlx_port(), server: d_mlx_server(), autostart: true, download_segments: d_segments(), first_run_prompt: true } }
+    fn default() -> Self { Self { build: String::new(), port: d_mlx_port(), server: d_mlx_server(), autostart: true, download_segments: d_segments(), first_run_prompt: true, draft_model: String::new(), draft_kind: d_auto(), draft_block_size: 0 } }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

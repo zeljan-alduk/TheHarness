@@ -216,9 +216,26 @@ pub fn server_plan(kind: &str) -> Vec<&'static str> {
 /// streams reasoning, so it is what "auto" starts first; mlx_lm stays as the fallback in case a build
 /// or an mlx-vlm release refuses to load.
 pub async fn serve(model_dir: &Path, port: u16, kind: &str) -> Result<Server> {
+    serve_spec(model_dir, port, kind, &Draft::default()).await
+}
+
+/// Speculative-decoding drafter for the server: a small model that proposes tokens the target verifies.
+/// Off when `model` is empty. Only mlx_vlm.server uses it.
+#[derive(Debug, Clone, Default)]
+pub struct Draft { pub model: String, pub kind: String, pub block_size: u32 }
+impl Draft {
+    pub fn on(&self) -> bool { !self.model.trim().is_empty() }
+    pub fn from_cfg(c: &crate::config::LocalModelConfig) -> Draft {
+        Draft { model: c.draft_model.trim().to_string(), kind: c.draft_kind.trim().to_string(), block_size: c.draft_block_size }
+    }
+}
+
+pub async fn serve_spec(model_dir: &Path, port: u16, kind: &str, draft: &Draft) -> Result<Server> {
     let mut last: Option<anyhow::Error> = None;
     for module in server_plan(kind) {
-        match serve_with(model_dir, port, module).await {
+        // The drafter is an mlx_vlm feature; if we fall back to the text server, drop it rather than fail.
+        let d = if module == "mlx_vlm.server" { draft } else { &Draft { model: String::new(), kind: String::new(), block_size: 0 } };
+        match serve_with(model_dir, port, module, d).await {
             Ok(s) => return Ok(s),
             Err(e) => { last = Some(e); }
         }
@@ -226,7 +243,7 @@ pub async fn serve(model_dir: &Path, port: u16, kind: &str) -> Result<Server> {
     Err(last.unwrap_or_else(|| anyhow::anyhow!("no MLX server module to start")))
 }
 
-async fn serve_with(model_dir: &Path, port: u16, module: &'static str) -> Result<Server> {
+async fn serve_with(model_dir: &Path, port: u16, module: &'static str, draft: &Draft) -> Result<Server> {
     let py = mlx_python().context("no MLX runtime — re-run the installer, or: uv venv ~/.config/harness/runtime/mlx && uv pip install --python ~/.config/harness/runtime/mlx/bin/python mlx-lm mlx-vlm")?;
     let log_dir = crate::setup::config_dir().join("logs");
     std::fs::create_dir_all(&log_dir).ok();
@@ -237,6 +254,12 @@ async fn serve_with(model_dir: &Path, port: u16, module: &'static str) -> Result
     // conversation (~85s for 10k tokens on a 27B 4-bit): APC_ENABLED=1 makes a repeated or extended
     // prompt cost only its new tail (measured 16s → 0.6s). 2048 blocks × 16 = 32k tokens of KV cache.
     if module == "mlx_vlm.server" { cmd.env("APC_ENABLED", "1"); }
+    // Speculative decoding: a drafter proposes tokens the target verifies in a batch (opt-in, mlx_vlm only).
+    if module == "mlx_vlm.server" && draft.on() {
+        cmd.args(["--draft-model", &draft.model]);
+        if !draft.kind.is_empty() && draft.kind != "auto" { cmd.args(["--draft-kind", &draft.kind]); }
+        if draft.block_size > 0 { cmd.args(["--draft-block-size", &draft.block_size.to_string()]); }
+    }
     // setsid: give the server its own session and process group, so it is NOT killed when the terminal
     // closes (SIGHUP goes to the foreground group) or the harness exits — it stays warm for the next start.
     #[cfg(unix)]
@@ -444,6 +467,18 @@ mod tests {
         assert_eq!(pick_model_id(&v, Path::new("/elsewhere/Qwen3.8-27B-MLX-4bit")).as_deref(), Some("Qwen3.8-27B-MLX-4bit"));
         let v: serde_json::Value = serde_json::json!({"data": [{"id": "something-else"}]});
         assert_eq!(pick_model_id(&v, Path::new("/elsewhere/Qwen3.8-27B-MLX-4bit")).as_deref(), Some("something-else"));
+    }
+    #[test]
+    fn draft_from_cfg_and_on() {
+        let mut c = crate::config::LocalModelConfig::default();
+        assert!(!Draft::from_cfg(&c).on(), "empty draft_model is off");
+        c.draft_model = "z-lab/Qwen3.5-27B-DFlash".into();
+        let d = Draft::from_cfg(&c);
+        assert!(d.on());
+        assert_eq!(d.model, "z-lab/Qwen3.5-27B-DFlash");
+        assert_eq!(d.kind, "auto");
+        c.draft_model = "   ".into();
+        assert!(!Draft::from_cfg(&c).on(), "whitespace-only is off");
     }
     #[test]
     fn server_plan_pins_or_falls_back() {

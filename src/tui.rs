@@ -2501,6 +2501,27 @@ impl App {
                         self.blocks.push(Block::System(format!("local_model.server → {kind} · restarting the MLX server ({}{})", lm::server_plan(kind).first().copied().unwrap_or("?"), if a == "vision" || a == "auto" { " — the same weights with the vision tower, so images and video frames work" } else { " — text-only" })));
                         self.start_mlx_ex(true);
                     }
+                    _ if a == "draft" || a.starts_with("draft ") => {
+                        let val = a.strip_prefix("draft").unwrap_or("").trim().to_string();
+                        if val.is_empty() {
+                            let d = &self.cfg.local_model.draft_model;
+                            self.blocks.push(Block::System(if d.is_empty() {
+                                "speculative decoding: off. /localmodel draft z-lab/Qwen3.5-27B-DFlash turns it on (a DFlash drafter matched to the 27B; ~1.4–1.6× on code) — or any drafter for the same family; /localmodel draft off disables it. mlx_vlm only.".into()
+                            } else {
+                                format!("speculative decoding: on · drafter {d} · kind {} · /localmodel draft off to disable", self.cfg.local_model.draft_kind)
+                            }));
+                        } else if val == "off" || val == "none" {
+                            self.cfg.local_model.draft_model.clear();
+                            let _ = harness::config::Config::save_setting("local_model.draft_model", "");
+                            self.blocks.push(Block::System("speculative decoding off · restarting the MLX server".into()));
+                            self.start_mlx_ex(true);
+                        } else {
+                            self.cfg.local_model.draft_model = val.clone();
+                            let _ = harness::config::Config::save_setting("local_model.draft_model", &val);
+                            self.blocks.push(Block::System(format!("speculative decoding on · drafter {val} · restarting the MLX server (it downloads the drafter on first serve if it is an HF id — watch ~/.config/harness/logs/mlx-server.log)")));
+                            self.start_mlx_ex(true);
+                        }
+                    }
                     "cancel" | "stop" | "unload" | "kill" => {
                         // `stop`/`cancel` cancel a running download first; otherwise (and always for
                         // `unload`/`kill`) they shut the MLX server down and reclaim its ~16–30GB of RAM.
@@ -2531,9 +2552,10 @@ impl App {
                             lines.push(format!("  {}-bit  {s}{}", b.bits, if self.cfg.local_model.build == b.name() { "  ← selected" } else { "" }));
                         }
                         lines.push(format!("server: {} → {} on 127.0.0.1:{} · /localmodel vision|text|auto switches (mlx_vlm sees images, mlx_lm is text-only)", self.cfg.local_model.server, lm::server_plan(&self.cfg.local_model.server).join(" then "), self.cfg.local_model.port));
+                        lines.push(format!("speculative decoding: {} · /localmodel draft <hf-id|off>", if self.cfg.local_model.draft_model.is_empty() { "off".to_string() } else { format!("on · drafter {} (kind {})", self.cfg.local_model.draft_model, self.cfg.local_model.draft_kind) }));
                         self.blocks.push(Block::Banner(lines));
                     }
-                    _ => self.blocks.push(Block::Error("usage: /localmodel [4|6|8|resume|serve|cancel|status]".into())),
+                    _ => self.blocks.push(Block::Error("usage: /localmodel [4|6|8|resume|serve|stop|restart|status|vision|text|draft <id|off>]".into())),
                 }
             }
             "/delegate" => {
@@ -3505,8 +3527,9 @@ impl App {
             return;
         }
         let (tx, dir, port, kind) = (self.tx.clone(), build.dir(), self.cfg.local_model.port, self.cfg.local_model.server.clone());
+        let draft = lm::Draft::from_cfg(&self.cfg.local_model);
         let first = lm::server_plan(&kind).first().copied().unwrap_or("mlx_lm.server");
-        self.set_status(format!("{} {first} on port {port}", if force { "restarting" } else { "starting" }));
+        self.set_status(format!("{} {first} on port {port}{}", if force { "restarting" } else { "starting" }, if draft.on() { format!(" · speculative draft {}", draft.model) } else { String::new() }));
         tokio::spawn(async move {
             // Keep it ready: a warm server of the right kind from an earlier session is reused as-is —
             // no reload of 16–30GB of weights, the prefix cache survives. `force` skips this to restart.
@@ -3528,7 +3551,7 @@ impl App {
             // ours from an earlier session (or the other server kind) may still hold the port: replace it
             lm::stop_on_port(port).await;
             let _ = tx.send(Msg::Notice(format!("loading {} GB of weights — a moment", build.bytes / 1_000_000_000)));
-            let msg = match lm::serve(&dir, port, &kind).await {
+            let msg = match lm::serve_spec(&dir, port, &kind, &draft).await {
                 Ok(s) => Msg::MlxUp(Ok((s.base_url.clone(), s.model.clone(), s.module))),
                 Err(e) => Msg::MlxUp(Err(format!("{e:#}"))),
             };
@@ -3752,7 +3775,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ("/resume", "resume a saved session: /resume <n|id|last>"),
     ("/model", "browse every model you can switch to — Claude, the downloaded MLX build, and this server (enter switches backend + model); /model <name> switches directly"),
     ("/backend", "switch backend: local (LM Studio etc.) | claude [model] [effort] (Claude Code CLI, subscription) | anthropic <model>"),
-    ("/localmodel", "the local Qwen3.8-27B: download 4/6/8-bit (resumable) · serve · stop (shut the MLX server, reclaim RAM) · restart · status · vision|text (mlx_vlm sees images, mlx_lm is text-only)"),
+    ("/localmodel", "the local Qwen3.8-27B: download 4/6/8-bit · serve · stop (reclaim RAM) · restart · status · vision|text · draft <hf-id|off> (speculative decoding: a drafter proposes tokens the 27B verifies)"),
     ("/delegate", "Claude orchestrates while the local model runs the delegated work (sub-agents): /delegate on|off"),
     ("/effort", "Claude Code backend reasoning effort: /effort low|medium|high|xhigh|max (default medium)"),
     ("/cd", "change working directory"),
