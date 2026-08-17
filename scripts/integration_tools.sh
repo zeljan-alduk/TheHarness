@@ -45,6 +45,12 @@ EXPECT="^one$"; if grep -qE "$EXPECT" "$D/cp.txt"; then echo "PASS checkpoint un
 EXPECT="restored"   c "checkpoint redo"  redo
 EXPECT="^two$"; if grep -qE "$EXPECT" "$D/cp.txt"; then echo "PASS checkpoint redo re-applied the change"; pass=$((pass+1)); else echo "FAIL checkpoint redo re-applied the change"; fail=$((fail+1)); fi
 
+EXPECT="most referenced first|Repository map" t "repo_map"       repo_map '{"budget_tokens":400}'
+EXPECT="sum 10"                    t "run_code"       run_code '{"code":"print(\"sum\", sum(range(5)))"}'
+EXPECT="terminal #"                t "terminal open"  terminal '{"action":"open","cmd":"/bin/sh","timeout_secs":3}'
+EXPECT="session|terminal"          t "terminal list"  terminal '{"action":"list"}'
+EXPECT="team is not available|at least two members" t "team guard" team '{"goal":"x","members":[{"name":"a","role":"b"}]}'
+
 # project instruction files + path-scoped rules reach the model through tool results
 mkdir -p "$D/.harness/rules"; printf -- '---\npaths: *.txt\ndescription: itest rule\n---\nITEST-RULE-BODY\n' > "$D/.harness/rules/itest.md"
 EXPECT="ITEST-RULE-BODY"           t "path-scoped rule"  read_file '{"path":"cp.txt"}'

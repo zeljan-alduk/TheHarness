@@ -145,6 +145,32 @@ All six P0 items are implemented, tested and on `main`:
 | 5 | Classifier auto mode + rules | `src/permissions.rs` | `Tool(arg:glob)` / `domain:` matchers with Claude-Code tool aliases, catastrophic-command deny, credential-file deny, `[permissions.auto]` LLM classifier (fail-closed) |
 | 6 | Headless stream-json + `--json-schema` | `src/headless.rs` | Claude-Code-compatible output *and* input, `--output-format text\|json\|stream-json`, schema-checked final answers with one corrective turn |
 
+## 2c. Status — P1 and P2 passes merged 2026-08-17
+
+**P1 — done.** PTY `terminal` tool · formatters + post-edit LSP diagnostics · `repo_map` · hooks 2.0
+(command/http/prompt executors, 17 events, `updatedInput` rewrite, `.claude/settings.json` import) ·
+sub-agents (background, `subagent_type: "fork"`, nesting to depth 2, per-call model) · `/goal` (+
+`--goal`) · mid-turn steering · `run_code` · `/arena` best-of-n via a judge · per-role models +
+fallback chain + Anthropic prompt caching · ACP **client** backend (`provider = "acp:<agent>"`) ·
+`harness attach` + `serve --allow-remote` (+ QR) · import of Claude Code/Codex transcripts and
+`/share` HTML export · persistent scheduler + `harness daemon` + webhook · GitHub Action + example
+workflows · interactive `/review-diff` · layered settings (managed → user → project → local → CLI) ·
+network allow-list proxy with credential stripping · `Ctrl+R` / `Ctrl+G` / `@path` / `!cmd` ·
+Terminal-Bench/Harbor eval import. *Windows runtime validation beyond CI is still open.*
+
+**P2 — done.** Browser agent preset + `screenshot` + vision bridge · search providers
+(Brave/Tavily/Exa/SearXNG) with caching · MCP elicitation, roots, prompts-as-commands and deferred
+tool loading via `tool_search` · `harness mcp-serve` (this harness as an MCP server) · `/btw` ·
+`team` · `/spec` · `/dream` memory consolidation + `/learn` · OTel export · `harness review`
+(+`--comment`/`--fix`) · statusline · custom themes · `/voice` · OSC notifications · $ cost + budgets
+· Telegram connector · prompts-as-data (compaction/subagent/goal + tool descriptions) · session
+content search · container sandbox (docker/podman) · five more eval tasks (31).
+
+**Deliberately not done.** Native Bedrock/Vertex adapters (SigV4/ADC signing; Gemini already works
+through its OpenAI-compatible endpoint), i18n, hosted cloud VMs, marketplaces and SSO/SCIM/MDM
+controls — the same "local, single-binary harness" line as before; ACP + `serve` + MCP are the
+integration surface instead.
+
 Next up: the P1 list below.
 
 ## 3. Roadmap distilled from the matrix

@@ -29,6 +29,12 @@ Status: ☐ open · ◐ partial · ☑ done.
 - ☑ **Model-driven plan mode** (`EnterPlanMode` / `ExitPlanMode`) — `plan_mode {enter|exit {plan}}`: sets the shared
   policy to Plan, presents the plan via ask_user-style question (approve / approve+ask / revise), restores the mode.
 
+## P1 + P2 passes from docs/GAPS.md — DONE 2026-08-17
+
+Everything in the P1 and P2 lists is implemented; see docs/GAPS.md §2c for the itemised status and the
+short "deliberately not done" list (Bedrock/Vertex signing, i18n, cloud/enterprise surfaces). The only
+open item from the original roadmap is runtime validation on Windows/Linux beyond what CI covers.
+
 ## P0 pass from docs/GAPS.md — DONE 2026-08-16
 
 Instruction files (AGENTS.md/CLAUDE.md chain, @imports, path-scoped rules), skills + custom agents from

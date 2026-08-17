@@ -61,6 +61,11 @@ cargo build --release
 ./target/release/harness acp                           # run as an ACP agent on stdio (Zed, JetBrains, nvim, Emacs)
 ./target/release/harness run --output-format stream-json "..."   # Claude-Code-compatible event stream
 ./target/release/harness checkpoint list               # file checkpoints of this directory's last session
+./target/release/harness review --pr 42 --comment      # review a PR and post the findings
+./target/release/harness arena --models a,b "task"     # best-of-n in isolated worktrees, judged
+./target/release/harness schedule add nightly --at 03:00 "run the evals"   # + harness daemon
+./target/release/harness connect telegram --token …    # drive it (and approve) from your phone
+./target/release/harness serve --allow-remote          # then: harness attach <url> from anywhere
 ```
 
 ## Desktop UI (Tauri)
@@ -99,11 +104,21 @@ scrubber (ffmpeg): ←/→, space to select, enter attaches frames with timestam
   next task.
 - **Sessions**: every turn is saved under `~/.config/harness/sessions/`; `/sessions`, `/resume <n|id|last>`,
   `harness --resume <id>`, `harness -c` (continue latest for this directory).
-- **Tools** (all): bash (+background), process, read/write/edit_file, apply_patch, list_dir, grep, glob,
-  diagnostics, notebook_edit, view_image, read_pdf, pdf_edit (in-place PDF text edits via PyMuPDF), extract_archive, memory, load_skill, todo, spawn_agent,
-  web_fetch, web_search, download_file, + MCP tools. `[hooks]` run shell hooks around tools; `[security]`
-  redacts secrets; `[sandbox] mode = "seatbelt"` confines shell writes (macOS).
-- **Web UI**: `harness serve` (localhost:7878) — same UI as the desktop app, from any browser.
+- **Tools** (all): bash (+background), terminal (persistent PTY: REPLs, debuggers, installers), process,
+  run_code (Python/JS that calls these tools in a loop), read/write/edit_file, apply_patch, list_dir, grep,
+  glob, repo_map (ranked outline of the repo), diagnostics, lsp, notebook_edit, view_image, screenshot,
+  read_pdf, pdf_edit, extract_archive, memory, load_skill, todo, spawn_agent (background · fork · nested),
+  team, agents, worktree, monitor, schedule, notify, report_findings, ask_user, mcp_resources,
+  web_fetch, web_search (Brave/Tavily/Exa/SearXNG/DDG), download_file, + MCP tools (deferred behind
+  `tool_search` when a catalogue is large). `[hooks]` run command/http/prompt hooks around 17 events;
+  `[security]` redacts secrets and flags prompt injection in fetched content; `[format]` runs the
+  project's formatter after edits; `[sandbox] mode` confines shell writes (seatbelt · bwrap · docker);
+  `[net.proxy]` restricts which hosts tools may reach.
+- **Web UI**: `harness serve` (localhost:7878) — same UI as the desktop app, from any browser;
+  `--allow-remote` prints a LAN URL + QR so `harness attach <url>` works from another machine, with the
+  session living in the server process.
+- **Cost**: `/cost` shows tokens and $ (built-in prices for hosted models, `[llm.pricing]` for others);
+  `/cost <max-usd>` and `harness run --max-budget-usd` stop the agent at a cap.
 
 ## Memory (MEMORY.md · WORKFLOWS.md · BRAIN.md)
 `~/.config/harness/` holds three markdown files injected into every session: **MEMORY.md** (settings,
@@ -144,6 +159,32 @@ Turn it off with `[checkpoints] enabled = false`.
   line on stdin, multi-turn) use the same JSON shapes as the Claude Code CLI. `--json-schema <json|file>`
   forces the final answer to match a schema (one corrective turn, then a non-zero exit).
 
+## Working with other agents
+- **As a client**: `provider = "acp:<agent>"` or `/backend acp <gemini|codex|opencode|copilot|goose>` —
+  the other agent does the work, this harness stays the UI (its updates stream into the transcript, its
+  permission requests hit your prompts, its file writes go through your policy). `/backend claude` runs
+  the official Claude Code CLI on your subscription with our tools bridged over MCP.
+- **As an agent**: `harness acp` (Agent Client Protocol on stdio) and `harness mcp-serve` (this harness
+  as an MCP server with `harness` / `harness_ask` tools) let Zed, JetBrains, Neovim, Claude Code, Codex
+  or Cursor delegate to it.
+- **Best-of-n**: `/arena [models] -- <task>` (or `harness arena`) runs the same task on several
+  contenders in isolated worktrees and a judge model compares the diffs, blind to which model wrote them.
+- **Teams**: `team {goal, members}` puts 2–5 named agents on one goal sharing the todo list as a board.
+
+## Automation
+- **Scheduled jobs**: `harness schedule add nightly-eval --at 03:00 "run the eval suite and report
+  regressions"`, then `harness daemon` (or `--once` from cron/launchd). Jobs survive restarts, keep a log
+  and can be fired by webhook (`POST /api/hook/<job>` on `harness serve`).
+- **Review**: `harness review [--pr N] [--comment] [--fix]` — structured findings from the diff plus the
+  project's house rules (`.harness/review-rules.md`), posted to the PR or fixed in place; exit code 2 on
+  critical/high findings so CI can gate on it.
+- **GitHub Action**: `.github/actions/harness` (composite) with ready workflows in `docs/examples/` —
+  reply to `@harness <task>` on issues/PRs, or run the evals nightly.
+- **Chat**: `harness connect telegram --token …` — send tasks from your phone and answer the agent's
+  permission prompts there (y / a / n).
+- **Telemetry**: `[telemetry] otlp_endpoint` exports the event stream to any OTLP collector with GenAI
+  semconv attributes (tokens, tool durations, permission decisions, cost).
+
 ## Plugins & MCP
 - `harness plugin list|install|enable|disable|remove|update` or `/plugin …` in the TUI. Catalog from the
   GitHub topics `harness-plugin` and `dsh-plugin` (● enabled ◐ disabled ○ downloadable). A plugin repo may
@@ -180,7 +221,12 @@ src/
   instructions.rs AGENTS.md/CLAUDE.md/HARNESS.md chain, @imports, path-scoped rules
   skills.rs / agentdefs.rs  skills and named custom agents from the standard directories
   checkpoints.rs shadow-git snapshots of the working tree (/undo, /redo, /rewind)
-  acp.rs       Agent Client Protocol server (editors) · headless.rs  stream-json + --json-schema runs
+  acp.rs       Agent Client Protocol server (editors) · acp_client.rs  other agents as backends
+  headless.rs  stream-json + --json-schema runs · attach.rs  thin client for a remote `harness serve`
+  scheduler.rs persistent jobs + `harness daemon` · review.rs  PR review · arena.rs  best-of-n
+  proxy.rs     network allow-list proxy · telemetry.rs  OTLP export · pricing.rs  cost + budgets
+  commands.rs  markdown slash commands · import.rs  Claude Code/Codex transcripts · export.rs  md/HTML
+  repomap.rs   ranked repo outline · format.rs  format-on-save + diagnostics · connect.rs  Telegram
   mcp.rs       MCP stdio client · plugins.rs plugin manager · setup.rs external tools · tui.rs terminal UI
   eval.rs      the fitness function: runs evals/tasks/* in fresh git-initialised workdirs
   arbiter.rs   proposal-vs-main verdict · selfimprove.rs  smart self-improvement loop (propose → gates → implement → arbiter → install)
