@@ -168,6 +168,8 @@ pub struct Server {
     pub model: String,
     pub port: u16,
     child: tokio::process::Child,
+    /// "mlx_vlm.server" (vision) or "mlx_lm.server" (text-only)
+    pub module: &'static str,
 }
 
 impl Server {
@@ -175,20 +177,67 @@ impl Server {
     pub fn pid(&self) -> Option<u32> { self.child.id() }
 }
 
+/// Does the runtime have mlx-vlm (the server with the vision tower)?
+pub fn has_mlx_vlm() -> bool {
+    let lib = runtime_dir().join("mlx/lib");
+    std::fs::read_dir(&lib).map(|rd| rd.flatten().any(|e| e.path().join("site-packages/mlx_vlm/server").is_dir())).unwrap_or(false)
+}
+
+/// Make sure the runtime can serve vision: a harness that updated itself past 1.0.109 may sit on a venv
+/// the older installer made with mlx-lm only. Installs mlx-vlm into the private venv with uv (what the
+/// installer uses) — a no-op when it is already there. Returns what happened, for the transcript.
+pub async fn ensure_mlx_vlm() -> Result<Option<String>> {
+    if has_mlx_vlm() { return Ok(None); }
+    let py = mlx_python().context("no MLX runtime — re-run the installer")?;
+    let uv = crate::setup::which("uv").or_else(|| { let p = crate::setup::home_dir().join(".local/bin/uv"); p.is_file().then_some(p) })
+        .context("mlx-vlm is missing from the MLX runtime and uv is not installed — re-run the installer (curl -fsSL https://zeljan-alduk.github.io/TheHarness/install.sh | sh)")?;
+    let out = tokio::process::Command::new(&uv).args(["pip", "install", "--python"]).arg(&py).args(["--quiet", "--upgrade", "mlx-lm", "mlx-vlm>=0.6.13"]).output().await.context("running uv pip install")?;
+    if !out.status.success() { bail!("installing mlx-vlm failed: {}", String::from_utf8_lossy(&out.stderr).lines().last().unwrap_or_default()); }
+    if !has_mlx_vlm() { bail!("uv reported success but mlx_vlm is still not importable in {}", py.display()); }
+    Ok(Some("installed mlx-vlm into the MLX runtime (the server with the vision tower, so images and video frames work)".into()))
+}
+
+/// Which server module a `[local_model] server` setting means, and whether a fallback is allowed.
+/// "auto" (default): mlx_vlm.server when the runtime has it, mlx_lm.server otherwise — and mlx_lm as the
+/// fallback if mlx_vlm refuses the build. "mlx-vlm" / "mlx-lm" pin one.
+pub fn server_plan(kind: &str) -> Vec<&'static str> {
+    match kind {
+        "mlx-vlm" | "mlx_vlm" | "vision" => vec!["mlx_vlm.server"],
+        "mlx-lm" | "mlx_lm" | "text" => vec!["mlx_lm.server"],
+        _ => if has_mlx_vlm() { vec!["mlx_vlm.server", "mlx_lm.server"] } else { vec!["mlx_lm.server"] },
+    }
+}
+
 /// Serve a downloaded model over an OpenAI-compatible API on 127.0.0.1.
 ///
-/// `mlx_lm.server` is the default: it knows the qwen3_5 architecture and is the more reliable of the two.
-/// `mlx_vlm.server` adds the vision tower (the model is image-text-to-text) but refuses some builds, so it
-/// is opt-in via `[local_model] server = "mlx-vlm"`.
+/// Both servers come from the same MLX runtime and load the same weights. `mlx_lm.server` is text-only —
+/// it answers image parts with 404 "Only 'text' content type is supported" — while `mlx_vlm.server`
+/// also loads the vision tower (Qwen3.8 is image-text-to-text), speaks the same chat/tools API and
+/// streams reasoning, so it is what "auto" starts first; mlx_lm stays as the fallback in case a build
+/// or an mlx-vlm release refuses to load.
 pub async fn serve(model_dir: &Path, port: u16, kind: &str) -> Result<Server> {
-    let py = mlx_python().context("no MLX runtime — re-run the installer, or: uv venv ~/.config/harness/runtime/mlx && uv pip install --python ~/.config/harness/runtime/mlx/bin/python mlx-lm")?;
-    let module = if kind == "mlx-vlm" || kind == "mlx_vlm" { "mlx_vlm.server" } else { "mlx_lm.server" };
+    let mut last: Option<anyhow::Error> = None;
+    for module in server_plan(kind) {
+        match serve_with(model_dir, port, module).await {
+            Ok(s) => return Ok(s),
+            Err(e) => { last = Some(e); }
+        }
+    }
+    Err(last.unwrap_or_else(|| anyhow::anyhow!("no MLX server module to start")))
+}
+
+async fn serve_with(model_dir: &Path, port: u16, module: &'static str) -> Result<Server> {
+    let py = mlx_python().context("no MLX runtime — re-run the installer, or: uv venv ~/.config/harness/runtime/mlx && uv pip install --python ~/.config/harness/runtime/mlx/bin/python mlx-lm mlx-vlm")?;
     let log_dir = crate::setup::config_dir().join("logs");
     std::fs::create_dir_all(&log_dir).ok();
     let log = std::fs::OpenOptions::new().create(true).append(true).open(log_dir.join("mlx-server.log"))?;
-    let child = tokio::process::Command::new(&py)
-        .args(["-m", module, "--host", "127.0.0.1", "--port", &port.to_string(), "--model"])
-        .arg(model_dir)
+    let mut cmd = tokio::process::Command::new(&py);
+    cmd.args(["-m", module, "--host", "127.0.0.1", "--port", &port.to_string(), "--model"]).arg(model_dir);
+    // mlx_vlm's prefix cache is off by default, and without it every agent turn re-prefills the whole
+    // conversation (~85s for 10k tokens on a 27B 4-bit): APC_ENABLED=1 makes a repeated or extended
+    // prompt cost only its new tail (measured 16s → 0.6s). 2048 blocks × 16 = 32k tokens of KV cache.
+    if module == "mlx_vlm.server" { cmd.env("APC_ENABLED", "1"); }
+    let child = cmd
         .stdout(log.try_clone()?)
         .stderr(log)
         .stdin(std::process::Stdio::null())
@@ -199,7 +248,7 @@ pub async fn serve(model_dir: &Path, port: u16, kind: &str) -> Result<Server> {
     // Loading 16–30GB of weights takes a while; poll until it answers or dies.
     let base_url = format!("http://127.0.0.1:{port}/v1");
     let http = reqwest::Client::builder().timeout(Duration::from_secs(3)).build()?;
-    let mut server = Server { base_url: base_url.clone(), model: model_dir.display().to_string(), port, child };
+    let mut server = Server { base_url: base_url.clone(), model: model_dir.display().to_string(), port, child, module };
     for _ in 0..600 {
         if let Ok(Some(status)) = server.child.try_wait() {
             bail!("{module} exited ({status}) — see {}", log_dir.join("mlx-server.log").display());
@@ -207,9 +256,9 @@ pub async fn serve(model_dir: &Path, port: u16, kind: &str) -> Result<Server> {
         if let Ok(r) = http.get(format!("{base_url}/models")).send().await {
             if r.status().is_success() {
                 if let Ok(v) = r.json::<serde_json::Value>().await {
-                    if let Some(id) = v.get("data").and_then(|d| d.as_array()).and_then(|a| a.first()).and_then(|m| m.get("id")).and_then(|i| i.as_str()) {
-                        server.model = id.to_string();
-                    }
+                    // mlx_vlm lists whatever is in the HF cache too, and wants requests to name the model
+                    // exactly as it lists it — so take the entry that is our directory, never just the first.
+                    if let Some(id) = pick_model_id(&v, model_dir) { server.model = id; }
                 }
                 return Ok(server);
             }
@@ -218,6 +267,50 @@ pub async fn serve(model_dir: &Path, port: u16, kind: &str) -> Result<Server> {
     }
     let _ = server.child.kill().await;
     bail!("{module} did not answer on {base_url} within 5 minutes — see {}", log_dir.join("mlx-server.log").display())
+}
+
+/// The id under which a `/v1/models` listing offers `model_dir` (exact path, or the directory name), else the first id.
+pub fn pick_model_id(models: &serde_json::Value, model_dir: &Path) -> Option<String> {
+    let ids: Vec<&str> = models.get("data").and_then(|d| d.as_array()).map(|a| a.iter().filter_map(|m| m.get("id").and_then(|i| i.as_str())).collect()).unwrap_or_default();
+    let want = model_dir.display().to_string();
+    let name = model_dir.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+    ids.iter().find(|i| i.trim_end_matches('/') == want.trim_end_matches('/'))
+        .or_else(|| ids.iter().find(|i| !name.is_empty() && (i.trim_end_matches('/').ends_with(&format!("/{name}")) || **i == name)))
+        .or_else(|| ids.first())
+        .map(|s| s.to_string())
+}
+
+/// Which MLX server answers on this base_url, if it is one of ours — decided from the process bound to
+/// that port (both servers answer `/health`, so routes cannot tell them apart). None = something else
+/// (LM Studio, llama-server, …) or nothing.
+pub async fn server_kind(base_url: &str) -> Option<&'static str> {
+    let port = port_of(base_url)?;
+    for module in ["mlx_vlm.server", "mlx_lm.server"] { if !pids_of(module, port).is_empty() { return Some(module); } }
+    None
+}
+
+fn port_of(base_url: &str) -> Option<u16> { base_url.trim_end_matches('/').trim_end_matches("/v1").rsplit(':').next()?.parse().ok() }
+
+fn pids_of(module: &str, port: u16) -> Vec<u32> {
+    let pat = format!("{} .*--port {port}( |$)", module.replace('.', "\\."));
+    let Ok(o) = std::process::Command::new("pgrep").args(["-f", &pat]).output() else { return vec![] };
+    String::from_utf8_lossy(&o.stdout).split_whitespace().filter_map(|p| p.parse().ok()).collect()
+}
+
+/// PIDs of *our* MLX server processes bound to `port` (matched on the command line, so LM Studio or a
+/// llama-server on the same port are never touched).
+pub fn pids_on_port(port: u16) -> Vec<u32> {
+    let mut v = pids_of("mlx_vlm.server", port); v.extend(pids_of("mlx_lm.server", port)); v
+}
+
+/// Stop the MLX server we (or a previous harness) started on `port`; true if one was running.
+pub async fn stop_on_port(port: u16) -> bool {
+    let pids = pids_on_port(port);
+    if pids.is_empty() { return false; }
+    for p in &pids { let _ = std::process::Command::new("kill").arg(p.to_string()).status(); }
+    for _ in 0..40 { if pids_on_port(port).is_empty() { break; } tokio::time::sleep(Duration::from_millis(250)).await; }
+    for p in pids_on_port(port) { let _ = std::process::Command::new("kill").args(["-9", &p.to_string()]).status(); }
+    true
 }
 
 /// What the configured local endpoint can actually do for us.
@@ -268,7 +361,10 @@ pub async fn probe(base_url: &str) -> Endpoint {
             }
         }
     }
-    match listed.into_iter().next() {
+    // Prefer an entry that is one of our own model directories: mlx_vlm.server lists the HF cache too,
+    // and the first id there can be some tiny test model that would answer nothing useful.
+    let ours = models_dir().display().to_string();
+    match listed.iter().find(|m| m.starts_with(&ours)).cloned().or_else(|| listed.into_iter().next()) {
         Some(model) => Endpoint::Ready { model },
         None => Endpoint::Idle { listed: 0 },
     }
@@ -311,5 +407,37 @@ mod tests {
         assert!(hours.line().contains("3h 25m left"), "{}", hours.line());
         let secs = Progress { done: 1, total: 2, bytes_per_sec: 10.0, eta_secs: 42, ..Default::default() };
         assert!(secs.line().contains("42s left"), "{}", secs.line());
+    }
+
+    #[test]
+    fn model_id_prefers_our_directory_over_hf_cache_entries() {
+        let v: serde_json::Value = serde_json::json!({"data": [
+            {"id": "hf-internal-testing/tiny-random-Idefics3ForConditionalGeneration"},
+            {"id": "HuggingFaceTB/SmolLM2-135M"},
+            {"id": "/Users/x/.config/harness/models/Qwen3.8-27B-MLX-4bit"}]});
+        assert_eq!(pick_model_id(&v, Path::new("/Users/x/.config/harness/models/Qwen3.8-27B-MLX-4bit")).as_deref(), Some("/Users/x/.config/harness/models/Qwen3.8-27B-MLX-4bit"));
+        // mlx_lm.server may list just the directory name; fall back to a name match, then to the first id
+        let v: serde_json::Value = serde_json::json!({"data": [{"id": "Qwen3.8-27B-MLX-4bit"}]});
+        assert_eq!(pick_model_id(&v, Path::new("/elsewhere/Qwen3.8-27B-MLX-4bit")).as_deref(), Some("Qwen3.8-27B-MLX-4bit"));
+        let v: serde_json::Value = serde_json::json!({"data": [{"id": "something-else"}]});
+        assert_eq!(pick_model_id(&v, Path::new("/elsewhere/Qwen3.8-27B-MLX-4bit")).as_deref(), Some("something-else"));
+    }
+    #[test]
+    fn server_plan_pins_or_falls_back() {
+        assert_eq!(server_plan("mlx-lm"), vec!["mlx_lm.server"]);
+        assert_eq!(server_plan("vision"), vec!["mlx_vlm.server"]);
+        assert!(server_plan("auto").ends_with(&["mlx_lm.server"]));
+    }
+
+    /// Real install into a throwaway venv: HARNESS_CONFIG_DIR=<dir with runtime/mlx (uv venv)> cargo test ensure_mlx_vlm -- --ignored
+    #[tokio::test] #[ignore]
+    async fn ensure_mlx_vlm_installs_into_a_bare_runtime() {
+        assert!(std::env::var_os("HARNESS_CONFIG_DIR").is_some(), "point HARNESS_CONFIG_DIR at a scratch dir with runtime/mlx");
+        assert!(!has_mlx_vlm(), "the scratch runtime must start without mlx_vlm");
+        let note = ensure_mlx_vlm().await.unwrap();
+        assert!(note.is_some(), "expected an install note");
+        assert!(has_mlx_vlm());
+        assert_eq!(ensure_mlx_vlm().await.unwrap(), None, "second call is a no-op");
+        assert_eq!(server_plan("auto")[0], "mlx_vlm.server");
     }
 }

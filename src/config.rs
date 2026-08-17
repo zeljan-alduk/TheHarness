@@ -49,7 +49,8 @@ pub struct LocalModelConfig {
     #[serde(default)] pub build: String,
     /// Loopback port for the MLX server the harness starts.
     #[serde(default = "d_mlx_port")] pub port: u16,
-    /// "mlx-lm" (default, text) or "mlx-vlm" (adds the vision tower; refuses some builds).
+    /// "auto" (default): mlx_vlm.server — same weights plus the vision tower, so the model sees images —
+    /// falling back to mlx_lm.server if it refuses the build; "mlx-vlm" / "mlx-lm" pin one (mlx-lm is text-only).
     #[serde(default = "d_mlx_server")] pub server: String,
     /// Start the MLX server when the TUI starts and the weights are complete.
     #[serde(default = "d_true")] pub autostart: bool,
@@ -59,7 +60,7 @@ pub struct LocalModelConfig {
     #[serde(default = "d_true")] pub first_run_prompt: bool,
 }
 fn d_mlx_port() -> u16 { 8890 }
-fn d_mlx_server() -> String { "mlx-lm".into() }
+fn d_mlx_server() -> String { "auto".into() }
 fn d_segments() -> usize { 8 }
 impl Default for LocalModelConfig {
     fn default() -> Self { Self { build: String::new(), port: d_mlx_port(), server: d_mlx_server(), autostart: true, download_segments: d_segments(), first_run_prompt: true } }

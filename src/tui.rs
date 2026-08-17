@@ -188,7 +188,9 @@ enum Msg { Toast(String), Title(String), Question(harness::permissions::Question
     /// The download finished (Ok) or gave up (Err) — a partial download is resumable, not lost.
     ModelDlDone(Result<String, String>),
     /// The MLX server answered on this base_url with this model id, or failed to come up.
-    MlxUp(Result<(String, String), String>),
+    MlxUp(Result<(String, String, &'static str), String>),
+    /// The server on our own MLX port turned out to be mlx_lm (text-only) while vision is wanted.
+    MlxTextOnly(String),
     /// Whether the Claude Code CLI can run a turn (installed + signed in).
     ClaudeAuth(harness::claude_code::Auth),
     /// /update: what GitHub says the latest release is (the TUI only reports; installing happens on start).
@@ -1571,7 +1573,12 @@ impl App {
         for t in text.split_whitespace() {
             let t = t.trim_matches(|c| c == '"' || c == '\'');
             let p = if t.starts_with('~') { PathBuf::from(t.replacen('~', &harness::setup::home_dir().display().to_string(), 1)) } else if PathBuf::from(t).is_absolute() { PathBuf::from(t) } else { self.workdir.join(t) };
-            if video_ext(&p) && p.is_file() && !self.input.contains("@") { self.open_video(&p); return; }
+            if video_ext(&p) && p.is_file() && !self.input.contains("@") {
+                // `/video <path>`: the command is consumed; the frame labels the scrubber inserts must land in an
+                // empty prompt, not after "/video …" (which would re-run /video with a mangled path on enter).
+                if text.starts_with("/video") { self.input.clear(); self.cursor = 0; }
+                self.open_video(&p); return;
+            }
         }
         let text = if text.is_empty() { "Look at the attached image(s).".to_string() } else { text };
         self.input.clear(); self.cursor = 0; self.hist_idx = None;
@@ -2486,7 +2493,14 @@ impl App {
                         Some(b) => self.start_model_download(b),
                         None => self.blocks.push(Block::Error("nothing to resume — /localmodel picks a build".into())),
                     },
-                    "serve" | "start" => self.start_mlx(),
+                    "serve" | "start" | "restart" => self.start_mlx(),
+                    "vision" | "text" | "auto" => {
+                        let kind = match a { "vision" => "mlx-vlm", "text" => "mlx-lm", _ => "auto" };
+                        self.cfg.local_model.server = kind.into();
+                        let _ = harness::config::Config::save_setting("local_model.server", kind);
+                        self.blocks.push(Block::System(format!("local_model.server → {kind} · restarting the MLX server ({}{})", lm::server_plan(kind).first().copied().unwrap_or("?"), if a == "vision" || a == "auto" { " — the same weights with the vision tower, so images and video frames work" } else { " — text-only" })));
+                        self.start_mlx();
+                    }
                     "cancel" | "stop" => {
                         match self.dl_cancel.take() {
                             Some(h) => { h.abort(); self.dl = None; self.blocks.push(Block::System("download stopped — the bytes already on disk stay, /localmodel resume continues from there".into())); }
@@ -2494,7 +2508,7 @@ impl App {
                         }
                     }
                     "status" => {
-                        let mut lines = vec![format!("runtime: {}", lm::mlx_python().map(|p| p.display().to_string()).unwrap_or("missing — re-run the installer".into()))];
+                        let mut lines = vec![format!("runtime: {} · vision server (mlx-vlm): {}", lm::mlx_python().map(|p| p.display().to_string()).unwrap_or("missing — re-run the installer".into()), if lm::has_mlx_vlm() { "installed" } else { "missing — installed automatically on the next /localmodel serve" })];
                         for b in lm::BUILDS {
                             let s = match lm::state_of(b) {
                                 ModelState::Ready { bytes } => format!("complete ({})", harness::tools::download::human(bytes)),
@@ -2503,7 +2517,7 @@ impl App {
                             };
                             lines.push(format!("  {}-bit  {s}{}", b.bits, if self.cfg.local_model.build == b.name() { "  ← selected" } else { "" }));
                         }
-                        lines.push(format!("server: {} on 127.0.0.1:{}", self.cfg.local_model.server, self.cfg.local_model.port));
+                        lines.push(format!("server: {} → {} on 127.0.0.1:{} · /localmodel vision|text|auto switches (mlx_vlm sees images, mlx_lm is text-only)", self.cfg.local_model.server, lm::server_plan(&self.cfg.local_model.server).join(" then "), self.cfg.local_model.port));
                         self.blocks.push(Block::Banner(lines));
                     }
                     _ => self.blocks.push(Block::Error("usage: /localmodel [4|6|8|resume|serve|cancel|status]".into())),
@@ -3049,8 +3063,13 @@ impl App {
                     }
                 }
             }
+            Msg::MlxTextOnly(base_url) => {
+                self.blocks.push(Block::System(format!("{base_url} is served by mlx_lm.server, which is text-only (images get \"Only 'text' content type is supported\") — restarting it as mlx_vlm.server, same weights plus the vision tower; back in a moment")));
+                self.start_mlx();
+            }
             Msg::MlxUp(r) => match r {
-                Ok((base_url, model)) => {
+                Ok((base_url, model, module)) => {
+                    let vision = module == "mlx_vlm.server";
                     self.no_model = false;
                     let claude = self.cfg.llm.provider.as_deref() == Some("claude-code");
                     self.cfg.llm.base_url = base_url.clone();
@@ -3067,7 +3086,7 @@ impl App {
                             ]));
                     } else {
                         self.cfg.llm.model = model.clone(); self.model = model.clone();
-                        self.blocks.push(Block::System(format!("local model ready: {model} on {base_url}")));
+                        self.blocks.push(Block::System(format!("local model ready: {} on {base_url} · {module}{}", model_label(&model), if vision { " (vision: images and video frames work)" } else { " (text-only — /localmodel vision restarts it with the vision tower)" })));
                         tokio::spawn(fetch_ctx_len(base_url, model, self.tx.clone()));
                     }
                 }
@@ -3188,7 +3207,12 @@ impl App {
                 let s = format!("{} · {} model call{} · {} tool call{} · {}+{} tokens · {:.0}s", if stop_reason == "done" { "done" } else { &stop_reason }, turns, if turns == 1 { "" } else { "s" }, tool_calls, if tool_calls == 1 { "" } else { "s" }, fmt_k(prompt_tokens), fmt_k(completion_tokens), wall_secs);
                 self.blocks.push(Block::Finished(s));
             }
-            Event::Error { message } => { self.finish_streaming(); self.blocks.push(Block::Error(message)); }
+            Event::Error { message } => {
+                self.finish_streaming();
+                let text_only = message.contains("Only 'text' content type is supported");
+                self.blocks.push(Block::Error(message));
+                if text_only { self.blocks.push(Block::System("that is mlx_lm.server refusing the image parts — it is text-only. /localmodel vision restarts the local model with mlx_vlm.server (same weights + the vision tower); then send the images again".into())); }
+            }
             Event::Memory { file, section, text } => { self.blocks.push(Block::Memory(format!("{} › {section}: {text}", file.trim_end_matches(".md")))); }
             Event::Permission { tool, summary, decision } => { if decision.starts_with("denied") { self.blocks.push(Block::Error(format!("🔒 {tool}({}) {decision}", truncate(&summary, 80)))); } }
         }
@@ -3217,8 +3241,16 @@ impl App {
             Endpoint::Ready { model } => {
                 // Whatever is loaded there is what answers, whatever the config file claims.
                 if !model.is_empty() && model != &self.model {
-                    self.blocks.push(Block::System(format!("{} is loaded on {} — using it", model, self.cfg.llm.base_url)));
+                    self.blocks.push(Block::System(format!("{} is loaded on {} — using it", model_label(model), self.cfg.llm.base_url)));
                     self.cfg.llm.model = model.clone(); self.model = model.clone();
+                }
+                // Our own port, our own weights, but the text-only server (left over from an older harness or
+                // an earlier session)? Then images would fail — swap it for the vision server now, while idle.
+                let ours = self.cfg.llm.base_url.contains(&format!(":{}/", self.cfg.local_model.port)) || self.cfg.llm.base_url.ends_with(&format!(":{}", self.cfg.local_model.port));
+                let wants_vision = lm::server_plan(&self.cfg.local_model.server).first() == Some(&"mlx_vlm.server");
+                if ours && wants_vision && self.cfg.local_model.autostart && lm::by_name(&self.cfg.local_model.build).map(|b| matches!(lm::state_of(b), ModelState::Ready { .. })).unwrap_or(false) {
+                    let (tx, base) = (self.tx.clone(), self.cfg.llm.base_url.clone());
+                    tokio::spawn(async move { if lm::server_kind(&base).await == Some("mlx_lm.server") { let _ = tx.send(Msg::MlxTextOnly(base)); } });
                 }
                 return;
             }
@@ -3403,10 +3435,21 @@ impl App {
             return;
         }
         let (tx, dir, port, kind) = (self.tx.clone(), build.dir(), self.cfg.local_model.port, self.cfg.local_model.server.clone());
-        self.set_status(format!("starting {} on port {port} — loading {} GB of weights takes a moment", kind, build.bytes / 1_000_000_000));
+        let first = lm::server_plan(&kind).first().copied().unwrap_or("mlx_lm.server");
+        self.set_status(format!("starting {first} on port {port} — loading {} GB of weights takes a moment", build.bytes / 1_000_000_000));
         tokio::spawn(async move {
+            // The runtime may predate the vision server (an updated harness on an old venv): fetch it first.
+            if !matches!(kind.as_str(), "mlx-lm" | "mlx_lm" | "text") {
+                match lm::ensure_mlx_vlm().await {
+                    Ok(Some(note)) => { let _ = tx.send(Msg::Notice(note)); }
+                    Ok(None) => {}
+                    Err(e) => { let _ = tx.send(Msg::Notice(format!("{e:#} — starting the text-only server meanwhile"))); }
+                }
+            }
+            // ours from an earlier session (or the other server kind) may still hold the port: replace it
+            lm::stop_on_port(port).await;
             let msg = match lm::serve(&dir, port, &kind).await {
-                Ok(s) => Msg::MlxUp(Ok((s.base_url.clone(), s.model.clone()))),
+                Ok(s) => Msg::MlxUp(Ok((s.base_url.clone(), s.model.clone(), s.module))),
                 Err(e) => Msg::MlxUp(Err(format!("{e:#}"))),
             };
             let _ = tx.send(msg);
@@ -3629,7 +3672,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ("/resume", "resume a saved session: /resume <n|id|last>"),
     ("/model", "browse every model you can switch to — Claude, the downloaded MLX build, and this server (enter switches backend + model); /model <name> switches directly"),
     ("/backend", "switch backend: local (LM Studio etc.) | claude [model] [effort] (Claude Code CLI, subscription) | anthropic <model>"),
-    ("/localmodel", "the local Qwen3.8-27B: pick a 4/6/8-bit build to download (resumable), serve it, or see status"),
+    ("/localmodel", "the local Qwen3.8-27B: pick a 4/6/8-bit build to download (resumable) · serve · status · vision|text (which MLX server: mlx_vlm sees images, mlx_lm is text-only)"),
     ("/delegate", "Claude orchestrates while the local model runs the delegated work (sub-agents): /delegate on|off"),
     ("/effort", "Claude Code backend reasoning effort: /effort low|medium|high|xhigh|max (default medium)"),
     ("/cd", "change working directory"),

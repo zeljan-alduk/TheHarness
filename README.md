@@ -60,7 +60,11 @@ GitHub; `HARNESS_NO_UPDATE=1` skips it for one start. Development builds (a `-de
 under `target/`) are left alone.
 
 ## Backends
-- **MLX** (default): the harness downloads Qwen3.8-27B and serves it with `mlx-lm` on loopback — see [Install](#install) and `/localmodel`. Any other OpenAI-compatible server works too (LM Studio, llama-server, OpenAI, OpenRouter…) via `base_url`/`api_key`.
+- **MLX** (default): the harness downloads Qwen3.8-27B and serves it on loopback with `mlx_vlm.server` — the same
+  weights with the vision tower, so images (`ctrl+v`, a path in the prompt) and `/video` frames work — with
+  prefix caching on, falling back to the text-only `mlx_lm.server` if a build refuses to load
+  (`[local_model] server = auto | mlx-vlm | mlx-lm`, `/localmodel vision|text` switches live). See [Install](#install)
+  and `/localmodel`. Any other OpenAI-compatible server works too (LM Studio, llama-server, OpenAI, OpenRouter…) via `base_url`/`api_key`.
 - **Claude Code (subscription)**: `provider = "claude-code"` or `/backend claude [model]` (default `claude-fable-5`).
   The harness runs the official `claude` CLI headlessly (`--print`, stream-json in/out) and exposes its own tools
   to it over an MCP bridge, so permissions, hooks, memory, redaction and the UI all still apply while your

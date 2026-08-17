@@ -8,8 +8,8 @@
 #
 #   harness    prebuilt binary from the latest GitHub release (falls back to `cargo install --git`)
 #   kitty      the terminal the TUI is built for — inline images, font control. Vendor installer, no sudo
-#   MLX        ~/.config/harness/runtime/mlx: a private venv with mlx-lm + mlx-vlm, the fastest way
-#              to run Qwen3.8-27B on an M-series chip
+#   MLX        ~/.config/harness/runtime/mlx: a private venv with mlx-vlm (+ mlx-lm), the fastest way
+#              to run Qwen3.8-27B — with vision — on an M-series chip
 #   claude     the Claude Code CLI: the harness works on Claude while the local model downloads
 #   TheHarness.app in ~/Applications, aliased on the Desktop, opens the harness in kitty
 #
@@ -123,8 +123,9 @@ else
     fi
     # A venv the harness owns, so the runtime is versioned with the harness and removed with it.
     run "$UV" venv --python 3.12 "$RUNTIME/mlx"
-    # mlx-lm serves the text path (it knows the qwen3_5 architecture); mlx-vlm adds the vision tower.
-    run "$UV" pip install --python "$RUNTIME/mlx/bin/python" --quiet --upgrade mlx-lm mlx-vlm
+    # mlx-vlm (>= 0.6.13 knows the qwen3_5 architecture) is the server the harness runs: the same weights with
+    # the vision tower, so the model sees images and video frames. mlx-lm stays as the text-only fallback.
+    run "$UV" pip install --python "$RUNTIME/mlx/bin/python" --quiet --upgrade mlx-lm "mlx-vlm>=0.6.13"
     ok "mlx-lm + mlx-vlm → $RUNTIME/mlx"
 fi
 
