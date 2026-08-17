@@ -359,6 +359,19 @@ pub fn repair_dangling(msgs: &mut Vec<Message>) {
 
 impl<'a> Agent<'a> {
     /// One-shot: fresh transcript, run to completion.
+    /// One line naming the model actually answering and how it is reached. A path-shaped id (what
+    /// `mlx_lm.server` reports) is shown by its directory name, which is the build the user chose.
+    fn identity_line(&self) -> String {
+        let id = self.client.model();
+        let name = if id.starts_with('/') { id.trim_end_matches('/').rsplit('/').next().unwrap_or(id) } else { id };
+        let via = match self.client.provider() {
+            crate::llm::Provider::ClaudeCode => " through the Claude Code CLI on the user's Anthropic subscription".to_string(),
+            crate::llm::Provider::Anthropic => " through the Anthropic API".to_string(),
+            _ => " on a local OpenAI-compatible server".to_string(),
+        };
+        format!("You are running on the model `{name}`{via}, inside TheHarness. If asked which model you are, say this rather than guessing or claiming you cannot know.")
+    }
+
     pub async fn run(&self, system: &str, task: &str) -> Result<(String, RunStats)> {
         let mut msgs = Vec::new();
         self.run_turn(&mut msgs, system, task).await
@@ -373,6 +386,10 @@ impl<'a> Agent<'a> {
     /// Like `run_turn` but the user turn is a prepared message (e.g. text + image parts).
     pub async fn run_turn_message(&self, msgs: &mut Vec<Message>, system: &str, user: Message) -> Result<(String, RunStats)> {
         let start = Instant::now();
+        // "Which model are you?" is a fair question, and the harness knows the answer even though the model
+        // cannot introspect it. Stamp identity into the system message rather than let it guess or refuse.
+        let system = format!("{}\n{}", system.trim_end(), self.identity_line());
+        let system = system.as_str();
         if msgs.is_empty() { msgs.push(Message::system(system)); } else if msgs[0].role == "system" { msgs[0] = Message::system(system); }
         repair_dangling(msgs);
         msgs.push(user);

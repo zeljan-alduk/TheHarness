@@ -75,6 +75,22 @@ const SETTINGS: &[(&str, &str, &[&str], &str)] = &[
 
 // ───────────────────────── custom keybindings ─────────────────────────
 /// ~/.config/harness/keybindings.toml — [bindings] action = "ctrl+x" | "alt+enter" | "shift+tab" | "f5" | "esc" …
+/// The Claude Code models the pickers offer, in the order a picker shows them — the cursor starts on the
+/// first, which is why fable is there. Effort is a separate knob (/effort).
+const CLAUDE_MODELS: &[(&str, &str)] = &[
+    ("claude-fable-5", "the default — fast, strong at code"),
+    ("claude-opus-5", "deepest reasoning, slowest"),
+    ("claude-sonnet-5", "balanced"),
+    ("claude-haiku-4-5", "cheapest, quickest"),
+];
+
+/// What to *show* for a model id. `mlx_lm.server` answers /v1/models with the filesystem path it was
+/// started with, which is long and mostly noise on screen; requests still carry the real id, so only the
+/// display is shortened. Publisher-style ids ("qwen/qwen3.6-35b") keep their slash.
+fn model_label(id: &str) -> &str {
+    if id.starts_with('/') { id.trim_end_matches('/').rsplit('/').next().unwrap_or(id) } else { id }
+}
+
 /// Actions: interrupt, next_task, toggle_panel, toggle_thinking, expand_tools, paste, cycle_permissions, newline,
 /// quit, scroll_up, scroll_down, clear_line, jump_bottom, complete
 #[derive(Clone, Default)]
@@ -893,7 +909,7 @@ impl App {
         self.banner_step = 0;
         self.blocks.push(Block::Startup(vec![
             format!("✻ TheHarness {} — local coding agent", harness::version()),
-            format!("  model  {}", self.model),
+            format!("  model  {}", model_label(&self.model)),
             if self.cfg.llm.provider.as_deref() == Some("claude-code") { "  server claude-code (official CLI, your Anthropic subscription; tools bridged over MCP)".to_string() } else { format!("  server {}", self.cfg.llm.base_url) },
             format!("  cwd    {}", wd),
             {
@@ -1656,15 +1672,48 @@ impl App {
             }
             "/model" => {
                 if arg.is_empty() {
-                    if self.models.is_empty() { self.blocks.push(Block::System(format!("current: {} — the server has not answered /models yet", self.model))); return; }
+                    // Everything you could switch to, in one list: Claude (when its CLI is installed), the
+                    // weights the harness downloaded itself, and whatever the local server is offering.
+                    // Entries switch *backend as well as model*, so picking Claude from a local session — or
+                    // the reverse — does the whole job rather than leaving a model the backend cannot serve.
                     let cur = self.model.clone();
-                    let items = self.models.iter().map(|m| PickItem {
-                        label: m.clone(),
-                        desc: if *m == cur { "● current".into() } else { String::new() },
-                        detail: format!("{}\n\nenter switches to this model{}", m, harness::pricing::price_of(m).map(|p| format!("\nprice: ${}/1M in · ${}/1M out", p.input, p.output)).unwrap_or_else(|| "\nno published price — treated as free in /cost".into())),
-                        run: Some(format!("/model {m}")),
-                    }).collect();
-                    self.pick = Some(ListPicker::new("Models on this server", "enter switches · type to filter · esc closes", items));
+                    let on_claude = self.cfg.llm.provider.as_deref() == Some("claude-code");
+                    let effort = self.cfg.llm.effort.clone().unwrap_or_else(|| "high".into());
+                    let mut items: Vec<PickItem> = Vec::new();
+                    if harness::claude_code::claude_bin().is_some() {
+                        items.extend(CLAUDE_MODELS.iter().map(|(m, note)| PickItem {
+                            label: (*m).to_string(),
+                            desc: format!("Claude · {note}{}", if on_claude && *m == cur { " · ● current" } else { "" }),
+                            detail: format!("{m} through the official Claude Code CLI on your Anthropic subscription, with the \
+                                             harness's tools bridged over MCP.\n\nenter switches the backend to Claude at effort {effort} (/effort changes it)"),
+                            run: Some(format!("/backend claude {m} {effort}")),
+                        }));
+                    }
+                    // Our own build, when the weights are complete but nothing is serving them yet.
+                    if let Some(b) = harness::localmodel::by_name(&self.cfg.local_model.build) {
+                        if matches!(harness::localmodel::state_of(b), harness::localmodel::ModelState::Ready { .. }) && !self.models.iter().any(|m| m.contains(b.name())) {
+                            items.push(PickItem {
+                                label: b.name().to_string(),
+                                desc: format!("local · {} GB on disk · MLX server not running", b.bytes / 1_000_000_000),
+                                detail: format!("{}\n\nThe weights are in ~/.config/harness/models. enter starts the MLX server \
+                                                 ({}) on 127.0.0.1:{} and points the harness at it — loading takes a moment.",
+                                                b.repo, self.cfg.local_model.server, self.cfg.local_model.port),
+                                run: Some("/localmodel serve".into()),
+                            });
+                        }
+                    }
+                    items.extend(self.models.iter().map(|m| PickItem {
+                        label: model_label(m).to_string(),
+                        desc: format!("local · {}{}", self.cfg.llm.base_url.trim_start_matches("http://").trim_start_matches("https://").trim_end_matches("/v1"), if !on_claude && *m == cur { " · ● current" } else { "" }),
+                        detail: format!("{}\n\nenter switches to this model on {}{}", m, self.cfg.llm.base_url,
+                            harness::pricing::price_of(m).map(|p| format!("\nprice: ${}/1M in · ${}/1M out", p.input, p.output)).unwrap_or_else(|| "\nno published price — treated as free in /cost".into())),
+                        run: Some(format!("/backend local {m}")),
+                    }));
+                    if items.is_empty() {
+                        self.blocks.push(Block::System(format!("current: {} — nothing to switch to: {} has not answered /models, no Claude CLI, no local build. /localmodel downloads one.", self.model, self.cfg.llm.base_url)));
+                        return;
+                    }
+                    self.pick = Some(ListPicker::new("Models", "enter switches backend + model · type to filter · esc closes", items));
                 } else { self.model = arg.clone(); self.cfg.llm.model = arg.clone(); self.blocks.push(Block::System(format!("model → {arg}"))); if self.cfg.llm.provider.as_deref() == Some("claude-code") { if let Some(cc) = self.cc.take() { tokio::spawn(async move { cc.stop().await; }); } self.cc_last_session = None; } else { tokio::spawn(fetch_ctx_len(self.cfg.llm.base_url.clone(), arg.clone(), self.tx.clone())); } }
             }
             "/cd" => {
@@ -3081,19 +3130,13 @@ impl App {
                 else { self.blocks.push(Block::Reasoning { text: label(est_tokens, done), streaming: !done, show: None, started: Instant::now(), ended: if done { Some(Instant::now()) } else { None } }); }
                 self.metrics.on_delta(40);
             }
-            Event::Reasoning { text } => {
-                if let Some(Block::Reasoning { text: t, streaming, ended, .. }) = self.blocks.last_mut() { *t = text; *streaming = false; *ended = Some(Instant::now()); }
-                else if !text.trim().is_empty() { let now = Instant::now(); self.blocks.push(Block::Reasoning { text, streaming: false, show: None, started: now, ended: Some(now) }); }
-            }
+            Event::Reasoning { text } => finalize_reasoning(&mut self.blocks, text),
             Event::AssistantDelta { text } => {
                 self.metrics.on_delta(text.chars().count());
                 if let Some(Block::Assistant { text: t, streaming: true, .. }) = self.blocks.last_mut() { t.push_str(&text); }
                 else { self.finish_streaming(); self.blocks.push(Block::Assistant { text, streaming: true, folded: false }); }
             }
-            Event::Assistant { text } => {
-                if let Some(Block::Assistant { text: t, streaming, .. }) = self.blocks.last_mut() { *t = text; *streaming = false; }
-                else if !text.trim().is_empty() { self.blocks.push(Block::Assistant { text, streaming: false, folded: false }); }
-            }
+            Event::Assistant { text } => finalize_assistant(&mut self.blocks, text),
             Event::ToolCall { id, name, args } => { self.finish_streaming(); self.blocks.push(Block::Tool { id, name, args, result: None, secs: 0.0, images: 0, interrupted: false, fold: None }); }
             Event::ToolResult { id, result, secs, images, .. } => {
                 if !images.is_empty() {
@@ -3262,13 +3305,7 @@ impl App {
                 // Signed in, so the choice is the user's: which model, at effort high, or none at all.
                 // Fable is first, which is where the cursor starts.
                 let who = auth.who();
-                let models: &[(&str, &str)] = &[
-                    ("claude-fable-5", "the default — fast, strong at code"),
-                    ("claude-opus-5", "deepest reasoning, slowest"),
-                    ("claude-sonnet-5", "balanced"),
-                    ("claude-haiku-4-5", "cheapest, quickest"),
-                ];
-                let mut items: Vec<PickItem> = models.iter().map(|(m, note)| PickItem {
+                let mut items: Vec<PickItem> = CLAUDE_MODELS.iter().map(|(m, note)| PickItem {
                     label: (*m).to_string(),
                     desc: format!("{note} · effort high"),
                     detail: format!("Runs turns through the official Claude Code CLI on your subscription ({who}), with the \
@@ -3486,6 +3523,49 @@ mod tui_tests {
     }
 
     #[test]
+    fn one_turn_renders_one_answer_even_when_reasoning_streams_first() {
+        // The sequence mlx_lm.server produces: reasoning deltas, then content deltas, then the agent's
+        // end-of-call full Reasoning and Assistant events. Finalising by tail alone appended copies of both.
+        let now = Instant::now();
+        let mut blocks: Vec<Block> = vec![
+            Block::Reasoning { text: "We need".into(), streaming: true, show: None, started: now, ended: None },
+            Block::Assistant { text: "Hello".into(), streaming: true, folded: false },
+        ];
+        finalize_reasoning(&mut blocks, "We need to answer".into());
+        finalize_assistant(&mut blocks, "Hello there".into());
+        assert_eq!(blocks.len(), 2, "the streamed blocks were finalised, not duplicated");
+        match &blocks[0] { Block::Reasoning { text, streaming, ended, .. } => { assert_eq!(text, "We need to answer"); assert!(!streaming); assert!(ended.is_some()); } _ => panic!("block 0 should be the reasoning") }
+        match &blocks[1] { Block::Assistant { text, streaming, .. } => { assert_eq!(text, "Hello there"); assert!(!streaming); } _ => panic!("block 1 should be the answer") }
+
+        // A turn that streamed nothing (a provider that hides thinking) still gets its blocks.
+        let mut fresh: Vec<Block> = Vec::new();
+        finalize_reasoning(&mut fresh, "thought".into());
+        finalize_assistant(&mut fresh, "answer".into());
+        assert_eq!(fresh.len(), 2);
+
+        // An earlier turn's finished answer must not be overwritten by the next turn's.
+        let mut two: Vec<Block> = vec![Block::Assistant { text: "first answer".into(), streaming: false, folded: false }];
+        finalize_assistant(&mut two, "second answer".into());
+        assert_eq!(two.len(), 2, "an unrelated finished answer is left alone");
+        // Empty finals never create a block.
+        let mut none: Vec<Block> = Vec::new();
+        finalize_assistant(&mut none, "   ".into());
+        finalize_reasoning(&mut none, String::new());
+        assert!(none.is_empty());
+    }
+
+    #[test]
+    fn model_label_shortens_paths_only() {
+        // mlx_lm.server reports the directory it was started with
+        assert_eq!(model_label("/Users/a/.config/harness/models/Qwen3.8-27B-MLX-4bit"), "Qwen3.8-27B-MLX-4bit");
+        assert_eq!(model_label("/Users/a/models/Qwen3.8-27B-MLX-4bit/"), "Qwen3.8-27B-MLX-4bit");
+        // publisher-style and plain ids are already what a person wants to read
+        assert_eq!(model_label("qwen/qwen3.6-35b-a3b"), "qwen/qwen3.6-35b-a3b");
+        assert_eq!(model_label("claude-fable-5"), "claude-fable-5");
+        assert_eq!(model_label(""), "");
+    }
+
+    #[test]
     fn completion_prefix() {
         assert_eq!(common_prefix(&["/compact", "/config", "/context"]).as_deref(), Some("/co"));
         assert_eq!(common_prefix(&["only"]).as_deref(), Some("only"));
@@ -3523,7 +3603,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ("/sessions", "pick a saved session (↑/↓/click, enter) · /sessions list · /sessions live · /sessions search <text>"),
     ("/msg", "message another live session: /msg <id|prefix|title|all> <text>"),
     ("/resume", "resume a saved session: /resume <n|id|last>"),
-    ("/model", "browse the models on this server (enter switches) - /model <name> switches directly"),
+    ("/model", "browse every model you can switch to — Claude, the downloaded MLX build, and this server (enter switches backend + model); /model <name> switches directly"),
     ("/backend", "switch backend: local (LM Studio etc.) | claude [model] [effort] (Claude Code CLI, subscription) | anthropic <model>"),
     ("/localmodel", "the local Qwen3.8-27B: pick a 4/6/8-bit build to download (resumable), serve it, or see status"),
     ("/delegate", "Claude orchestrates while the local model runs the delegated work (sub-agents): /delegate on|off"),
@@ -3763,7 +3843,7 @@ fn draw(f: &mut Frame, app: &mut App) {
         // A model name here is a promise that a turn will work; when nothing is loaded, say that instead.
         Span::styled(
             if app.no_model && app.cfg.llm.provider.is_none() { "no model loaded".to_string() }
-            else { format!("{}{}", app.model, if app.cfg.llm.provider.as_deref() == Some("claude-code") { app.cfg.llm.effort.as_ref().map(|e| format!(" · effort {e}")).unwrap_or_default() } else { String::new() }) },
+            else { format!("{}{}", model_label(&app.model), if app.cfg.llm.provider.as_deref() == Some("claude-code") { app.cfg.llm.effort.as_ref().map(|e| format!(" · effort {e}")).unwrap_or_default() } else { String::new() }) },
             Style::default().fg(if app.no_model && app.cfg.llm.provider.is_none() { pal().err } else { pal().cyan })), dot(),
         Span::styled(short_path(&app.workdir), Style::default().fg(pal().cyan))];
     if !app.net { st.push(dot()); st.push(Span::styled("offline", Style::default().fg(pal().pink))); }
@@ -4630,3 +4710,35 @@ fn desktop_notify(title: &str, body: &str) {
     });
 }
 fn short_path(p: &std::path::Path) -> String { let s = p.display().to_string(); let h = harness::setup::home_dir().display().to_string(); if let Some(r) = s.strip_prefix(&h) { return format!("~{r}"); } s }
+
+/// Finalise the reasoning this turn streamed with the complete text.
+///
+/// The streamed block is not necessarily the *last* block: a server that streams reasoning and then
+/// content — `mlx_lm.server` does — leaves an Assistant block on the end, so finalising by tail alone
+/// appended a second copy and every answer appeared twice. Identify it instead: the newest Reasoning block
+/// that is still streaming, or whose partial text is a prefix of what just arrived.
+fn finalize_reasoning(blocks: &mut Vec<Block>, text: String) {
+    match blocks.iter_mut().rev().find_map(|b| match b {
+        Block::Reasoning { text: t, streaming, ended, .. } if *streaming || (!t.is_empty() && text.starts_with(t.as_str())) => Some((t, streaming, ended)),
+        _ => None,
+    }) {
+        Some((t, streaming, ended)) => { *t = text; *streaming = false; *ended = Some(Instant::now()); }
+        None => if !text.trim().is_empty() {
+            let now = Instant::now();
+            blocks.push(Block::Reasoning { text, streaming: false, show: None, started: now, ended: Some(now) });
+        },
+    }
+}
+
+/// The same, for the answer itself.
+fn finalize_assistant(blocks: &mut Vec<Block>, text: String) {
+    match blocks.iter_mut().rev().find_map(|b| match b {
+        Block::Assistant { text: t, streaming, .. } if *streaming || (!t.is_empty() && text.starts_with(t.as_str())) => Some((t, streaming)),
+        _ => None,
+    }) {
+        Some((t, streaming)) => { *t = text; *streaming = false; }
+        None => if !text.trim().is_empty() { blocks.push(Block::Assistant { text, streaming: false, folded: false }); },
+    }
+}
+
+

@@ -56,9 +56,12 @@ fn handle_one(s: &mut TcpStream, data: &[u8], served: &AtomicU64, cut_after: Opt
     };
     s.write_all(head.as_bytes())?;
     let stop = cut_after.map(|n| n.min(slice.len())).unwrap_or(slice.len());
-    s.write_all(&slice[..stop])?;
+    // Count before writing: the client may hang up as soon as it has what it needs (a 1-byte probe does),
+    // and then write_all fails with EPIPE and never gets to increment — which made this flaky on CI.
     served.fetch_add(stop as u64, Ordering::Relaxed);
-    s.flush()
+    let _ = s.write_all(&slice[..stop]);
+    let _ = s.flush();
+    Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -134,8 +137,14 @@ async fn a_complete_file_is_left_alone() {
     std::fs::write(&dest, body()).unwrap();
 
     let http = reqwest::Client::new();
+    let before = std::fs::metadata(&dest).unwrap().modified().unwrap();
     let got = harness::tools::download::fetch_resumable(&http, &url, &dest, 4, Duration::from_secs(30), None).await.expect("no-op");
     assert_eq!(got, SIZE as u64);
-    assert_eq!(served.load(Ordering::Relaxed), 1, "only the 1-byte probe was served, not the file again");
+    // The claim is "it did not re-download", not an exact byte count: only the ranged probe should have
+    // been served, which is a byte or so, never the 8MB body.
+    let served = served.load(Ordering::Relaxed);
+    assert!(served <= 1, "served {served} bytes for a file that was already complete");
+    assert_eq!(std::fs::read(&dest).unwrap(), body(), "the existing file was left intact");
+    assert_eq!(std::fs::metadata(&dest).unwrap().modified().unwrap(), before, "the file was not rewritten");
     let _ = std::fs::remove_dir_all(&dir);
 }
