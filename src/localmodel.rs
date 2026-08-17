@@ -266,16 +266,18 @@ async fn serve_with(model_dir: &Path, port: u16, module: &'static str, opts: &Se
     // prompt cost only its new tail (measured 16s → 0.6s).
     //
     // Qwen3.5 is a hybrid attention/recurrent model, so mlx_vlm can't use its block cache and falls back
-    // to the "exact" whole-prefix snapshot cache. That cache is an LRU whose default size is only TWO
-    // entries — so any small model call interleaved between two agent turns (the session-title, goal-check,
-    // reflection or compaction aux calls all hit the same server) evicts the conversation's snapshot, and
-    // the next turn re-prefills all 13k tokens from scratch. That looks exactly like the model reloading.
-    // Raising it to 8 keeps the conversation cached across those interleaved calls (verified: a 2.4k prompt
-    // stays a 0.7s cache hit after two interleaved aux requests, vs a 20s full re-prefill at the default).
-    // Cost is bounded: ~0.2GB per 5k-token snapshot, so ≤ ~6GB with a large conversation.
+    // to the "exact" whole-prefix snapshot cache: an LRU of full KV snapshots. Its default is 2 entries.
+    //
+    // MEMORY IS THE HARD CONSTRAINT HERE. Each snapshot holds the whole KV for its prefix — ~5GB for a 13k
+    // context on the 27B — so the LRU size trades cache survival against RAM. An earlier build set this to
+    // 8; on real 13–31k contexts that is up to ~40GB of snapshots, which on a 48GB machine forces the model
+    // out to swap and makes the *next* request page ~15GB back in — a 2-minute "reload" that looks exactly
+    // like the model unloading. So keep it small (3): enough that the conversation usually survives the one
+    // interleaved aux call (session-title/goal/reflection) between turns, without blowing the memory budget.
+    // For more headroom, use KV-cache quantization (kv_bits = 8), which halves every snapshot.
     if module == "mlx_vlm.server" {
         cmd.env("APC_ENABLED", "1");
-        cmd.env("APC_EXACT_CACHE_ENTRIES", "8");
+        cmd.env("APC_EXACT_CACHE_ENTRIES", std::env::var("HARNESS_APC_ENTRIES").ok().filter(|v| v.parse::<u32>().is_ok()).unwrap_or_else(|| "3".into()));
     }
     // Speculative decoding: a drafter proposes tokens the target verifies in a batch (opt-in, mlx_vlm only).
     if module == "mlx_vlm.server" && draft.on() {
