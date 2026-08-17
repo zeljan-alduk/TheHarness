@@ -230,6 +230,53 @@ impl MemoryStore {
     }
 
     /// If a file is over the size threshold, ask the model to consolidate it (merge, dedupe, drop stale).
+    /// `/dream`: a full pass over the memory even when nothing is oversized — merge duplicates, drop
+    /// what has gone stale, and (from BRAIN's how-to section) draft skills the agent can load later.
+    /// Returns (consolidated files, drafted skills).
+    pub async fn dream(&self, client: &Client) -> Result<(Vec<String>, Vec<String>)> {
+        let mut files = Vec::new();
+        for f in FILES {
+            let doc = self.read(f)?;
+            if doc.trim().is_empty() { continue; }
+            let system = "You tidy an AI agent's markdown memory file. Rewrite it: keep the same top-level structure and headings, merge duplicates and near-duplicates, drop stale or contradictory entries (keep the newer), keep every distinct durable fact, keep the per-project ledger lines (they contain 'sessions:') verbatim. Output only the new markdown.";
+            let req = vec![Message::system(system), Message::user(doc.clone())];
+            let Ok((reply, _)) = client.chat(&req, &[]).await else { continue };
+            let new = reply.text();
+            let new = strip_fence(&new);
+            // never accept a rewrite that throws most of the file away
+            if new.trim().len() < doc.trim().len() / 3 || new.trim().is_empty() { continue; }
+            if new.trim() != doc.trim() { std::fs::write(self.path(f)?, new.trim_end().to_string() + "\n")?; files.push(f.to_string()); }
+        }
+        let skills = self.draft_skills(client).await.unwrap_or_default();
+        Ok((files, skills))
+    }
+
+    /// Turn recurring how-to knowledge into skill drafts under `<memory dir>/skills/<name>/SKILL.md`,
+    /// where the normal skill discovery picks them up. Existing skills are never overwritten.
+    pub async fn draft_skills(&self, client: &Client) -> Result<Vec<String>> {
+        let brain = self.read("BRAIN.md")?;
+        let workflows = self.read("WORKFLOWS.md")?;
+        if brain.trim().is_empty() && workflows.trim().is_empty() { return Ok(vec![]); }
+        let system = "You turn an agent's accumulated notes into reusable skills. A skill is worth writing only when the notes describe a repeatable procedure with concrete steps (commands, files, order). Reply with JSON only:\n{\"skills\": [{\"name\": \"kebab-case\", \"description\": \"one line, when to use it\", \"body\": \"markdown instructions\"}]}\nAt most 2 skills; an empty list is the normal answer.";
+        let user = format!("BRAIN.md:\n{}\n\nWORKFLOWS.md:\n{}", crate::llm::truncate_for_log(&brain, 8000), crate::llm::truncate_for_log(&workflows, 8000));
+        let (reply, _) = client.chat(&[Message::system(system), Message::user(user)], &[]).await?;
+        let Some(json) = extract_json(&reply.text()) else { return Ok(vec![]) };
+        #[derive(Deserialize)] struct Sk { name: String, description: String, body: String }
+        #[derive(Deserialize, Default)] struct Out { #[serde(default)] skills: Vec<Sk> }
+        let out: Out = serde_json::from_str(&json).unwrap_or_default();
+        let mut made = Vec::new();
+        for sk in out.skills.into_iter().take(2) {
+            let name: String = sk.name.trim().to_lowercase().chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '-' }).collect();
+            if name.is_empty() || sk.body.trim().is_empty() { continue; }
+            let dir = self.dir.join("skills").join(&name);
+            if dir.join("SKILL.md").exists() { continue; }
+            std::fs::create_dir_all(&dir)?;
+            std::fs::write(dir.join("SKILL.md"), format!("---\nname: {name}\ndescription: {}\n---\n{}\n", sk.description.trim(), sk.body.trim()))?;
+            made.push(name);
+        }
+        Ok(made)
+    }
+
     pub async fn maybe_consolidate(&self, client: &Client) -> Result<Vec<String>> {
         let mut done = Vec::new();
         for f in FILES {
@@ -281,6 +328,14 @@ fn compact_transcript(msgs: &[Message], max_chars: usize) -> String {
     let n = out.chars().count();
     if n > max_chars { out = format!("…[{} chars elided]\n{}", n - max_chars, out.chars().skip(n - max_chars).collect::<String>()); }
     out
+}
+
+/// Drop a ```markdown fence if the model wrapped its answer in one.
+fn strip_fence(s: &str) -> String {
+    let t = s.trim();
+    let Some(rest) = t.strip_prefix("```") else { return t.to_string() };
+    let rest = rest.splitn(2, '\n').nth(1).unwrap_or("");
+    rest.trim_end().trim_end_matches("```").trim_end().to_string()
 }
 
 /// First balanced JSON object/array in a model reply (it may be fenced or wrapped in prose).

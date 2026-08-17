@@ -6,7 +6,7 @@
 //! the repository instead of in a prompt someone pasted once.
 
 use crate::config::Config;
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, Result};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::time::Duration;

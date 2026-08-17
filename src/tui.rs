@@ -1771,6 +1771,34 @@ impl App {
                     let _ = tx.send(Msg::Review(diff));
                 });
             }
+            "/dream" => {
+                let (cfg, tx) = (self.cfg.clone(), self.tx.clone());
+                self.set_status("consolidating memory…");
+                self.blocks.push(Block::System("dreaming: merging duplicates, dropping stale notes, drafting skills from what was learned…".into()));
+                tokio::spawn(async move {
+                    let Ok(store) = harness::memory::MemoryStore::open(&cfg.memory) else { let _ = tx.send(Msg::Notice("memory is disabled".into())); return };
+                    let Ok(client) = Client::new(&cfg.llm) else { return };
+                    let msg = match store.dream(&client.role("memory")).await {
+                        Ok((files, skills)) => {
+                            let mut m = if files.is_empty() { "memory was already tidy".to_string() } else { format!("consolidated: {}", files.join(", ")) };
+                            if !skills.is_empty() { m.push_str(&format!(" · drafted skill(s): {} (load_skill them, or edit under {}/skills)", skills.join(", "), store.dir.display())); }
+                            m
+                        }
+                        Err(e) => format!("dream failed: {e:#}"),
+                    };
+                    let _ = tx.send(Msg::Notice(msg));
+                });
+            }
+            "/learn" => {
+                if arg.trim().is_empty() { self.blocks.push(Block::System("/learn <url|path> [as <name>] — read it and write a skill you can load later".into())); return; }
+                let (src, name) = match arg.split_once(" as ") { Some((s, n)) => (s.trim().to_string(), Some(n.trim().to_string())), None => (arg.trim().to_string(), None) };
+                let dir = harness::memory::MemoryStore::open(&self.cfg.memory).map(|s| s.dir.join("skills")).unwrap_or_else(|_| harness::setup::config_dir().join("skills"));
+                let prompt = format!(
+"Learn from {src} and write a skill.\n\n1. Read it: {} for a URL, otherwise read_file / list_dir (and grep) for a path.\n2. Work out what a future agent would actually need: when this applies, the exact steps, commands, file paths, gotchas — not a summary of the prose.\n3. Write it to {}/SKILL.md with frontmatter (name, description: one line saying when to use it), then confirm what you wrote in one sentence.",
+                    if src.starts_with("http") { "web_fetch" } else { "read_file" },
+                    dir.join(name.unwrap_or_else(|| "<kebab-case-name>".into())).display());
+                if self.running.is_some() { self.queued.push(prompt); self.set_status("queued /learn"); } else { self.start_run(prompt); }
+            }
             "/commands" => {
                 let cmds = harness::commands::discover(&self.workdir);
                 if cmds.is_empty() {
@@ -2625,6 +2653,8 @@ const COMMANDS: &[(&str, &str)] = &[
     ("/workflows", "show WORKFLOWS.md (recipes)"),
     ("/remember", "add a note: /remember <text> | brain: <text> | workflows: <text>"),
     ("/reflect", "ask the model what to remember from this session"),
+    ("/dream", "consolidate memory: merge duplicates, drop stale notes, draft skills from what was learned"),
+    ("/learn", "learn a URL or directory into a skill: /learn <url|path> [as <name>]"),
     ("/video", "open the frame scrubber for a video: /video <path>"),
     ("/plugin", "plugins: list · install <owner/repo> · enable|disable|remove|update|info <name>"),
     ("/mcp", "show configured MCP servers and live MCP tools"),

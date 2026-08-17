@@ -85,6 +85,8 @@ enum Cmd {
         #[arg(short, long)]
         out: Option<PathBuf>,
     },
+    /// Consolidate the memory files and draft skills from what was learned (the `/dream` pass)
+    Dream,
     /// Review a pull request (or the working branch): structured findings, optionally posted or fixed
     Review {
         #[arg(short = 'C', long)]
@@ -626,6 +628,12 @@ async fn main() -> Result<()> {
                 report.total_prompt_tokens, report.total_completion_tokens, report.total_wall_secs, out.display());
             println!("{}", serde_json::to_string(&serde_json::json!({"passed": report.passed, "total": report.total, "score": report.score}))?);
             if report.passed < report.total { std::process::exit(1); }
+        }
+        Cmd::Dream => {
+            let store = harness::memory::MemoryStore::open(&cfg.memory)?;
+            let (files, skills) = store.dream(&client.role("memory")).await?;
+            println!("{}", if files.is_empty() { "memory was already tidy".to_string() } else { format!("consolidated: {}", files.join(", ")) });
+            if !skills.is_empty() { println!("drafted skill(s): {} — under {}/skills", skills.join(", "), store.dir.display()); }
         }
         Cmd::Review { dir, pr, base, comment, fix, max_turns } => {
             let workdir = dir.unwrap_or(std::env::current_dir()?).canonicalize().context("workdir does not exist")?;
