@@ -85,6 +85,19 @@ enum Cmd {
         #[arg(short, long)]
         out: Option<PathBuf>,
     },
+    /// Drive the agent from a chat app (Telegram): tasks in, answers out, approvals from your phone
+    Connect {
+        /// Which service (telegram)
+        service: String,
+        /// Bot token (or $TELEGRAM_BOT_TOKEN)
+        #[arg(long)]
+        token: Option<String>,
+        /// Chat ids allowed to drive it (default: the first chat that messages the bot)
+        #[arg(long)]
+        allow: Vec<i64>,
+        #[arg(short = 'C', long)]
+        dir: Option<PathBuf>,
+    },
     /// Consolidate the memory files and draft skills from what was learned (the `/dream` pass)
     Dream,
     /// Review a pull request (or the working branch): structured findings, optionally posted or fixed
@@ -632,6 +645,16 @@ async fn main() -> Result<()> {
                 report.total_prompt_tokens, report.total_completion_tokens, report.total_wall_secs, out.display());
             println!("{}", serde_json::to_string(&serde_json::json!({"passed": report.passed, "total": report.total, "score": report.score}))?);
             if report.passed < report.total { std::process::exit(1); }
+        }
+        Cmd::Connect { service, token, allow, dir } => {
+            let workdir = dir.unwrap_or(std::env::current_dir()?).canonicalize().context("workdir does not exist")?;
+            match service.to_lowercase().as_str() {
+                "telegram" | "tg" => {
+                    let token = token.or_else(|| std::env::var("TELEGRAM_BOT_TOKEN").ok()).context("pass --token or set TELEGRAM_BOT_TOKEN (get one from @BotFather)")?;
+                    harness::connect::telegram(cfg, &token, allow, workdir).await?;
+                }
+                other => bail!("unknown service '{other}' (telegram)"),
+            }
         }
         Cmd::Dream => {
             let store = harness::memory::MemoryStore::open(&cfg.memory)?;

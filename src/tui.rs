@@ -164,7 +164,7 @@ fn builtin_pal() -> Pal {
 const SPINNER: [&str; 10] = ["✻", "✼", "✽", "✾", "✿", "❀", "✿", "✾", "✽", "✼"];
 const WORDS: [&str; 12] = ["Thinking", "Pondering", "Working", "Reasoning", "Cooking", "Tinkering", "Brewing", "Mulling", "Crunching", "Percolating", "Noodling", "Computing"];
 
-enum Msg { Toast(String), Title(String), Question(harness::permissions::Question, tokio::sync::oneshot::Sender<harness::permissions::Answer>), SubEnv(Arc<harness::agent::SubAgentEnv>), Policy(Arc<harness::permissions::Policy>), CcSession(Arc<harness::claude_code::ClaudeCodeSession>), CcSid(String), Block(Block), Ask(harness::permissions::ApprovalRequest, tokio::sync::oneshot::Sender<harness::permissions::Approval>), Ev(Event), Done(Result<(String, harness::agent::RunStats), String>), Sys(SysSample), CtxLen(u64), Pasted(Result<PathBuf, String>), Frames(Result<(PathBuf, f64, Vec<(f64, PathBuf)>), String>), Toolset(Arc<Toolset>), Catalog(Result<harness::plugins::Catalog, String>), Notice(String), Improve(harness::selfimprove::Stage), GoalCheck(bool, String), Review(String), AcpSession(Arc<harness::acp_client::AcpSession>), RunTask(String), QueueTask(String), StatusLine(String) }
+enum Msg { Toast(String), Title(String), Question(harness::permissions::Question, tokio::sync::oneshot::Sender<harness::permissions::Answer>), SubEnv(Arc<harness::agent::SubAgentEnv>), Policy(Arc<harness::permissions::Policy>), CcSession(Arc<harness::claude_code::ClaudeCodeSession>), CcSid(String), Block(Block), Ask(harness::permissions::ApprovalRequest, tokio::sync::oneshot::Sender<harness::permissions::Approval>), Ev(Event), Done(Result<(String, harness::agent::RunStats), String>), Sys(SysSample), CtxLen(u64), Pasted(Result<PathBuf, String>), Frames(Result<(PathBuf, f64, Vec<(f64, PathBuf)>), String>), Toolset(Arc<Toolset>), Catalog(Result<harness::plugins::Catalog, String>), Notice(String), Improve(harness::selfimprove::Stage), GoalCheck(bool, String), Review(String), AcpSession(Arc<harness::acp_client::AcpSession>), RunTask(String), QueueTask(String), StatusLine(String), Dictated(String) }
 
 /// One hunk of the working-tree diff, as `/review-diff` shows it.
 #[derive(Clone, Debug)]
@@ -1842,6 +1842,33 @@ impl App {
                     let _ = tx.send(Msg::Notice(msg));
                 });
             }
+            "/voice" => {
+                let secs: u64 = arg.trim().parse().unwrap_or(8);
+                let tx = self.tx.clone();
+                let (rec, transcribe) = (voice_record_command(), voice_transcribe_command());
+                let (Some(rec), Some(transcribe)) = (rec, transcribe) else {
+                    self.blocks.push(Block::Error("voice needs a recorder (ffmpeg or sox/arecord) and whisper.cpp (`whisper-cli`/`whisper`) or openai-whisper on PATH".into()));
+                    return;
+                };
+                self.set_status(format!("recording {secs}s… (speak now)"));
+                let wd = self.workdir.clone();
+                tokio::spawn(async move {
+                    let wav = std::env::temp_dir().join(format!("harness-voice-{}.wav", std::process::id()));
+                    let w = wav.display().to_string();
+                    let r = harness::sandbox::run_shell(&rec.replace("{secs}", &secs.to_string()).replace("{out}", &w), &wd, Duration::from_secs(secs + 20), 4000).await;
+                    if r.map(|o| !wav.is_file() || o.timed_out).unwrap_or(true) { let _ = tx.send(Msg::Notice("recording failed".into())); return; }
+                    let t = harness::sandbox::run_shell(&transcribe.replace("{in}", &w), &wd, Duration::from_secs(180), 20000).await;
+                    let _ = std::fs::remove_file(&wav);
+                    match t {
+                        Ok(o) if o.success() => {
+                            let text = o.stdout.lines().filter(|l| !l.trim().is_empty() && !l.starts_with('[')).collect::<Vec<_>>().join(" ").trim().to_string();
+                            let _ = tx.send(if text.is_empty() { Msg::Notice("nothing transcribed".into()) } else { Msg::Dictated(text) });
+                        }
+                        Ok(o) => { let _ = tx.send(Msg::Notice(format!("transcription failed: {}", truncate(o.stderr.trim(), 160)))); }
+                        Err(e) => { let _ = tx.send(Msg::Notice(format!("transcription failed: {e:#}"))); }
+                    }
+                });
+            }
             "/spec" => {
                 let a = arg.trim().to_string();
                 if a.is_empty() {
@@ -2470,6 +2497,7 @@ impl App {
             Msg::SubEnv(e) => { self.subenv = Some(e); }
             Msg::Title(t) => { self.session_meta.title = t; self.save_session(); }
             Msg::Toast(t) => { self.toast = Some((t, Instant::now())); }
+            Msg::Dictated(t) => { if !self.input.is_empty() && !self.input.ends_with(' ') { self.insert_str(" "); } self.insert_str(&t); self.set_status("dictated — edit and press enter"); }
             Msg::Question(q, tx) => {
                 let mut lines = vec![format!("❓ {}", q.question)];
                 for (i, o) in q.options.iter().enumerate() { lines.push(format!("   [{}] {}{}", i + 1, o.label, if o.description.is_empty() { String::new() } else { format!(" — {}", o.description) })); }
@@ -2748,6 +2776,29 @@ mod tui_tests {
     }
 }
 
+/// How to record a few seconds of microphone audio on this machine ({secs}, {out} are substituted).
+fn voice_record_command() -> Option<String> {
+    if cfg!(target_os = "macos") && harness::setup::which("ffmpeg").is_some() {
+        return Some("ffmpeg -hide_banner -loglevel error -f avfoundation -i :default -t {secs} -ar 16000 -ac 1 -y {out}".into());
+    }
+    if harness::setup::which("arecord").is_some() { return Some("arecord -q -f S16_LE -r 16000 -c 1 -d {secs} {out}".into()); }
+    if harness::setup::which("sox").is_some() { return Some("sox -q -d -r 16000 -c 1 {out} trim 0 {secs}".into()); }
+    if harness::setup::which("ffmpeg").is_some() { return Some("ffmpeg -hide_banner -loglevel error -f alsa -i default -t {secs} -ar 16000 -ac 1 -y {out}".into()); }
+    None
+}
+
+/// How to turn that wav into text ({in} is substituted): whisper.cpp, then openai-whisper.
+fn voice_transcribe_command() -> Option<String> {
+    for bin in ["whisper-cli", "whisper-cpp", "main"] {
+        if harness::setup::which(bin).is_some() {
+            let model = harness::setup::home_dir().join(".config/harness/models/ggml-base.en.bin");
+            if model.is_file() { return Some(format!("{bin} -m {} -f {{in}} -nt -np", model.display())); }
+        }
+    }
+    if harness::setup::which("whisper").is_some() { return Some("whisper {in} --model base.en --output_format txt --output_dir /tmp --fp16 False 2>/dev/null && cat /tmp/$(basename {in} .wav).txt".into()); }
+    None
+}
+
 const COMMANDS: &[(&str, &str)] = &[
     ("/help", "show commands and keys"),
     ("/clear", "start a new session (forget the transcript)"),
@@ -2789,6 +2840,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ("/trust", "remember this directory as trusted (no first-time notice)"),
     ("/theme", "switch theme: /theme light|dark|<name> · /theme list (custom themes are JSON in ~/.config/harness/themes)"),
     ("/vim", "toggle vim-style modal editing in the prompt"),
+    ("/voice", "dictate the prompt: /voice [seconds] (needs ffmpeg/sox + whisper.cpp)"),
     ("/workflow", "run a workflow: /workflow <name> [args]  (list with /workflow)"),
     ("/queue", "queue a task instead of steering: /queue <text> · show the queue · /queue clear"),
     ("/jobs", "persistent scheduled jobs (harness daemon runs them): /jobs · /jobs run <name> · /jobs remove <name>"),

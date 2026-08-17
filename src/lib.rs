@@ -12,6 +12,7 @@ pub mod checkpoints;
 pub mod claude_code;
 pub mod commands;
 pub mod config;
+pub mod connect;
 pub mod eval;
 pub mod events;
 pub mod export;
