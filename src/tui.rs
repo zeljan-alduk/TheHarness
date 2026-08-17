@@ -113,7 +113,48 @@ fn parse_key(s: &str) -> Option<(KeyCode, KeyModifiers)> {
 #[derive(Clone, Copy)]
 struct Pal { orange: Color, dim: Color, ok: Color, err: Color, think: Color, blue: Color, pink: Color, cyan: Color, fg: Color, panel_bg: Color }
 static LIGHT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// A palette loaded from ~/.config/harness/themes/<name>.json (keys: orange, dim, ok, err, think,
+/// blue, pink, cyan, fg, panel_bg; values "#rrggbb"). Set with /theme <name>.
+static CUSTOM: std::sync::Mutex<Option<Pal>> = std::sync::Mutex::new(None);
+
+fn hex_color(s: &str) -> Option<Color> {
+    let h = s.trim().trim_start_matches('#');
+    if h.len() != 6 { return None; }
+    let n = u32::from_str_radix(h, 16).ok()?;
+    Some(Color::Rgb((n >> 16) as u8, (n >> 8) as u8, n as u8))
+}
+
+/// Theme names available: the built-ins plus every JSON file in the themes directory.
+fn theme_names() -> Vec<String> {
+    let mut v = vec!["dark".to_string(), "light".to_string()];
+    if let Ok(rd) = std::fs::read_dir(harness::setup::config_dir().join("themes")) {
+        for e in rd.flatten() { if e.path().extension().map(|x| x == "json").unwrap_or(false) { if let Some(n) = e.path().file_stem() { v.push(n.to_string_lossy().to_string()); } } }
+    }
+    v.sort(); v.dedup(); v
+}
+
+/// Load a custom theme file over the current base palette. Returns what it could not parse.
+fn load_theme(name: &str) -> Result<(), String> {
+    let path = harness::setup::config_dir().join("themes").join(format!("{name}.json"));
+    let text = std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let v: serde_json::Value = serde_json::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
+    let base = { let dark = v["base"].as_str().unwrap_or("dark") == "dark"; LIGHT.store(!dark, std::sync::atomic::Ordering::Relaxed); builtin_pal() };
+    let g = |k: &str, d: Color| v[k].as_str().and_then(hex_color).unwrap_or(d);
+    let p = Pal {
+        orange: g("orange", base.orange), dim: g("dim", base.dim), ok: g("ok", base.ok), err: g("err", base.err),
+        think: g("think", base.think), blue: g("blue", base.blue), pink: g("pink", base.pink), cyan: g("cyan", base.cyan),
+        fg: g("fg", base.fg), panel_bg: g("panel_bg", base.panel_bg),
+    };
+    *CUSTOM.lock().unwrap() = Some(p);
+    Ok(())
+}
+
 fn pal() -> Pal {
+    if let Some(p) = *CUSTOM.lock().unwrap() { return p; }
+    builtin_pal()
+}
+
+fn builtin_pal() -> Pal {
     if LIGHT.load(std::sync::atomic::Ordering::Relaxed) {
         Pal { orange: Color::Rgb(200, 90, 0), dim: Color::Rgb(110, 116, 130), ok: Color::Rgb(20, 140, 80), err: Color::Rgb(200, 40, 40), think: Color::Rgb(110, 70, 220), blue: Color::Rgb(20, 100, 220), pink: Color::Rgb(200, 40, 90), cyan: Color::Rgb(0, 130, 150), fg: Color::Black, panel_bg: Color::Rgb(225, 228, 235) }
     } else {
@@ -567,6 +608,7 @@ pub async fn run(cfg: Config, resume: Option<String>) -> Result<()> {
         });
     }
 
+    if !matches!(app.cfg.ui.theme.as_str(), "dark" | "light") { let _ = load_theme(&app.cfg.ui.theme.clone()); }
     let mut terminal = ratatui::init();
     let _ = crossterm::execute!(std::io::stdout(), crossterm::event::EnableBracketedPaste, crossterm::event::EnableMouseCapture);
     let kbd_enh = crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false);
@@ -1435,7 +1477,18 @@ impl App {
             }
             "/trust" => { harness::permissions::trust(&self.workdir); self.blocks.push(Block::System(format!("{} is now a trusted directory", short_path(&self.workdir)))); }
             "/vim" => { self.vim = !self.vim; self.vim_normal = false; self.blocks.push(Block::System(format!("vim mode {} — esc → NORMAL (h/l/w/b/0/$ move, x delete, d clear, i/a/A/I insert, j/k history, : starts a /command, enter sends)", if self.vim { "on" } else { "off" }))); }
-            "/theme" => { let light = match arg.as_str() { "light" => true, "dark" => false, _ => !LIGHT.load(std::sync::atomic::Ordering::Relaxed) }; LIGHT.store(light, std::sync::atomic::Ordering::Relaxed); self.blocks.push(Block::System(format!("theme → {}", if light { "light" } else { "dark" }))); }
+            "/theme" => {
+                let want = arg.trim().to_string();
+                match want.as_str() {
+                    "" => { let light = !LIGHT.load(std::sync::atomic::Ordering::Relaxed); *CUSTOM.lock().unwrap() = None; LIGHT.store(light, std::sync::atomic::Ordering::Relaxed); self.blocks.push(Block::System(format!("theme → {} · available: {}", if light { "light" } else { "dark" }, theme_names().join(", ")))); }
+                    "light" | "dark" => { *CUSTOM.lock().unwrap() = None; LIGHT.store(want == "light", std::sync::atomic::Ordering::Relaxed); self.blocks.push(Block::System(format!("theme → {want}"))); }
+                    "list" => self.blocks.push(Block::Banner(vec![format!("themes: {}", theme_names().join(", ")), format!("custom themes are JSON files in {} — keys: base (dark|light), orange, dim, ok, err, think, blue, pink, cyan, fg, panel_bg (\"#rrggbb\")", harness::setup::config_dir().join("themes").display())])),
+                    name => match load_theme(name) {
+                        Ok(()) => self.blocks.push(Block::System(format!("theme → {name}"))),
+                        Err(e) => self.blocks.push(Block::Error(format!("theme {name}: {e} · /theme list"))),
+                    },
+                }
+            }
             "/plan" => { let m = if self.perm_mode == harness::permissions::Mode::Plan { harness::permissions::Mode::Auto } else { harness::permissions::Mode::Plan }; self.set_perm_mode(m); self.blocks.push(Block::System(format!("permissions → {}", self.perm_mode.label()))); }
             "/context" | "/ctx" => {
                 let tx = self.tx.clone(); let session = self.session.clone(); let cfg = self.cfg.clone(); let workdir = self.workdir.clone(); let toolset = self.toolset.clone();
@@ -2734,7 +2787,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ("/permissions", "show or set permission mode: bypass|auto|ask|plan"),
     ("/plan", "toggle plan mode (read-only)"),
     ("/trust", "remember this directory as trusted (no first-time notice)"),
-    ("/theme", "switch theme: /theme light|dark"),
+    ("/theme", "switch theme: /theme light|dark|<name> · /theme list (custom themes are JSON in ~/.config/harness/themes)"),
     ("/vim", "toggle vim-style modal editing in the prompt"),
     ("/workflow", "run a workflow: /workflow <name> [args]  (list with /workflow)"),
     ("/queue", "queue a task instead of steering: /queue <text> · show the queue · /queue clear"),

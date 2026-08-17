@@ -114,6 +114,15 @@ diagnostics_after_edit = true
 # [llm.pricing]
 # "my-hosted-model*" = { input = 1.0, output = 3.0 }
 
+[telemetry]
+# OpenTelemetry export (OTLP/HTTP + JSON). Empty endpoint = off. Events become log records with GenAI
+# semconv attributes (tokens, tool names/durations, permission decisions, cost); tool arguments and
+# model text are only included with include_content = true.
+otlp_endpoint = ""
+# include_content = false
+# [telemetry.attributes]
+# deployment = "laptop"
+
 [hooks]
 # Hooks get the event as JSON and may answer with JSON:
 #   {"decision":"block"|"allow","reason":"…","updatedInput":{…},"context":"…"}

@@ -73,6 +73,8 @@ impl Prepared {
 /// Wire up a run (opens memory, starts MCP servers unless a toolset was supplied, probes context length).
 pub async fn prepare(setup: RunSetup) -> Result<Prepared> {
     let RunSetup { cfg, workdir, sink, approver, prompt_extra, perm_mode, toolset, context_length, todos, extra_roots, inbox, cwd, session_id } = setup;
+    // OTLP export, when configured, wraps whatever sink the front-end supplied
+    let sink = crate::telemetry::OtelSink::wrap(sink, cfg.telemetry.clone(), "harness");
     let client = Client::new(&cfg.llm)?;
     let store = if cfg.memory.enabled { crate::memory::MemoryStore::open(&cfg.memory).ok() } else { None };
     if let Some(m) = &store { let _ = m.touch_project(&workdir); }

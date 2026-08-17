@@ -28,6 +28,8 @@ pub struct Config {
     pub checkpoints: crate::checkpoints::CheckpointsConfig,
     #[serde(default)]
     pub format: crate::format::FormatConfig,
+    #[serde(default)]
+    pub telemetry: crate::telemetry::TelemetryConfig,
     /// Smart self-improvement loop (`harness improve`, `/improve`).
     #[serde(default, rename = "self")]
     pub selfimprove: SelfConfig,

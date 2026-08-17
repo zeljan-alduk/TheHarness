@@ -44,6 +44,7 @@ pub mod security;
 pub mod sessions;
 pub mod setup;
 pub mod skills;
+pub mod telemetry;
 pub mod tools;
 pub mod workflow;
 pub mod worktree;
