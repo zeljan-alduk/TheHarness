@@ -56,10 +56,38 @@ pub fn shell_program() -> (String, &'static str) {
     ("/bin/sh".to_string(), "-c")
 }
 
-/// The shell command every tool-spawned process goes through: sandbox wrapper (seatbelt/bwrap if
-/// configured), scrubbed env (no secrets), harness PATH, stdin closed, own session (process group),
-/// killed on drop. Stdout/stderr are left to the caller.
+/// Container sandbox: run the command inside an image with the working directory mounted, so a
+/// mistake cannot touch the rest of the machine. Configured with `[sandbox] mode = "docker"` and
+/// `image = "..."`; `deny_network` maps to `--network none`.
+static CONTAINER: std::sync::OnceLock<Option<(String, String, bool)>> = std::sync::OnceLock::new();
+pub fn configure_container(mode: &str, image: &str, deny_network: bool) {
+    let engine = match mode { "docker" => "docker", "podman" => "podman", "container" => if crate::setup::which("docker").is_some() { "docker" } else { "podman" }, _ => return };
+    let _ = CONTAINER.set(Some((engine.to_string(), if image.trim().is_empty() { "debian:stable-slim".to_string() } else { image.to_string() }, deny_network)));
+}
+
+fn container_command(cmd: &str, cwd: &Path) -> Option<Command> {
+    let (engine, image, deny_net) = CONTAINER.get().cloned().flatten()?;
+    let dir = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
+    let dirs = dir.display().to_string();
+    let mut c = Command::new(&engine);
+    c.args(["run", "--rm", "-i", "--init"]);
+    if deny_net { c.args(["--network", "none"]); }
+    c.args(["-v", &format!("{dirs}:{dirs}"), "-w", &dirs]);
+    // the agent's own bin dir is useful inside too, when it exists
+    let bin = crate::setup::bin_dir();
+    if bin.is_dir() { let b = bin.display().to_string(); c.args(["-v", &format!("{b}:{b}:ro")]); }
+    for (k, v) in std::env::vars() { if !is_secret_env(&k) && matches!(k.as_str(), "LANG" | "LC_ALL" | "TERM" | "TZ") { c.args(["-e", &format!("{k}={v}")]); } }
+    c.args(["-e", "HARNESS=1", "-e", "CI=1"]);
+    c.arg(&image).args(["/bin/sh", "-c", cmd]);
+    c.current_dir(&dir).stdin(Stdio::null()).kill_on_drop(true);
+    Some(c)
+}
+
+/// The shell command every tool-spawned process goes through: container or sandbox wrapper
+/// (docker/podman, seatbelt, bwrap) if configured, scrubbed env (no secrets), harness PATH, stdin
+/// closed, own session (process group), killed on drop. Stdout/stderr are left to the caller.
 pub fn build_shell_command(cmd: &str, cwd: &Path) -> Command {
+    if let Some(c) = container_command(cmd, cwd) { return c; }
     let seatbelt = SEATBELT.get().cloned().flatten().filter(|_| cfg!(target_os = "macos") && Path::new("/usr/bin/sandbox-exec").exists());
     let (prog, flag) = shell_program();
     let bwrap = SEATBELT.get().cloned().flatten().filter(|_| cfg!(target_os = "linux") && crate::setup::which("bwrap").is_some());

@@ -153,8 +153,10 @@ event_log = true       # ~/.config/harness/logs/<date>/tui-<pid>.jsonl
 
 [sandbox]
 # "none" | "seatbelt" (macOS sandbox-exec) | "bwrap" (Linux bubblewrap): shell may only write inside the
-# workdir, temp dirs and ~/.config/harness (+allow_write); deny_network = true blocks outbound connections
+# workdir, temp dirs and ~/.config/harness (+allow_write). "docker" | "podman" runs every shell command
+# inside `image` with the working directory mounted. deny_network = true blocks outbound connections.
 mode = "none"
+# image = "debian:stable-slim"
 deny_network = false
 allow_write = []
 

@@ -1,0 +1,5 @@
+name = "py_cli_exit_codes"
+tags = ["python", "cli", "medium"]
+prompt = "Write check_json.py: it takes one argument, a path to a JSON file. Print 'ok' and exit 0 when the file parses; print the parse error to stderr and exit 1 when it does not; print 'no such file: <path>' to stderr and exit 2 when the file is missing; with no argument, print a usage line to stderr and exit 64. `sh check.sh` must pass."
+check = "sh check.sh"
+max_turns = 20

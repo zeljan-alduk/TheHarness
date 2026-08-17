@@ -390,6 +390,7 @@ async fn main() -> Result<()> {
     if !cfg.llm.pricing.is_empty() { harness::pricing::configure(cfg.llm.pricing.iter().map(|(k, v)| (k.clone(), *v)).collect()); }
     if cfg.net.proxy.enabled { harness::proxy::configure(cfg.net.proxy.clone()).await.context("starting the network allow-list proxy")?; }
     sandbox::configure_seatbelt(cfg.sandbox.mode == "seatbelt" || cfg.sandbox.mode == "bwrap", cfg.sandbox.deny_network, cfg.sandbox.allow_write.clone());
+    sandbox::configure_container(&cfg.sandbox.mode, &cfg.sandbox.image, cfg.sandbox.deny_network);
     let client = llm::Client::new(&cfg.llm)?;
 
     match cli.cmd.unwrap_or(Cmd::Chat) {

@@ -1,0 +1,5 @@
+name = "js_debounce_fix"
+tags = ["javascript", "fix", "medium"]
+prompt = "debounce.js has a broken debounce(): it fires on every call instead of only after the wait, and it loses `this` and the latest arguments. Fix it so `node test.js` passes. Do not change test.js."
+check = "node test.js"
+max_turns = 20

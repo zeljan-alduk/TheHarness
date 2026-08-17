@@ -1,0 +1,5 @@
+name = "py_json_merge"
+tags = ["python", "write", "medium"]
+prompt = "Write merge.py with a function `deep_merge(a, b)` that returns a new dict merging b into a recursively: nested dicts merge, lists concatenate, and any other type in b wins. Neither input may be mutated. Make `python3 test_merge.py` pass without editing the tests."
+check = "python3 test_merge.py"
+max_turns = 20

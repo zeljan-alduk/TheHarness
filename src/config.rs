@@ -68,9 +68,12 @@ pub struct LspConfig {
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct SandboxConfig {
-    /// "none" (default) or "seatbelt" (macOS sandbox-exec: shell commands may only write inside the
-    /// workdir, $TMPDIR and ~/.config/harness; set deny_network to also block outbound network).
+    /// "none" (default), "seatbelt" (macOS sandbox-exec) / "bwrap" (Linux bubblewrap): shell commands
+    /// may only write inside the workdir, $TMPDIR and ~/.config/harness; or "docker" / "podman", which
+    /// runs every shell command inside `image` with the working directory mounted.
     #[serde(default)] pub mode: String,
+    /// Container image for mode = docker|podman (default debian:stable-slim).
+    #[serde(default)] pub image: String,
     #[serde(default)] pub deny_network: bool,
     /// Extra writable paths for seatbelt mode.
     #[serde(default)] pub allow_write: Vec<String>,
@@ -429,6 +432,7 @@ impl Config {
             "self.skip_arbiter" => self.selfimprove.skip_arbiter = b(val),
             "self.auto" => self.selfimprove.auto = val.into(),
             "sandbox.mode" => self.sandbox.mode = if val == "none" { String::new() } else { val.into() },
+            "sandbox.image" => self.sandbox.image = val.into(),
             "checkpoints.enabled" => self.checkpoints.enabled = b(val),
             "format.enabled" => self.format.enabled = b(val),
             "format.diagnostics_after_edit" => self.format.diagnostics_after_edit = b(val),

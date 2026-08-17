@@ -1,0 +1,5 @@
+name = "sh_log_summary"
+tags = ["shell", "data", "easy"]
+prompt = "Write summarize.sh: given a path to a log file as $1, print one line per HTTP status code found in it, as '<code> <count>', sorted by count descending then code ascending. Lines without a status code are ignored. `sh check.sh` must pass."
+check = "sh check.sh"
+max_turns = 15

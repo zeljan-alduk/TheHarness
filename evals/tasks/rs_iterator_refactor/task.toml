@@ -1,0 +1,5 @@
+name = "rs_iterator_refactor"
+tags = ["rust", "refactor", "medium"]
+prompt = "In src/lib.rs, rewrite `sum_even_squares` as a single iterator chain (no for loop, no mut accumulator) keeping the behaviour identical, and make sure `cargo test` still passes. Do not change the tests or the function signature."
+check = "cargo test 2>&1 | grep -q 'test result: ok' && ! grep -q 'for ' src/lib.rs && ! grep -q 'mut ' src/lib.rs"
+max_turns = 20
