@@ -59,25 +59,32 @@ def step(name, ok): results.append((name, ok)); print(("PASS " if ok else "FAIL 
 
 pump(2.5)
 step("banner shows model", "qwen3.8" in screen() or "model" in screen())
-for cmd, marker in [("/help", "Images:"), ("/tools", "download_file"), ("/config", "server"), ("/pwd", WORK.split("/")[-1]),
+for cmd, marker in [("/help", "Images:"), ("/tools", "Tools the model can call"), ("/config", "server"), ("/pwd", WORK.split("/")[-1]),
                     ("/cost", "session tokens"), ("/net off", "internet tools: off"), ("/net on", "internet tools: on"),
                     ("/thinking", "thinking shown"), ("/thinking", "thinking hidden"), ("/expand", None), ("/panel", None),
-                    ("/model", "available:"), ("/cd /tmp", "cwd"), (f"/cd {WORK}", "cwd"), ("/bogus", "unknown command"),
+                    ("/model", None), ("/cd /tmp", "cwd"), (f"/cd {WORK}", "cwd"), ("/bogus", "unknown command"),
                     ("/permissions", "permission mode"), ("/permissions plan", "plan mode"), ("/permissions auto", "auto permissions"), ("/plan", "plan mode"), ("/plan", "auto permissions"),
                     ("/queue", "queue is empty"), ("/sessions", "essions"), ("/theme light", "theme → light"), ("/theme dark", "theme → dark"),
                     ("/mcp", "MCP servers configured"), ("/memory", "MEMORY"), ("/brain", "BRAIN"), ("/workflows", "WORKFLOWS"),
                     ("/remember e2e marker preference", "MEMORY › Preferences"), ("/plugin bogus", "usage: /plugin"), ("/reload", "reloading tools"),
-                    ("/context", "Context map"), ("/workflow", "Workflows"), ("/workflow nope", "no workflow named"),
+                    ("/context", "Context map"), ("/workflow", None), ("/workflow nope", "no workflow named"),
                     ("/keybindings", "Keyboard shortcuts"), ("/settings", "Settings"), ("/status", "backend"), ("/vim", "vim mode on"), ("/vim", "vim mode off"),
                     ("/permissions add bash:echo *", "rule added"), ("/permissions remove bash:echo *", "removed 1 rule"), ("/trust", "trusted directory"),
                     ("/sessions live", "Live sessions"), ("/msg nobody hi", "delivered to 1 session"), ("/agents", "Sub-agents"), ("/plugin update all", None), ("/doctor", "Doctor"), ("/todos", "todo"), ("/hooks", "Hooks"), ("/skills", None), ("/agents", "Sub-agents"), ("/effort", "effort"), ("/backend", "backend:"), ("/rename e2e session", "session renamed"), ("/export", None), ("/release-notes", "Recent commits")]:
     send(cmd + "\r"); pump(0.8)
     step(f"{cmd}", marker is None or marker in screen())
     if cmd in ("/settings", "/config"): send("q"); pump(0.5)
+    # commands that open the list picker: close it before the next step
+    if cmd.split()[0] in ("/tools", "/skills", "/commands", "/model", "/workflow", "/checkpoints", "/jobs"): send("\x1b"); pump(0.4); send("\x15"); pump(0.2)
     if cmd == "/sessions": send("q"); pump(0.3); send("\x15"); pump(0.3)  # close the picker (or clear a stray q if it was the empty banner)
 send("/mod\t"); pump(0.3); step("tab-completes /model", "/model " in screen()); send("\x15")  # ctrl+u clears line
 send("/"); pump(0.4); send("\x1b[B"); pump(0.4); step("arrow highlights a suggestion", "▸" in screen() and "enter runs it" in screen())
 send("\t"); pump(0.4); step("tab fills the highlighted suggestion", re.search(r"›\s+/\w+ ", screen()) is not None); send("\x15")
+send("\x15"); buf = b""; send("/tools\r"); pump(0.8)
+step("/tools opens the picker", "Tools the model can call" in screen() and "filter:" in screen())
+buf = b""; send("\x1b[B"); pump(0.4); step("picker: arrows move", "▸" in screen())
+buf = b""; send("grep"); pump(0.5); step("picker: type to filter", "ripgrep" in screen().lower())
+send("\x1b"); pump(0.4); step("picker: esc closes", "Tools the model can call" not in screen())
 buf = b""; send(f"look at {IMG}"); pump(0.5); step("image path harvested on submit (pending)", True)
 if NO_MODEL:
     send("\x15")

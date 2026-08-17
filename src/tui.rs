@@ -543,6 +543,8 @@ struct App {
     settings_open: bool, settings_cursor: usize,
     /// /sessions picker: (all sessions, cursor into the filtered view, filter text, first visible row, row rect for clicks)
     sessions_pick: Option<SessionPicker>,
+    /// Generic list picker (/tools, /skills, /commands, …).
+    pick: Option<ListPicker>,
     live_policy: Option<Arc<harness::permissions::Policy>>,
     extra_roots: Vec<PathBuf>,
     /// worktree enter/exit state (shared with the running agent; persists across turns)
@@ -581,7 +583,7 @@ pub async fn run(cfg: Config, resume: Option<String>) -> Result<()> {
         quit: false, restart: false, improve: None, improve_cancel: Default::default(), restart_at: None, tick: 0, word: 0, models: vec![],
         metrics: Metrics::new(0), panel: None, attachments: vec![], tool_previews: Default::default(),
         picker, images: Default::default(), img_seq: 0,
-        think_scroll: 0, toolset: None, perm_mode: harness::permissions::Mode::Auto, vim: false, vim_normal: false, keymap: Keymap::load(), sel_anchor: None, sel_cur: None, sel_dragging: false, visible_text: vec![], toast: None, tool_view: "summary".into(), tool_groups_open: Default::default(), settings_open: false, settings_cursor: 0, sessions_pick: None, live_policy: None, cc_rate: None, extra_roots: vec![], wt_cwd: harness::worktree::new_cell(), cc: None, cc_last_session: None, compact_progress: None, session_meta: harness::sessions::Meta::default(), todos: Default::default(), inbox: Default::default(), event_log: None, pending_ask: None, pending_q: None, subenv: None, attached: None, video: None, strip_rects: vec![], tr_rect: Rect::default(), panel_rect: Rect::default(), tr_start: 0, line_map: vec![],
+        think_scroll: 0, toolset: None, perm_mode: harness::permissions::Mode::Auto, vim: false, vim_normal: false, keymap: Keymap::load(), sel_anchor: None, sel_cur: None, sel_dragging: false, visible_text: vec![], toast: None, tool_view: "summary".into(), tool_groups_open: Default::default(), settings_open: false, settings_cursor: 0, sessions_pick: None, pick: None, live_policy: None, cc_rate: None, extra_roots: vec![], wt_cwd: harness::worktree::new_cell(), cc: None, cc_last_session: None, compact_progress: None, session_meta: harness::sessions::Meta::default(), todos: Default::default(), inbox: Default::default(), event_log: None, pending_ask: None, pending_q: None, subenv: None, attached: None, video: None, strip_rects: vec![], tr_rect: Rect::default(), panel_rect: Rect::default(), tr_start: 0, line_map: vec![],
     };
     app.metrics.ctx_len = app.cfg.llm.context_budget_tokens.unwrap_or(0);
     app.perm_mode = app.cfg.permissions.mode;
@@ -790,6 +792,22 @@ impl App {
                     _ => {}
                 }
             }
+            CEvent::Mouse(m) if self.pick.is_some() => {
+                let mut run: Option<String> = None;
+                if let MouseEventKind::Down(MouseButton::Left) = m.kind {
+                    if let Some(p) = &mut self.pick {
+                        let rows = p.rows;
+                        if m.row >= rows.y && m.row < rows.y + rows.height {
+                            let idx = p.top + (m.row - rows.y) as usize;
+                            if idx < p.matches().len() {
+                                // click selects, clicking the selected row again runs it
+                                if p.cursor == idx { run = p.selected().and_then(|i| i.run.clone()); } else { p.cursor = idx; }
+                            }
+                        }
+                    }
+                }
+                if let Some(cmd) = run { self.pick = None; self.command(&cmd); }
+            }
             CEvent::Mouse(m) if self.sessions_pick.is_some() => {
                 let mut resume: Option<String> = None;
                 if let Some(p) = &mut self.sessions_pick {
@@ -826,6 +844,33 @@ impl App {
                     }
                     _ => {}
                 }
+            }
+            CEvent::Key(k) if k.kind == KeyEventKind::Press && self.pick.is_some() => {
+                let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+                let (mut run, mut close) = (None::<String>, false);
+                if let Some(p) = &mut self.pick {
+                    let empty_filter = p.filter.is_empty();
+                    match k.code {
+                        KeyCode::Esc => close = true,
+                        KeyCode::Char('c') | KeyCode::Char('d') if ctrl => close = true,
+                        KeyCode::Char('q') if empty_filter => close = true,
+                        KeyCode::Up => p.mv(-1),
+                        KeyCode::Down | KeyCode::Tab => p.mv(1),
+                        KeyCode::Char('k') if empty_filter => p.mv(-1),
+                        KeyCode::Char('j') if empty_filter => p.mv(1),
+                        KeyCode::PageUp => p.mv(-10),
+                        KeyCode::PageDown => p.mv(10),
+                        KeyCode::Home => p.cursor = 0,
+                        KeyCode::End => p.cursor = p.matches().len().saturating_sub(1),
+                        KeyCode::Enter => { run = p.selected().and_then(|i| i.run.clone()); close = run.is_some(); }
+                        KeyCode::Backspace => { p.filter.pop(); p.cursor = 0; }
+                        KeyCode::Char('u') if ctrl => { p.filter.clear(); p.cursor = 0; }
+                        KeyCode::Char(c) if !ctrl && !k.modifiers.contains(KeyModifiers::ALT) => { p.filter.push(c); p.cursor = 0; }
+                        _ => {}
+                    }
+                }
+                if close { self.pick = None; }
+                if let Some(cmd) = run { self.command(&cmd); }
             }
             CEvent::Key(k) if k.kind == KeyEventKind::Press && self.sessions_pick.is_some() => {
                 let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
@@ -1381,10 +1426,15 @@ impl App {
             }
             "/model" => {
                 if arg.is_empty() {
-                    let mut lines = vec![format!("current: {}", self.model), "available:".into()];
-                    for m in &self.models { lines.push(format!("  {}{}", if *m == self.model { "● " } else { "  " }, m)); }
-                    lines.push("usage: /model <name>".into());
-                    self.blocks.push(Block::Banner(lines));
+                    if self.models.is_empty() { self.blocks.push(Block::System(format!("current: {} — the server has not answered /models yet", self.model))); return; }
+                    let cur = self.model.clone();
+                    let items = self.models.iter().map(|m| PickItem {
+                        label: m.clone(),
+                        desc: if *m == cur { "● current".into() } else { String::new() },
+                        detail: format!("{}\n\nenter switches to this model{}", m, harness::pricing::price_of(m).map(|p| format!("\nprice: ${}/1M in · ${}/1M out", p.input, p.output)).unwrap_or_else(|| "\nno published price — treated as free in /cost".into())),
+                        run: Some(format!("/model {m}")),
+                    }).collect();
+                    self.pick = Some(ListPicker::new("Models on this server", "enter switches · type to filter · esc closes", items));
                 } else { self.model = arg.clone(); self.cfg.llm.model = arg.clone(); self.blocks.push(Block::System(format!("model → {arg}"))); if self.cfg.llm.provider.as_deref() == Some("claude-code") { if let Some(cc) = self.cc.take() { tokio::spawn(async move { cc.stop().await; }); } self.cc_last_session = None; } else { tokio::spawn(fetch_ctx_len(self.cfg.llm.base_url.clone(), arg.clone(), self.tx.clone())); } }
             }
             "/cd" => {
@@ -1398,7 +1448,13 @@ impl App {
             "/net" => { match arg.as_str() { "on" => self.net = true, "off" => self.net = false, _ => {} } self.blocks.push(Block::System(format!("internet tools: {}", if self.net { "on" } else { "off" }))); }
             "/tools" => {
                 let defs = match &self.toolset { Some(ts) => ts.registry.defs(), None => Registry::defaults(self.net).defs() };
-                self.blocks.push(Block::Banner(std::iter::once(format!("Tools ({})", defs.len())).chain(defs.into_iter().map(|d| format!("  {:<28} {}", d.function.name, truncate(&d.function.description, 80)))).collect()));
+                let items = defs.into_iter().map(|d| PickItem {
+                    label: d.function.name.clone(),
+                    desc: d.function.description.lines().next().unwrap_or("").to_string(),
+                    detail: format!("{}\n\nparameters:\n{}", d.function.description, serde_json::to_string_pretty(&d.function.parameters).unwrap_or_default()),
+                    run: None,
+                }).collect();
+                self.pick = Some(ListPicker::new("Tools the model can call", "↑/↓ move · type to filter · esc closes", items));
             }
             "/mcp" => {
                 let wd = self.workdir.clone();
@@ -1573,9 +1629,14 @@ impl App {
                 let mut it = arg.splitn(2, ' '); let name = it.next().unwrap_or("").to_string(); let wargs = it.next().unwrap_or("").to_string();
                 if name.is_empty() || name == "list" {
                     let l = harness::workflow::list(&self.workdir);
-                    let mut lines = vec!["Workflows — /workflow <name> [args]   (files: ~/.config/harness/workflows/*.toml, .harness/workflows/*.toml)".to_string()];
-                    for (n, d, _) in l { lines.push(format!("  {:<14} {}", n, truncate(&d, 100))); }
-                    self.blocks.push(Block::Banner(lines));
+                    if l.is_empty() { self.blocks.push(Block::System("no workflows — add ~/.config/harness/workflows/*.toml or .harness/workflows/*.toml".into())); return; }
+                    let items = l.into_iter().map(|(n, d, path)| PickItem {
+                        desc: d.clone(),
+                        detail: format!("{}\n\n{}", path.display(), std::fs::read_to_string(&path).unwrap_or_default().trim()),
+                        run: Some(format!("/workflow {n}")),
+                        label: n,
+                    }).collect();
+                    self.pick = Some(ListPicker::new("Workflows", "enter runs one · type to filter · esc closes", items));
                 } else if self.running.is_some() { self.set_status("finish or interrupt the current task first"); }
                 else {
                     match harness::workflow::find(&name, &self.workdir) {
@@ -1720,8 +1781,14 @@ impl App {
             "/hooks" => { let h = &self.cfg.hooks; self.blocks.push(Block::Banner(vec!["Hooks (harness.toml [hooks]) — JSON on stdin; pre_tool exit 2 blocks the call".into(), format!("  pre_tool  {:?}", h.pre_tool), format!("  post_tool {:?}", h.post_tool), format!("  on_stop   {:?}", h.on_stop), format!("  on_prompt {:?}", h.on_prompt), format!("  timeout   {}s", h.timeout_secs)])); }
             "/skills" => {
                 let sk = harness::skills::discover(&self.workdir);
-                if sk.is_empty() { self.blocks.push(Block::System("no skills found — add .harness/skills/<name>/SKILL.md, ~/.claude/skills/…, or install a plugin (/plugin list)".into())); }
-                else { self.blocks.push(Block::Banner(std::iter::once(format!("Skills ({}) — the model loads them with load_skill", sk.len())).chain(sk.iter().map(|x| format!("  {:<28} {}  [{}]", x.name, truncate(&x.description, 78), x.source))).collect())); }
+                if sk.is_empty() { self.blocks.push(Block::System("no skills found — add .harness/skills/<name>/SKILL.md, ~/.claude/skills/…, or install a plugin (/plugin list)".into())); return; }
+                let items = sk.into_iter().map(|x| PickItem {
+                    desc: format!("{}  [{}]", x.description, x.source),
+                    detail: format!("{}\n{}\n{}", x.path.display(), if x.allowed_tools.is_empty() { String::new() } else { format!("tools: {}", x.allowed_tools.join(", ")) }, x.body().trim()),
+                    label: x.name,
+                    run: None,
+                }).collect();
+                self.pick = Some(ListPicker::new("Skills", "the model loads one with load_skill · type to filter · esc closes", items));
             }
             "/diff" => { let wd = self.workdir.clone(); let tx = self.tx.clone(); tokio::spawn(async move { let o = harness::sandbox::run_shell("git status --short | head -40; echo; git diff --stat HEAD | tail -25", &wd, Duration::from_secs(20), 12000).await; let _ = tx.send(Msg::Block(Block::Banner(std::iter::once("git diff (working tree vs HEAD)".to_string()).chain(o.map(|o| o.stdout).unwrap_or_default().lines().map(String::from)).collect()))); }); }
             "/copy" => {
@@ -1803,11 +1870,16 @@ impl App {
                 };
                 let list = cp.list();
                 if a.is_empty() {
-                    let mut lines = vec![format!("Checkpoints ({}) — cursor at #{} · /rewind <n> restores files AND conversation · /rewind code <n> files only · /rewind conv = conversation only · /undo · /redo", list.len(), cp.cursor() + 1)];
-                    for (i, c) in list.iter().enumerate().rev().take(25).collect::<Vec<_>>().into_iter().rev() {
-                        lines.push(format!("  {}{:>3}. {:<8} {:>3} file(s)  {}", if i == cp.cursor() { "▸" } else { " " }, i + 1, harness::sessions::fmt_age(c.time), c.changed, truncate(&c.label, 70)));
-                    }
-                    self.blocks.push(Block::Banner(lines)); return;
+                    if list.is_empty() { self.blocks.push(Block::System("no checkpoints yet in this session".into())); return; }
+                    let cursor = cp.cursor();
+                    let items: Vec<PickItem> = list.iter().enumerate().map(|(i, c)| PickItem {
+                        label: format!("#{}", i + 1),
+                        desc: format!("{}{:<9} {:>3} file(s)  {}", if i == cursor { "▸ current  " } else { "           " }, harness::sessions::fmt_age(c.time), c.changed, c.label),
+                        detail: format!("{}\n{} · {} file(s) changed · {}\n\nenter rewinds files AND the conversation to this point\n/rewind code {} restores only the files · /undo · /redo", c.label, &c.id[..8.min(c.id.len())], c.changed, harness::sessions::fmt_age(c.time), i + 1),
+                        run: Some(format!("/rewind {}", i + 1)),
+                    }).rev().collect();
+                    self.pick = Some(ListPicker::new("Checkpoints", "enter rewinds here · type to filter · esc closes", items));
+                    return;
                 }
                 let (code_only, which) = match a.strip_prefix("code ") { Some(r) => (true, r.trim().to_string()), None => (false, a.clone()) };
                 let (tx, session) = (self.tx.clone(), self.session.clone());
@@ -1995,10 +2067,15 @@ impl App {
                 let cmds = harness::commands::discover(&self.workdir);
                 if cmds.is_empty() {
                     self.blocks.push(Block::System("no markdown commands — add .harness/commands/<name>.md (body = prompt template; $ARGUMENTS, $1…$9, !`shell`, @file)".into()));
-                } else {
-                    self.blocks.push(Block::Banner(std::iter::once(format!("Commands ({}) — run with /<name> [args]", cmds.len()))
-                        .chain(cmds.iter().map(|c| format!("  /{:<20} {}  [{}]", c.name, truncate(&c.description, 70), c.source))).collect()));
+                    return;
                 }
+                let items = cmds.into_iter().map(|c| PickItem {
+                    desc: format!("{}  [{}]", c.description, c.source),
+                    detail: format!("{}\n\n{}", if c.path.as_os_str().is_empty() { "(plugin command)".to_string() } else { c.path.display().to_string() }, c.template.trim()),
+                    run: Some(format!("/{}", c.name)),
+                    label: format!("/{}", c.name),
+                }).collect();
+                self.pick = Some(ListPicker::new("Markdown commands", "enter runs one · type to filter · esc closes", items));
             }
             "/btw" | "/side" => {
                 if arg.trim().is_empty() { self.blocks.push(Block::System("/btw <question> — answers from the session's context with the aux model, without adding anything to the conversation".into())); return; }
@@ -2074,11 +2151,19 @@ impl App {
                         } else if let Some(name) = a.strip_prefix("remove ") {
                             match st.remove(name.trim()) { Ok(j) => self.blocks.push(Block::System(format!("removed job '{}'", j.id))), Err(e) => self.blocks.push(Block::Error(format!("{e:#}"))) }
                         } else {
-                            let mut lines = harness::scheduler::render(&st.list());
-                            lines.push(String::new());
-                            lines.push("add with: harness schedule add <name> --every 1h|--at 03:00 \"<prompt>\" · run them with: harness daemon".into());
-                            lines.push("here: /jobs run <name> · /jobs remove <name>".into());
-                            self.blocks.push(Block::Banner(lines));
+                            let jobs = st.list();
+                            if jobs.is_empty() {
+                                self.blocks.push(Block::Banner(vec!["no scheduled jobs".into(), "add one with: harness schedule add <name> --every 1h|--at 03:00 \"<prompt>\" · run them with: harness daemon".into()]));
+                                return;
+                            }
+                            let now = harness::scheduler::now();
+                            let items = jobs.into_iter().map(|j| PickItem {
+                                desc: format!("{:<12} next {:<8} {} run(s)  {}", j.cadence(), if !j.enabled { "paused".into() } else if j.next_at <= now { "due".into() } else { harness::scheduler::fmt_secs(j.next_at - now) }, j.runs, truncate(&j.prompt, 60)),
+                                detail: format!("{}\n\nworkdir: {}\ncadence: {} · runs: {}{}\n\nenter runs it now · /jobs remove {} deletes it", j.prompt, j.workdir, j.cadence(), j.runs, if j.last_status.is_empty() { String::new() } else { format!("\nlast: {}", j.last_status) }, j.id),
+                                run: Some(format!("/jobs run {}", j.id)),
+                                label: j.id,
+                            }).collect();
+                            self.pick = Some(ListPicker::new("Scheduled jobs", "enter runs one now · harness daemon runs them on schedule · esc closes", items));
                         }
                     }
                     Err(e) => self.blocks.push(Block::Error(format!("{e:#}"))),
@@ -2868,12 +2953,12 @@ const COMMANDS: &[(&str, &str)] = &[
     ("/sessions", "pick a saved session (↑/↓/click, enter) · /sessions list · /sessions live · /sessions search <text>"),
     ("/msg", "message another live session: /msg <id|prefix|title|all> <text>"),
     ("/resume", "resume a saved session: /resume <n|id|last>"),
-    ("/model", "show or switch the model: /model <name>"),
+    ("/model", "browse the models on this server (enter switches) - /model <name> switches directly"),
     ("/backend", "switch backend: local (LM Studio etc.) | claude [model] [effort] (Claude Code CLI, subscription) | anthropic <model>"),
     ("/effort", "Claude Code backend reasoning effort: /effort low|medium|high|xhigh|max (default medium)"),
     ("/cd", "change working directory"),
     ("/pwd", "print working directory"),
-    ("/tools", "list the tools the model can call"),
+    ("/tools", "browse the tools the model can call (arrows, type to filter, full schema below)"),
     ("/net", "internet tools on|off"),
     ("/thinking", "toggle showing the model's reasoning"),
     ("/expand", "toggle expanded tool output (ctrl+o)"),
@@ -2906,7 +2991,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ("/voice", "dictate the prompt: /voice [seconds] (needs ffmpeg/sox + whisper.cpp)"),
     ("/workflow", "run a workflow: /workflow <name> [args]  (list with /workflow)"),
     ("/queue", "queue a task instead of steering: /queue <text> · show the queue · /queue clear"),
-    ("/jobs", "persistent scheduled jobs (harness daemon runs them): /jobs · /jobs run <name> · /jobs remove <name>"),
+    ("/jobs", "browse scheduled jobs - enter runs one now - /jobs remove <name>"),
     ("/arena", "best-of-n: /arena [models] -- <task> runs it in parallel worktrees and judges the results"),
     ("/goal", "keep working until a condition holds: /goal <condition> · /goal off (checked by the aux model each turn)"),
     ("/next", "stop the current task and start the next queued one (ctrl+n)"),
@@ -2920,9 +3005,9 @@ const COMMANDS: &[(&str, &str)] = &[
     ("/import", "import Claude Code / Codex transcripts into the session store (/import claude|codex|<file>)"),
     ("/todos", "show the agent's todo list"),
     ("/hooks", "show configured hooks"),
-    ("/skills", "list installed skills"),
+    ("/skills", "browse skills (arrows, filter; the full SKILL.md shows below)"),
     ("/prompt", "run a prompt offered by an MCP server: /prompt <server>:<name> [args] (bare /prompt lists them)"),
-    ("/commands", "list markdown slash commands (.harness/commands/*.md, .claude/commands, plugins)"),
+    ("/commands", "browse markdown slash commands - enter runs the highlighted one"),
     ("/btw", "ask a side question about this session without touching the conversation"),
     ("/recap", "summarise the session so far (aux model)"),
     ("/find", "search this session's transcript: /find <text>"),
@@ -2932,7 +3017,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ("/review", "run the review workflow on the working-tree diff"),
     ("/pr-comments", "show PR comments via gh: /pr-comments [number]"),
     ("/rewind", "rewind to a checkpoint: /rewind <n> (files + conversation) · /rewind code <n> · /rewind conv"),
-    ("/checkpoints", "list file checkpoints taken before each change"),
+    ("/checkpoints", "browse file checkpoints - enter rewinds files and conversation to that point"),
     ("/undo", "restore the files to the previous checkpoint (/undo <n> steps)"),
     ("/redo", "re-apply what /undo reverted"),
     ("/fork", "continue this conversation as a new, separately saved session"),
@@ -2994,6 +3079,7 @@ fn draw(f: &mut Frame, app: &mut App) {
     if app.video.is_some() { draw_video(f, app, tr_area); }
     if app.settings_open { draw_settings(f, app, tr_area); }
     if app.sessions_pick.is_some() { draw_sessions(f, app, tr_area); }
+    if app.pick.is_some() { draw_pick(f, app, tr_area); }
     if app.review.is_some() { draw_review(f, app, tr_area); }
     // transcript
     let mut lines: Vec<Line> = Vec::new();
@@ -3036,7 +3122,7 @@ fn draw(f: &mut Frame, app: &mut App) {
     app.line_map = line_map; app.tr_rect = tr_area; app.tr_start = start;
     app.panel_rect = panel_area.map(|(_, pa)| pa).unwrap_or_default();
     let visible: Vec<Line> = lines.into_iter().skip(start).take(h).collect();
-    if app.video.is_none() && !app.settings_open && app.sessions_pick.is_none() { f.render_widget(Paragraph::new(visible), tr_area); }
+    if app.video.is_none() && !app.settings_open && app.sessions_pick.is_none() && app.pick.is_none() && app.review.is_none() { f.render_widget(Paragraph::new(visible), tr_area); }
     // images: draw those whose slot is fully inside the visible window
     for p in ph {
         if app.video.is_some() { break; }
@@ -3140,6 +3226,41 @@ fn draw(f: &mut Frame, app: &mut App) {
 }
 
 // ───────────────────────── settings panel ─────────────────────────
+/// One row of the generic list picker.
+#[derive(Clone, Debug)]
+struct PickItem {
+    label: String,
+    /// One-line summary shown next to the label (truncated to fit the row).
+    desc: String,
+    /// The full text shown in the detail pane — never truncated by the list width.
+    detail: String,
+    /// Slash command run when enter is pressed (None = the entry is informational).
+    run: Option<String>,
+}
+
+/// A filterable list with a detail pane: `/tools`, `/skills`, `/commands`, `/jobs`, `/checkpoints`,
+/// `/model`, `/workflow`, `/agents`. The point is that nothing is cut off — the selected entry's full
+/// description (schema, body, log) is readable underneath the list.
+struct ListPicker { title: String, hint: String, items: Vec<PickItem>, cursor: usize, top: usize, filter: String, rows: Rect }
+
+impl ListPicker {
+    fn new(title: impl Into<String>, hint: impl Into<String>, items: Vec<PickItem>) -> Self {
+        Self { title: title.into(), hint: hint.into(), items, cursor: 0, top: 0, filter: String::new(), rows: Rect::default() }
+    }
+    /// Indices of the entries matching the filter (label and summary are searched).
+    fn matches(&self) -> Vec<usize> {
+        if self.filter.is_empty() { return (0..self.items.len()).collect(); }
+        let f = self.filter.to_lowercase();
+        (0..self.items.len()).filter(|i| { let it = &self.items[*i]; it.label.to_lowercase().contains(&f) || it.desc.to_lowercase().contains(&f) }).collect()
+    }
+    fn mv(&mut self, d: isize) {
+        let n = self.matches().len();
+        if n == 0 { self.cursor = 0; return; }
+        self.cursor = (self.cursor as isize + d).rem_euclid(n as isize) as usize;
+    }
+    fn selected(&self) -> Option<&PickItem> { self.matches().get(self.cursor).map(|i| &self.items[*i]) }
+}
+
 struct SessionPicker { all: Vec<harness::sessions::Meta>, cursor: usize, filter: String, top: usize, rows: Rect, /// marquee: (row the offset belongs to, tick counter) — reset when the cursor moves
     marquee: (usize, u32) }
 /// Marquee window over `s`: if it fits in `w` cells, pad it; otherwise show a `w`-wide slice that starts at `off`
@@ -3160,6 +3281,51 @@ impl SessionPicker {
     }
     fn selected_id(&self) -> Option<String> { self.filtered().get(self.cursor).map(|m| m.id.clone()) }
     fn mv(&mut self, d: i32) { let n = self.filtered().len(); if n == 0 { self.cursor = 0; return; } self.cursor = (self.cursor as i32 + d).clamp(0, n as i32 - 1) as usize; }
+}
+
+/// The generic list picker: filterable list on top, the selected entry in full underneath.
+fn draw_pick(f: &mut Frame, app: &mut App, area: Rect) {
+    f.render_widget(ratatui::widgets::Clear, area);
+    let dim = Style::default().fg(pal().dim);
+    let Some(p) = &mut app.pick else { return };
+    let w = area.width as usize;
+    let detail_h = (area.height / 3).clamp(4, 12) as usize;
+    let list_h = (area.height as usize).saturating_sub(detail_h + 3).max(1);
+    let idx = p.matches();
+    let n = idx.len();
+    if p.cursor >= n { p.cursor = n.saturating_sub(1); }
+    if p.cursor < p.top { p.top = p.cursor; }
+    if p.cursor >= p.top + list_h { p.top = p.cursor + 1 - list_h; }
+
+    let mut lines: Vec<Line> = vec![
+        Line::from(Span::styled(format!(" {} ({}{})  ·  {} ", p.title, n, if p.filter.is_empty() { String::new() } else { format!(" of {}", p.items.len()) }, p.hint), Style::default().fg(Color::Black).bg(pal().orange).bold())),
+        Line::from(vec![Span::styled(" filter: ", dim), Span::raw(p.filter.clone()), Span::styled("▏", Style::default().fg(pal().orange))]),
+    ];
+    let label_w = idx.iter().map(|i| p.items[*i].label.chars().count()).max().unwrap_or(12).clamp(8, 32);
+    for (row, i) in idx.iter().enumerate().skip(p.top).take(list_h) {
+        let it = &p.items[*i];
+        let sel = row == p.cursor;
+        let st = if sel { Style::default().fg(Color::Black).bg(pal().orange).bold() } else { Style::default().fg(pal().blue) };
+        let text = format!("{:<label_w$}  {}", truncate(&it.label, label_w), truncate(&it.desc, w.saturating_sub(label_w + 8)));
+        lines.push(Line::from(vec![
+            Span::styled(if sel { " ▸ " } else { "   " }, Style::default().fg(pal().orange)),
+            Span::styled(format!("{:<width$}", text, width = w.saturating_sub(4)), st),
+        ]));
+    }
+    if n == 0 { lines.push(Line::from(Span::styled("   nothing matches the filter", dim.italic()))); }
+    lines.push(Line::from(Span::styled("─".repeat(w.min(200)), dim)));
+    if let Some(it) = idx.get(p.cursor).and_then(|i| p.items.get(*i)) {
+        let mut shown = 0usize;
+        'outer: for para in it.detail.lines() {
+            for chunk in wrap_text(para, w.saturating_sub(3)) {
+                if shown >= detail_h { lines.push(Line::from(Span::styled("  …", dim))); break 'outer; }
+                lines.push(Line::from(vec![Span::raw("  "), Span::styled(chunk, Style::default().fg(pal().fg))]));
+                shown += 1;
+            }
+        }
+    }
+    p.rows = Rect { x: area.x, y: area.y + 2, width: area.width, height: list_h as u16 };
+    f.render_widget(Paragraph::new(lines), area);
 }
 
 fn draw_sessions(f: &mut Frame, app: &mut App, area: Rect) {
@@ -3676,6 +3842,27 @@ fn push_wrapped(out: &mut Vec<Line<'static>>, spans: Vec<Span<'static>>, width: 
         if !buf.is_empty() { cur.push(Span::styled(buf, style)); }
     }
     out.push(Line::from(cur));
+}
+
+/// Break a paragraph into lines of at most `width` cells, on word boundaries where it can.
+fn wrap_text(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(8);
+    let (mut out, mut cur) = (Vec::new(), String::new());
+    for word in text.split_whitespace() {
+        let wl = word.chars().count();
+        if wl > width { // one very long token (a path, a JSON blob): hard-split it
+            if !cur.is_empty() { out.push(std::mem::take(&mut cur)); }
+            let chars: Vec<char> = word.chars().collect();
+            for chunk in chars.chunks(width) { out.push(chunk.iter().collect()); }
+            continue;
+        }
+        if cur.chars().count() + wl + 1 > width { out.push(std::mem::take(&mut cur)); }
+        if !cur.is_empty() { cur.push(' '); }
+        cur.push_str(word);
+    }
+    if !cur.is_empty() { out.push(cur); }
+    if out.is_empty() { out.push(String::new()); }
+    out
 }
 
 fn wrap_input(input: &str, width: usize) -> Vec<String> {
