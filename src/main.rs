@@ -395,6 +395,7 @@ async fn main() -> Result<()> {
 
     match cli.cmd.unwrap_or(Cmd::Chat) {
         Cmd::Chat => {
+            if relaunch_in_kitty(&cfg) { return Ok(()); }
             let resume = cli.resume.clone().or(if cli.r#continue { Some("last".into()) } else { None });
             tui::run(cfg, resume).await?;
         }
@@ -782,6 +783,40 @@ async fn run_agent(cfg: &config::Config, client: &llm::Client, workdir: &std::pa
     let out = out?;
     if let Some(m) = &store { agent::reflect_after_run(client, m, &msgs, &out.1, sink.as_ref()).await; }
     Ok(out)
+}
+
+/// The TUI is built for kitty: inline images, the graphics protocol, remote-controlled font size. When
+/// the interactive UI starts in some *other* terminal, hand it to kitty instead and step aside.
+///
+/// Only ever for `harness` with no subcommand, and only when a person is watching: a pipe, a script, an
+/// `acp`/`serve`/`run` invocation, an SSH session (no local window to open) or a second hop through this
+/// function must all fall through and run here. Returns true if kitty took over and we should exit.
+fn relaunch_in_kitty(cfg: &config::Config) -> bool {
+    use std::io::IsTerminal;
+    if !cfg.ui.prefer_kitty { return false; }
+    if matches!(std::env::var("HARNESS_NO_KITTY").as_deref(), Ok("1") | Ok("true") | Ok("yes")) { return false; }
+    if std::env::var_os("KITTY_WINDOW_ID").is_some() { return false; }        // already home
+    if std::env::var_os("HARNESS_IN_KITTY").is_some() { return false; }       // we already tried once
+    if std::env::var_os("SSH_CONNECTION").is_some() || std::env::var_os("SSH_TTY").is_some() { return false; }
+    if std::env::var_os("CI").is_some() || std::env::var_os("HARNESS_SELF_EXEC").is_some() { return false; }
+    if !(std::io::stdin().is_terminal() && std::io::stdout().is_terminal()) { return false; }
+    if !cfg!(target_os = "macos") && std::env::var_os("DISPLAY").is_none() && std::env::var_os("WAYLAND_DISPLAY").is_none() { return false; }
+    // $HOME at run time, not build time — a baked-in path would point at the release runner's home.
+    let vendor = harness::setup::home_dir().join(".local/kitty.app/Contents/MacOS/kitty");
+    let kitty = harness::setup::which("kitty")
+        .or_else(|| vendor.is_file().then_some(vendor))
+        .or_else(|| { let p = PathBuf::from("/Applications/kitty.app/Contents/MacOS/kitty"); p.is_file().then_some(p) });
+    let (Some(kitty), Ok(exe)) = (kitty, std::env::current_exe()) else { return false };
+    let mut cmd = std::process::Command::new(kitty);
+    // allow_remote_control is what makes ctrl+= / ctrl+- work; the font size is applied by the TUI itself.
+    cmd.args(["-o", "allow_remote_control=yes", "--start-as=maximized", "-T", "TheHarness"])
+       .arg(&exe).args(std::env::args_os().skip(1))
+       .env("HARNESS_IN_KITTY", "1")
+       .stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+    match cmd.spawn() {
+        Ok(_) => { eprintln!("· opening TheHarness in kitty (HARNESS_NO_KITTY=1 to stay here, or /set ui.prefer_kitty false)"); true }
+        Err(_) => false,
+    }
 }
 
 /// `self` mode rebuilds the harness while it runs. Never run from the binary being edited:

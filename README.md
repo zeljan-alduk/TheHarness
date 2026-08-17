@@ -1,15 +1,41 @@
 # TheHarness
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Platform: macOS · Apple Silicon](https://img.shields.io/badge/platform-macOS%20%C2%B7%20Apple%20Silicon-black.svg)](#platform)
+[![ci](https://github.com/zeljan-alduk/TheHarness/actions/workflows/ci.yml/badge.svg)](https://github.com/zeljan-alduk/TheHarness/actions/workflows/ci.yml)
 
-A local-first, self-improving agentic coding harness. Rust core, any OpenAI-compatible
-local model (built and tested against **Qwen3.8-27B via LM Studio**; also works with
-`llama-server` and Ollama).
+A local-first, self-improving agentic coding harness for **macOS on Apple Silicon**. Rust core,
+**Qwen3.8-27B running on MLX** — the fastest way to serve a model on an M-series chip — with Claude
+available as a second backend, or as an orchestrator that delegates to the local model.
 
 The thesis: give the agent a *real* toolchain (shell, git, filesystem, internet, build
 tools) **and its own source**, but only let it improve itself through an
 **eval-gated loop** — proposals land on git branches and are judged by a benchmark score,
 never by the agent's own opinion.
+
+## Install
+
+```sh
+curl -fsSL https://zeljan-alduk.github.io/TheHarness/install.sh | sh
+```
+
+One line, no sudo, nothing outside `$HOME`. It installs the `harness` binary, [kitty](https://sw.kovidgoyal.net/kitty/)
+(the terminal the TUI is built for), a private MLX runtime under `~/.config/harness/runtime`, the Claude
+Code CLI, and a **TheHarness.app** in `~/Applications` with an alias on your Desktop. Read it first if you
+like — it is [`docs/install.sh`](docs/install.sh), and `DRY_RUN=1` makes it print every step instead of
+doing it (`NO_KITTY=1`, `NO_MLX=1`, `NO_CLAUDE=1`, `NO_APP=1`, `WITH_OLLAMA=1` are the other knobs).
+
+Then just run `harness` in any terminal — it re-opens itself in kitty, because that is where inline
+images, the graphics protocol and `ctrl+=` / `ctrl+-` font control work. `HARNESS_NO_KITTY=1 harness`
+stays put, or set `[ui] prefer_kitty = false`.
+
+**The model is downloaded on first run, not by the installer**, so the harness can show it: pick
+Qwen3.8-27B in **4-bit (16GB) · 6-bit (23GB) · 8-bit (30GB)**, and the weights come down in parallel
+segments that resume where they stopped, with progress, speed and ETA in the side panel (⌃P). Claude
+keeps you working meanwhile; when the weights land the harness offers to switch to the local model —
+or to keep Claude as the orchestrator and hand the local model the delegated work.
+
+Uninstall: `rm -rf ~/.config/harness ~/Applications/TheHarness.app ~/Desktop/TheHarness.app ~/.local/bin/harness`.
 
 ## Version
 `harness --version` → `1.0.NNN (sha)`; the build number increments on every release build (`build.rs`,
@@ -28,13 +54,19 @@ prompt and `<tool_call>{…}</tool_call>` blocks in the reply are parsed back in
 (`[llm] tool_shim = "auto" | "on" | "off"`; auto switches over by itself when a server rejects tools or a
 model writes calls as text).
 
-## Platforms
-macOS (primary; Kitty for inline images, seatbelt sandbox, temps via macmon), Linux (notify-send,
-wl-paste/xclip for clipboard), Windows (`harness.exe`; install **Git for Windows** so the `bash` tool has a
-POSIX shell — falls back to `cmd /C`; WezTerm shows inline images). State lives in `~/.config/harness`
-(`%USERPROFILE%\.config\harness` on Windows). CI builds and unit-tests all three.
+## Platform
+**macOS 13+ on Apple Silicon only.** That is a deliberate narrowing, not an accident: the local model
+runs on **MLX**, which is Apple-Silicon-only, the terminal UI targets kitty, the sandbox is seatbelt and
+the temperature/power readings come from macmon. CI builds and tests exactly that target, and the
+installer refuses anything else.
 
-## Install & use (interactive, Claude-Code-style)
+The Linux and Windows code paths are still in the tree (clipboard, notifications, `cmd /C` fallback,
+bubblewrap) and nothing has been ripped out — **multiplatform can come back if there is interest in the
+project**; it is a matter of restoring the CI matrix and picking a non-MLX runtime. Open an issue.
+
+State lives in `~/.config/harness` — config, sessions, memory, the MLX runtime and the model weights.
+
+## Install from source (instead of the one-liner)
 
 ```sh
 cargo install --path .                       # → ~/.cargo/bin/harness

@@ -106,11 +106,14 @@ pub struct UiConfig {
     #[serde(default)] pub statusline: String,
     /// Terminal font size (pt) applied at start when the terminal can be driven (kitty, iTerm2, Terminal.app); 0 = leave alone. ctrl+= / ctrl+- / ctrl+0.
     #[serde(default)] pub font_size: u32,
+    /// Re-open the interactive TUI in kitty when started from another terminal (inline images, font
+    /// control, the graphics protocol the UI is built for). HARNESS_NO_KITTY=1 skips it for one run.
+    #[serde(default = "d_true")] pub prefer_kitty: bool,
 }
 fn d_theme() -> String { "dark".into() }
 fn d_tool_view() -> String { "summary".into() }
 fn d_panel() -> String { "auto".into() }
-impl Default for UiConfig { fn default() -> Self { Self { notify: true, theme: d_theme(), event_log: true, tool_view: d_tool_view(), show_thinking: false, panel: d_panel(), vim: false, fold_previous: true, steer: true, sound: false, statusline: String::new(), font_size: 0 } } }
+impl Default for UiConfig { fn default() -> Self { Self { notify: true, theme: d_theme(), event_log: true, tool_view: d_tool_view(), show_thinking: false, panel: d_panel(), vim: false, fold_previous: true, steer: true, sound: false, statusline: String::new(), font_size: 0, prefer_kitty: true } } }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct SecurityConfig {
@@ -396,6 +399,7 @@ impl Config {
             "ui.statusline" => self.ui.statusline = val.into(),
             "ui.sound" => self.ui.sound = b(val),
             "ui.font_size" => self.ui.font_size = val.parse().context("bad size")?,
+            "ui.prefer_kitty" => self.ui.prefer_kitty = b(val),
             "permissions.mode" => self.permissions.mode = crate::permissions::Mode::parse(val).context("bad mode")?,
             "llm.compact_at_fraction" => self.llm.compact_at_fraction = val.parse().context("bad fraction")?,
             "llm.effort" => self.llm.effort = if val.is_empty() || val == "default" { None } else { Some(val.into()) },
