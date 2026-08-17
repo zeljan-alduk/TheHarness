@@ -89,7 +89,7 @@ pub async fn prepare(setup: RunSetup) -> Result<Prepared> {
     env.cc_effort = cfg.llm.effort.clone();
     env.max_depth = cfg.agent.max_subagent_depth.max(1);
     let env = Arc::new(env);
-    let ctx = ToolCtx { workdir: workdir.clone(), timeout: Duration::from_secs(cfg.agent.tool_timeout_secs), max_output: cfg.agent.max_tool_output_chars, net: cfg.net.clone(), memory: store.clone(), subagent: Some(env.clone()), redact_secrets: cfg.security.redact_secrets, hooks: cfg.hooks.clone(), todos, lsp_servers: cfg.lsp.servers.clone(), format: cfg.format.clone(), extra_roots, approver: Some(approver.clone()), inbox, cancel: None, cwd: Some(cwd.unwrap_or_else(crate::worktree::new_cell)), session_id };
+    let ctx = ToolCtx { workdir: workdir.clone(), timeout: Duration::from_secs(cfg.agent.tool_timeout_secs), max_output: cfg.agent.max_tool_output_chars, net: cfg.net.clone(), memory: store.clone(), subagent: Some(env.clone()), redact_secrets: cfg.security.redact_secrets, injection_scan: cfg.security.injection_scan, hooks: cfg.hooks.clone(), todos, lsp_servers: cfg.lsp.servers.clone(), format: cfg.format.clone(), extra_roots, approver: Some(approver.clone()), inbox, cancel: None, cwd: Some(cwd.unwrap_or_else(crate::worktree::new_cell)), session_id };
     let extra = match prompt_extra { Some(e) => format!("{e}{}", toolset.prompt_extra), None => toolset.prompt_extra.clone() };
     let system = crate::agent::system_prompt_with_memory(&workdir.display().to_string(), &toolset.registry.names(), Some(&extra), store.as_ref());
     Ok(Prepared { client, acp: tokio::sync::Mutex::new(None), toolset, store, policy, approver, sink, env, ctx, system, budget, max_turns: cfg.agent.max_turns })

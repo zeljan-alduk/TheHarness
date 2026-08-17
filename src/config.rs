@@ -110,8 +110,11 @@ pub struct SecurityConfig {
     /// Redact well-known secret formats (API keys, tokens, private keys) in tool outputs.
     #[serde(default = "d_true")]
     pub redact_secrets: bool,
+    /// Warn the model when fetched/MCP content tries to give it instructions (prompt injection).
+    #[serde(default = "d_true")]
+    pub injection_scan: bool,
 }
-impl Default for SecurityConfig { fn default() -> Self { Self { redact_secrets: true } } }
+impl Default for SecurityConfig { fn default() -> Self { Self { redact_secrets: true, injection_scan: true } } }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct LlmConfig {
@@ -394,6 +397,7 @@ impl Config {
             "memory.auto_reflect" => self.memory.auto_reflect = b(val),
             "memory.enabled" => self.memory.enabled = b(val),
             "security.redact_secrets" => self.security.redact_secrets = b(val),
+            "security.injection_scan" => self.security.injection_scan = b(val),
             "agent.max_task_secs" => self.agent.max_task_secs = val.parse().context("bad number")?,
             "agent.max_turns" => self.agent.max_turns = val.parse().context("bad number")?,
             "net.enabled" => self.net.enabled = b(val),

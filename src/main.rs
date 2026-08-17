@@ -476,7 +476,7 @@ async fn main() -> Result<()> {
                 let approver: std::sync::Arc<dyn harness::permissions::Approver> = std::sync::Arc::new(harness::permissions::AutoApprover { yes: cli.yes });
                 let env = std::sync::Arc::new(agent::SubAgentEnv::new(client.clone(), ts.registry.clone(), policy.clone(), approver, sink.clone(), budget, true));
                 let store = if cfg.memory.enabled { harness::memory::MemoryStore::open(&cfg.memory).ok() } else { None };
-                let ctx = tools::ToolCtx { memory: store.clone(), subagent: Some(env.clone()), redact_secrets: cfg.security.redact_secrets, hooks: cfg.hooks.clone(), lsp_servers: cfg.lsp.servers.clone(), timeout: Duration::from_secs(cfg.agent.tool_timeout_secs), max_output: cfg.agent.max_tool_output_chars, net: cfg.net.clone(), ..tools::ToolCtx::basic(workdir.clone()) };
+                let ctx = tools::ToolCtx { memory: store.clone(), subagent: Some(env.clone()), redact_secrets: cfg.security.redact_secrets, injection_scan: cfg.security.injection_scan, hooks: cfg.hooks.clone(), lsp_servers: cfg.lsp.servers.clone(), timeout: Duration::from_secs(cfg.agent.tool_timeout_secs), max_output: cfg.agent.max_tool_output_chars, net: cfg.net.clone(), ..tools::ToolCtx::basic(workdir.clone()) };
                 let base_system = agent::system_prompt_with_memory(&workdir.display().to_string(), &ts.registry.names(), Some(&ts.prompt_extra), store.as_ref());
                 let wenv = harness::workflow::WorkflowEnv { env, ctx, sink, base_system };
                 let out = harness::workflow::run(&wf, &args.join(" "), &wenv).await?;
@@ -539,7 +539,7 @@ async fn main() -> Result<()> {
         Cmd::Tool { dir, session, name, args } => {
             let workdir = dir.unwrap_or(std::env::current_dir()?).canonicalize().context("workdir does not exist")?;
             let store = if cfg.memory.enabled { harness::memory::MemoryStore::open(&cfg.memory).ok() } else { None };
-            let ctx = tools::ToolCtx { workdir: workdir.clone(), timeout: Duration::from_secs(cfg.agent.tool_timeout_secs), max_output: cfg.agent.max_tool_output_chars, net: cfg.net.clone(), memory: store, subagent: None, redact_secrets: cfg.security.redact_secrets, hooks: cfg.hooks.clone(), todos: Default::default(), lsp_servers: cfg.lsp.servers.clone(), format: cfg.format.clone(), extra_roots: vec![], approver: None, inbox: Default::default(), cancel: None, cwd: None, session_id: session };
+            let ctx = tools::ToolCtx { workdir: workdir.clone(), timeout: Duration::from_secs(cfg.agent.tool_timeout_secs), max_output: cfg.agent.max_tool_output_chars, net: cfg.net.clone(), memory: store, subagent: None, redact_secrets: cfg.security.redact_secrets, injection_scan: cfg.security.injection_scan, hooks: cfg.hooks.clone(), todos: Default::default(), lsp_servers: cfg.lsp.servers.clone(), format: cfg.format.clone(), extra_roots: vec![], approver: None, inbox: Default::default(), cancel: None, cwd: None, session_id: session };
             let ts = tools::build_toolset(cfg.net.enabled, &workdir, name.starts_with("mcp__")).await;
             let out = ts.registry.call(&name, args.as_deref().unwrap_or("{}"), &ctx).await;
             println!("{}", out.text);
@@ -695,7 +695,7 @@ async fn run_agent(cfg: &config::Config, client: &llm::Client, workdir: &std::pa
         net: cfg.net.clone(),
         memory: None,
         subagent: None,
-        redact_secrets: cfg.security.redact_secrets, hooks: cfg.hooks.clone(), todos: Default::default(), lsp_servers: cfg.lsp.servers.clone(), format: cfg.format.clone(), extra_roots: vec![], approver: None, inbox: Default::default(), cancel: None, cwd: None, session_id: Some(session_id.clone()),
+        redact_secrets: cfg.security.redact_secrets, injection_scan: cfg.security.injection_scan, hooks: cfg.hooks.clone(), todos: Default::default(), lsp_servers: cfg.lsp.servers.clone(), format: cfg.format.clone(), extra_roots: vec![], approver: None, inbox: Default::default(), cancel: None, cwd: None, session_id: Some(session_id.clone()),
     };
     let store = if cfg.memory.enabled { harness::memory::MemoryStore::open(&cfg.memory).ok() } else { None };
     if let Some(m) = &store { let _ = m.touch_project(workdir); }

@@ -56,6 +56,8 @@ pub struct ToolCtx {
     pub lsp_servers: std::collections::HashMap<String, crate::lsp::LspServerConfig>,
     /// Formatter / post-edit diagnostics settings ([format]).
     pub format: crate::format::FormatConfig,
+    /// Flag prompt-injection attempts in fetched/MCP content ([security] injection_scan).
+    pub injection_scan: bool,
     /// Additional directories file tools may access (/add-dir).
     pub extra_roots: Vec<PathBuf>,
     /// Who answers questions / approvals for the model (None = headless: ask_user gets no answer).
@@ -73,7 +75,7 @@ pub struct ToolCtx {
 impl ToolCtx {
     /// A context with defaults (no memory/sub-agents/hooks) — tests, `harness tool`, sub-processes.
     pub fn basic(workdir: PathBuf) -> Self {
-        Self { workdir, timeout: Duration::from_secs(120), max_output: 16000, net: crate::config::NetConfig::default(), memory: None, subagent: None, redact_secrets: true, hooks: Default::default(), todos: Default::default(), lsp_servers: Default::default(), format: Default::default(), extra_roots: vec![], approver: None, inbox: Default::default(), cancel: None, cwd: None, session_id: None }
+        Self { workdir, timeout: Duration::from_secs(120), max_output: 16000, net: crate::config::NetConfig::default(), memory: None, subagent: None, redact_secrets: true, hooks: Default::default(), todos: Default::default(), lsp_servers: Default::default(), format: Default::default(), injection_scan: true, extra_roots: vec![], approver: None, inbox: Default::default(), cancel: None, cwd: None, session_id: None }
     }
     /// The context tools actually run in: if the session entered a worktree, workdir is the worktree and
     /// the original tree stays reachable as an extra root.
@@ -236,6 +238,10 @@ impl Registry {
             Err(p) => { let msg = p.downcast_ref::<String>().cloned().or_else(|| p.downcast_ref::<&str>().map(|s| s.to_string())).unwrap_or_else(|| "unknown panic".into()); format!("error: tool panicked: {msg}").into() }
         };
         if ctx.redact_secrets { out.text = crate::security::redact(&out.text); }
+        // content fetched from outside is data: flag it when it starts issuing instructions
+        if ctx.injection_scan && (matches!(name, "web_fetch" | "web_search" | "download_file" | "read_pdf") || name.starts_with("mcp__")) {
+            out.text = crate::security::wrap_untrusted(name, &out.text);
+        }
         // formatter + fresh diagnostics after a successful file edit (like an editor's format-on-save)
         if matches!(name, "write_file" | "edit_file" | "apply_patch" | "notebook_edit") && !out.text.starts_with("error:") {
             let base = ctx.effective();
