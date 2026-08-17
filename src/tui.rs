@@ -491,6 +491,8 @@ struct App {
     goal_rounds: usize,
     /// ctrl+r reverse history search: (query, saved input, match index).
     hist_search: Option<(String, String, usize)>,
+    /// Which slash-command suggestion is highlighted (↑/↓ while the list is open).
+    sugg_idx: Option<usize>,
     /// ctrl+g: the main loop suspends the TUI and opens $EDITOR on the prompt.
     edit_external: bool,
     /// `/review-diff`: per-hunk accept/revert/comment over the working tree.
@@ -573,7 +575,7 @@ pub async fn run(cfg: Config, resume: Option<String>) -> Result<()> {
     let mut app = App {
         model: cfg.llm.model.clone(), net: cfg.net.enabled, cfg, workdir,
         blocks: vec![], input: String::new(), cursor: 0, history: vec![], hist_idx: None, hist_draft: String::new(),
-        scroll_up: 0, running: None, run_started: Instant::now(), queued: vec![], goal: None, goal_rounds: 0, hist_search: None, edit_external: false, review: None, acp: None, statusline: None, expand_tools: false, show_thinking: false,
+        scroll_up: 0, running: None, run_started: Instant::now(), queued: vec![], goal: None, goal_rounds: 0, hist_search: None, sugg_idx: None, edit_external: false, review: None, acp: None, statusline: None, expand_tools: false, show_thinking: false,
         session: Arc::new(tokio::sync::Mutex::new(Vec::new())), tx: tx.clone(),
         total_prompt: 0, total_completion: 0, last_prompt_tokens: 0, turn_tokens: 0, last_ctrl_c: None, status_msg: None,
         quit: false, restart: false, improve: None, improve_cancel: Default::default(), restart_at: None, tick: 0, word: 0, models: vec![],
@@ -950,7 +952,13 @@ impl App {
                 if km.is("scroll_down", k.code, k.modifiers) || (k.code == KeyCode::Down && ctrl) { self.scroll_up = self.scroll_up.saturating_sub(10); return; }
                 if km.is("clear_line", k.code, k.modifiers) { let c = self.cursor; self.input = self.input.chars().skip(c).collect(); self.cursor = 0; return; }
                 if km.is("jump_bottom", k.code, k.modifiers) { self.scroll_up = 0; return; }
-                if km.is("complete", k.code, k.modifiers) { self.complete_slash(); return; }
+                if km.is("complete", k.code, k.modifiers) {
+                    match self.selected_suggestion() {
+                        Some(cmd) => { self.input = format!("{cmd} "); self.cursor = self.input.chars().count(); self.sugg_idx = None; }
+                        None => self.complete_slash(),
+                    }
+                    return;
+                }
                 if km.is("interrupt", k.code, k.modifiers) && self.running.is_some() { self.interrupt(); return; }
                 if km.is("font_bigger", k.code, k.modifiers) || (k.code == KeyCode::Char('+') && ctrl) { self.adjust_font(1); return; }
                 if km.is("font_smaller", k.code, k.modifiers) || (k.code == KeyCode::Char('_') && ctrl) { self.adjust_font(-1); return; }
@@ -1002,16 +1010,29 @@ impl App {
                         else if self.last_ctrl_c.map(|t| t.elapsed() < Duration::from_millis(1500)).unwrap_or(false) { self.quit = true; }
                         else { self.last_ctrl_c = Some(Instant::now()); self.set_status("Press ctrl+c again to exit"); }
                     }
+                    (KeyCode::Esc, _, _) if self.sugg_idx.is_some() => { self.sugg_idx = None; }
                     (KeyCode::Esc, _, _) => { if self.restart_at.is_some() { self.cancel_restart(); } else if self.running.is_some() { self.interrupt(); } else if self.vim { self.vim_normal = true; } else if !self.input.is_empty() { self.input.clear(); self.cursor = 0; } }
-                    (KeyCode::Enter, _, _) => self.submit(),
+                    (KeyCode::Enter, _, _) => {
+                        // a highlighted suggestion is what enter runs
+                        if let Some(cmd) = self.selected_suggestion() { self.input = cmd; self.cursor = self.input.chars().count(); self.sugg_idx = None; }
+                        self.submit();
+                    }
                     (KeyCode::Char('a'), true, _) | (KeyCode::Home, _, _) => self.cursor = self.line_start(),
                     (KeyCode::Char('e'), true, _) | (KeyCode::End, _, _) => self.cursor = self.line_end(),
-                    (KeyCode::Backspace, _, _) => { if self.cursor > 0 { let mut cs: Vec<char> = self.input.chars().collect(); cs.remove(self.cursor - 1); self.input = cs.into_iter().collect(); self.cursor -= 1; } }
+                    (KeyCode::Backspace, _, _) => { self.sugg_idx = None; if self.cursor > 0 { let mut cs: Vec<char> = self.input.chars().collect(); cs.remove(self.cursor - 1); self.input = cs.into_iter().collect(); self.cursor -= 1; } }
                     (KeyCode::Delete, _, _) => { let mut cs: Vec<char> = self.input.chars().collect(); if self.cursor < cs.len() { cs.remove(self.cursor); self.input = cs.into_iter().collect(); } }
                     (KeyCode::Left, _, _) => { self.cursor = self.cursor.saturating_sub(1); }
                     (KeyCode::Right, _, _) => { self.cursor = (self.cursor + 1).min(self.input.chars().count()); }
-                    (KeyCode::Up, _, _) => { if !self.input.contains('\n') { self.history_prev(); } }
-                    (KeyCode::Down, _, _) => { if !self.input.contains('\n') { self.history_next(); } }
+                    (KeyCode::Up, _, _) => {
+                        let n = suggestions(&self.input).len();
+                        if n > 0 { self.sugg_idx = Some(match self.sugg_idx { Some(0) | None => n - 1, Some(i) => i - 1 }); }
+                        else if !self.input.contains('\n') { self.history_prev(); }
+                    }
+                    (KeyCode::Down, _, _) => {
+                        let n = suggestions(&self.input).len();
+                        if n > 0 { self.sugg_idx = Some(match self.sugg_idx { Some(i) if i + 1 < n => i + 1, _ => 0 }); }
+                        else if !self.input.contains('\n') { self.history_next(); }
+                    }
                     (KeyCode::Char(c), false, false) => { self.insert_str(&c.to_string()); }
                     _ => {}
                 }
@@ -1020,12 +1041,19 @@ impl App {
         }
     }
 
+    /// The command the user has highlighted with ↑/↓, if the list is open.
+    fn selected_suggestion(&self) -> Option<String> {
+        let i = self.sugg_idx?;
+        suggestions(&self.input).get(i).map(|(c, _)| c.to_string())
+    }
+
     fn insert_str(&mut self, s: &str) {
         let mut cs: Vec<char> = self.input.chars().collect();
         for (i, c) in s.chars().enumerate() { cs.insert(self.cursor + i, c); }
         self.cursor += s.chars().count();
         self.input = cs.into_iter().collect();
         self.hist_idx = None;
+        self.sugg_idx = None;
     }
     fn line_start(&self) -> usize { let cs: Vec<char> = self.input.chars().collect(); let mut i = self.cursor; while i > 0 && cs[i - 1] != '\n' { i -= 1; } i }
     fn line_end(&self) -> usize { let cs: Vec<char> = self.input.chars().collect(); let mut i = self.cursor; while i < cs.len() && cs[i] != '\n' { i += 1; } i }
@@ -2787,6 +2815,22 @@ mod tui_tests {
     }
 
     #[test]
+    fn suggestion_windowing() {
+        // everything fits: no scrolling
+        assert_eq!(suggestion_window(4, Some(3), 6), (0, 4));
+        // long list, nothing selected yet: from the top
+        assert_eq!(suggestion_window(20, None, 6), (0, 6));
+        // selection near the top stays at the top, in the middle centres, at the end sticks
+        assert_eq!(suggestion_window(20, Some(1), 6), (0, 6));
+        assert_eq!(suggestion_window(20, Some(10), 6), (7, 13));
+        assert_eq!(suggestion_window(20, Some(19), 6), (14, 20));
+        // the typed prefix filters, and every match is available to the arrows
+        assert!(suggestions("/co").iter().all(|(c, _)| c.starts_with("/co")));
+        assert!(suggestions("/").len() > 6, "the list is not truncated to the visible rows");
+        assert!(suggestions("hello").is_empty() && suggestions("/model x").is_empty());
+    }
+
+    #[test]
     fn completion_prefix() {
         assert_eq!(common_prefix(&["/compact", "/config", "/context"]).as_deref(), Some("/co"));
         assert_eq!(common_prefix(&["only"]).as_deref(), Some("only"));
@@ -2916,7 +2960,9 @@ fn draw(f: &mut Frame, app: &mut App) {
     // input geometry
     let input_lines = wrap_input(&app.input, width.saturating_sub(2).max(1));
     let sugg = suggestions(&app.input);
-    let input_h = (input_lines.len().clamp(1, 8) + sugg.len() + if app.attachments.is_empty() { 0 } else { 1 }) as u16;
+    const SUGG_ROWS: usize = 6;
+    let sugg_shown = sugg.len().min(SUGG_ROWS) + usize::from(sugg.len() > SUGG_ROWS);
+    let input_h = (input_lines.len().clamp(1, 8) + sugg_shown + if app.attachments.is_empty() { 0 } else { 1 }) as u16;
     // notice line above the box: spinner while running, or a transient status message
     let notice: Option<Vec<Span>> = if let Some((q, _, buf)) = &app.pending_q {
         Some(vec![Span::styled(" ❓ ", Style::default().fg(Color::Black).bg(pal().cyan)), Span::styled(format!(" {} ", truncate(&q.question, width.saturating_sub(60))), Style::default().fg(Color::Black).bg(pal().cyan).bold()),
@@ -3024,7 +3070,21 @@ fn draw(f: &mut Frame, app: &mut App) {
     if app.input.is_empty() {
         in_lines[0] = Line::from(vec![Span::styled("› ", Style::default().fg(pal().fg).bold()), Span::styled(if app.running.is_some() { "type to queue the next message…" } else { "Ask the agent to do something… (/help)" }, Style::default().fg(pal().dim))]);
     }
-    for (c, d) in &sugg { in_lines.push(Line::from(vec![Span::raw("  "), Span::styled(format!("{c:<12}"), Style::default().fg(pal().blue)), Span::styled(d.to_string(), Style::default().fg(pal().dim))])); }
+    let (from, to) = suggestion_window(sugg.len(), app.sugg_idx, SUGG_ROWS);
+    for (i, (c, d)) in sugg.iter().enumerate().take(to).skip(from) {
+        let selected = app.sugg_idx == Some(i);
+        let (marker, cmd_style, desc_style) = if selected {
+            ("▸ ", Style::default().fg(Color::Black).bg(pal().blue).bold(), Style::default().fg(pal().fg))
+        } else {
+            ("  ", Style::default().fg(pal().blue), Style::default().fg(pal().dim))
+        };
+        let mut spans = vec![Span::styled(marker, Style::default().fg(pal().blue)), Span::styled(format!("{c:<12}"), cmd_style), Span::styled(d.to_string(), desc_style)];
+        if selected { spans.push(Span::styled("   enter runs it · tab edits it", Style::default().fg(pal().dim))); }
+        in_lines.push(Line::from(spans));
+    }
+    if sugg.len() > SUGG_ROWS {
+        in_lines.push(Line::from(Span::styled(format!("  {}/{} — ↑/↓ to move", app.sugg_idx.map(|i| i + 1).unwrap_or(0), sugg.len()), Style::default().fg(pal().dim))));
+    }
     if !app.attachments.is_empty() {
         let mut spans = vec![Span::styled("  📎 ", Style::default().fg(pal().blue))];
         for (i, a) in app.attachments.iter().enumerate() { spans.push(Span::styled(format!("#{} {} {}×{}  ", i + 1, a.path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default(), a.dims.0, a.dims.1), Style::default().fg(pal().blue))); }
@@ -3357,9 +3417,18 @@ fn draw_panel(f: &mut Frame, app: &App, area: Rect) {
 
 fn fmt_bytes(n: u64) -> String { if n < 1 << 20 { format!("{} KB", n >> 10) } else if n < 1 << 30 { format!("{:.0} MB", n as f64 / 1048576.0) } else { format!("{:.1} GB", n as f64 / 1073741824.0) } }
 
+/// Every command matching what has been typed (the renderer shows a window of them).
 fn suggestions(input: &str) -> Vec<(&'static str, &'static str)> {
     if !input.starts_with('/') || input.contains(' ') { return vec![]; }
-    COMMANDS.iter().filter(|(c, _)| c.starts_with(input)).take(6).cloned().collect()
+    COMMANDS.iter().filter(|(c, _)| c.starts_with(input)).take(60).cloned().collect()
+}
+
+/// Which slice of the suggestion list to draw: at most `rows`, kept around the selection.
+fn suggestion_window(total: usize, selected: Option<usize>, rows: usize) -> (usize, usize) {
+    if total <= rows { return (0, total); }
+    let sel = selected.unwrap_or(0);
+    let start = sel.saturating_sub(rows / 2).min(total - rows);
+    (start, start + rows)
 }
 
 /// Reserve `rows` blank lines for an image and remember where it goes.

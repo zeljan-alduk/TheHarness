@@ -76,6 +76,8 @@ for cmd, marker in [("/help", "Images:"), ("/tools", "download_file"), ("/config
     if cmd in ("/settings", "/config"): send("q"); pump(0.5)
     if cmd == "/sessions": send("q"); pump(0.3); send("\x15"); pump(0.3)  # close the picker (or clear a stray q if it was the empty banner)
 send("/mod\t"); pump(0.3); step("tab-completes /model", "/model " in screen()); send("\x15")  # ctrl+u clears line
+send("/"); pump(0.4); send("\x1b[B"); pump(0.4); step("arrow highlights a suggestion", "▸" in screen() and "enter runs it" in screen())
+send("\t"); pump(0.4); step("tab fills the highlighted suggestion", re.search(r"›\s+/\w+ ", screen()) is not None); send("\x15")
 buf = b""; send(f"look at {IMG}"); pump(0.5); step("image path harvested on submit (pending)", True)
 if NO_MODEL:
     send("\x15")
