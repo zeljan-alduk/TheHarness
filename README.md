@@ -1,5 +1,7 @@
 # TheHarness
 
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 A local-first, self-improving agentic coding harness. Rust core, any OpenAI-compatible
 local model (built and tested against **Qwen3.8-27B via LM Studio**; also works with
 `llama-server` and Ollama).
@@ -306,3 +308,6 @@ and for every eval workdir.
 - [ ] More tools: `grep`/`glob` (ripgrep-backed), `apply_patch`, LSP diagnostics, image input for VL models
 - [ ] Larger, harder eval corpus (SWE-bench-lite subset, repo-level tasks); per-task token/time budgets in the score
 - [ ] Optional container backend for `sandbox.rs`
+
+## License
+MIT — see [LICENSE](LICENSE).

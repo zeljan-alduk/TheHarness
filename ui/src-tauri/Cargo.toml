@@ -3,6 +3,7 @@ name = "harness-ui"
 version = "0.1.0"
 edition = "2021"
 description = "Tauri desktop UI for TheHarness"
+license = "MIT"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
