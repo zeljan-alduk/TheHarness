@@ -216,7 +216,7 @@ pub fn server_plan(kind: &str) -> Vec<&'static str> {
 /// streams reasoning, so it is what "auto" starts first; mlx_lm stays as the fallback in case a build
 /// or an mlx-vlm release refuses to load.
 pub async fn serve(model_dir: &Path, port: u16, kind: &str) -> Result<Server> {
-    serve_spec(model_dir, port, kind, &Draft::default()).await
+    serve_spec(model_dir, port, kind, &ServeOpts::default()).await
 }
 
 /// Speculative-decoding drafter for the server: a small model that proposes tokens the target verifies.
@@ -230,12 +230,22 @@ impl Draft {
     }
 }
 
-pub async fn serve_spec(model_dir: &Path, port: u16, kind: &str, draft: &Draft) -> Result<Server> {
+/// Everything the mlx_vlm server is started with beyond the model + port: the speculative drafter and the
+/// KV-cache quantization. All optional; the defaults reproduce the plain server.
+#[derive(Debug, Clone, Default)]
+pub struct ServeOpts { pub draft: Draft, pub kv_bits: u8, pub kv_quant_start: u32 }
+impl ServeOpts {
+    pub fn from_cfg(c: &crate::config::LocalModelConfig) -> ServeOpts {
+        ServeOpts { draft: Draft::from_cfg(c), kv_bits: c.kv_bits, kv_quant_start: c.kv_quant_start }
+    }
+}
+
+pub async fn serve_spec(model_dir: &Path, port: u16, kind: &str, opts: &ServeOpts) -> Result<Server> {
     let mut last: Option<anyhow::Error> = None;
     for module in server_plan(kind) {
-        // The drafter is an mlx_vlm feature; if we fall back to the text server, drop it rather than fail.
-        let d = if module == "mlx_vlm.server" { draft } else { &Draft { model: String::new(), kind: String::new(), block_size: 0 } };
-        match serve_with(model_dir, port, module, d).await {
+        // The drafter/KV-quant are mlx_vlm features; if we fall back to the text server, drop them rather than fail.
+        let o = if module == "mlx_vlm.server" { opts.clone() } else { ServeOpts::default() };
+        match serve_with(model_dir, port, module, &o).await {
             Ok(s) => return Ok(s),
             Err(e) => { last = Some(e); }
         }
@@ -243,7 +253,8 @@ pub async fn serve_spec(model_dir: &Path, port: u16, kind: &str, draft: &Draft) 
     Err(last.unwrap_or_else(|| anyhow::anyhow!("no MLX server module to start")))
 }
 
-async fn serve_with(model_dir: &Path, port: u16, module: &'static str, draft: &Draft) -> Result<Server> {
+async fn serve_with(model_dir: &Path, port: u16, module: &'static str, opts: &ServeOpts) -> Result<Server> {
+    let draft = &opts.draft;
     let py = mlx_python().context("no MLX runtime — re-run the installer, or: uv venv ~/.config/harness/runtime/mlx && uv pip install --python ~/.config/harness/runtime/mlx/bin/python mlx-lm mlx-vlm")?;
     let log_dir = crate::setup::config_dir().join("logs");
     std::fs::create_dir_all(&log_dir).ok();
@@ -271,6 +282,12 @@ async fn serve_with(model_dir: &Path, port: u16, module: &'static str, draft: &D
         cmd.args(["--draft-model", &draft.model]);
         if !draft.kind.is_empty() && draft.kind != "auto" { cmd.args(["--draft-kind", &draft.kind]); }
         if draft.block_size > 0 { cmd.args(["--draft-block-size", &draft.block_size.to_string()]); }
+    }
+    // KV-cache quantization (opt-in, mlx_vlm only): 8 or 4 bits shrinks the KV the context holds — less
+    // memory pressure, faster long-context decode — for a small quality cost. Early tokens stay fp16.
+    if module == "mlx_vlm.server" && (opts.kv_bits == 8 || opts.kv_bits == 4) {
+        cmd.args(["--kv-bits", &opts.kv_bits.to_string()]);
+        if opts.kv_quant_start > 0 { cmd.args(["--quantized-kv-start", &opts.kv_quant_start.to_string()]); }
     }
     // setsid: give the server its own session and process group, so it is NOT killed when the terminal
     // closes (SIGHUP goes to the foreground group) or the harness exits — it stays warm for the next start.

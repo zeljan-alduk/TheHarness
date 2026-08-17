@@ -812,7 +812,7 @@ async fn run_agent(cfg: &config::Config, client: &llm::Client, workdir: &std::pa
         session.stop().await;
         r
     } else {
-        let a = agent::Agent { client, registry, ctx: &ctx, max_turns: cfg.agent.max_turns, context_budget: budget, sink: sink.as_ref(), stream: true, policy: &policy, approver: approver.as_ref() };
+        let a = agent::Agent { client, registry, ctx: &ctx, max_turns: cfg.agent.max_turns, context_budget: budget, sink: sink.as_ref(), stream: true, policy: &policy, tool_history_keep: cfg.agent.tool_history_keep, tool_history_chars: cfg.agent.tool_history_max_chars, approver: approver.as_ref() };
         a.run_turn(&mut msgs, &system, task).await
     };
     // always persist the transcript (also on error) — it is the run log

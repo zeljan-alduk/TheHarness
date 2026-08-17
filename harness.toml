@@ -36,8 +36,16 @@ prompt_cache = true
 max_turns = 40
 # Per tool call
 tool_timeout_secs = 120
-# Max characters of a tool result fed back to the model (head+tail kept)
+# Max characters of a tool result fed back to the model (head+tail kept). This is the CACHE-FRIENDLY way to
+# keep the local model fast: it caps each tool output at creation (stable), so contexts stay small — smaller
+# prefill and KV memory — without ever busting the MLX prefix cache. Lowering it 16000 → 8000 roughly halves
+# the context of a tool-heavy session (measured 27k → 15k tokens); 6000 → ~12k. 4000-ish tokens is a lot.
 max_tool_output_chars = 16000
+# Context-output trimming (OPT-IN, off by default): retroactively shrink tool outputs older than
+# tool_history_keep to a head+tail. Reclaims memory from an already-large history, but busts the prefix
+# cache the turn each output ages out — prefer lowering max_tool_output_chars above unless you need this.
+# tool_history_keep = 4
+# tool_history_max_chars = 4000     # 0 = off
 # Optional wall-clock cap per task in the interactive UI (0 = unlimited); queued tasks continue afterwards
 max_task_secs = 0
 
@@ -67,6 +75,10 @@ download_timeout_secs = 3600
 # draft_model = ""                 # HF id or local path of a drafter for the same family
 # draft_kind = "auto"              # auto | dflash | eagle3 | mtp
 # draft_block_size = 0             # 0 = the drafter's default
+# KV-cache quantization (mlx_vlm): 8 or 4 bits shrinks the KV the context holds — less memory pressure,
+# faster long-context decode (measured ~1.16× at 5k, ~1.27× at 16k), small quality cost. /localmodel kv.
+# kv_bits = 0                      # 0 = off (fp16) | 8 | 4
+# kv_quant_start = 0               # keep the first N tokens full-precision (0 = server default)
 
 # Per-role models: use a small/fast local model for the auxiliary calls and keep the big one for coding.
 # A role may be just a model name, or a table pointing at another server entirely.

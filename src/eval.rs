@@ -203,7 +203,7 @@ pub async fn run_task(cfg: &Config, client: &Client, task_dir: &Path, spec: &Tas
     let approver: std::sync::Arc<dyn crate::permissions::Approver> = std::sync::Arc::new(crate::permissions::AutoApprover { yes: true });
     ctx.approver = Some(approver.clone());
     ctx.subagent = Some(std::sync::Arc::new(crate::agent::SubAgentEnv::new(client.clone(), registry.clone(), policy.clone(), approver.clone(), sink.clone(), budget, true)));
-    let agent = Agent { client, registry: &registry, ctx: &ctx, max_turns: spec.max_turns.unwrap_or(cfg.agent.max_turns), context_budget: budget, sink: sink.as_ref(), stream: true, policy: &policy, approver: approver.as_ref() };
+    let agent = Agent { client, registry: &registry, ctx: &ctx, max_turns: spec.max_turns.unwrap_or(cfg.agent.max_turns), context_budget: budget, sink: sink.as_ref(), stream: true, policy: &policy, tool_history_keep: cfg.agent.tool_history_keep, tool_history_chars: cfg.agent.tool_history_max_chars, approver: approver.as_ref() };
     let system = crate::agent::system_prompt(&ctx.workdir.display().to_string(), &registry.names(), None);
     let timeout = Duration::from_secs(spec.timeout_secs.unwrap_or(cfg.eval.task_timeout_secs));
 

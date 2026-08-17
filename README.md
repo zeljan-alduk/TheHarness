@@ -68,6 +68,10 @@ under `target/`) are left alone.
   Optional **speculative decoding**: `/localmodel draft z-lab/Qwen3.5-27B-DFlash` loads a DFlash drafter matched
   to the 27B — measured **1.4–1.6× faster generation on code**, ~1.15× on prose, for ~4.3GB extra RAM (opt-in,
   `[local_model] draft_model`). It speeds up generation, not prefill.
+  On a fixed machine, two more levers: **KV-cache quantization** (`/localmodel kv 8`) — ~1.16× decode at 5k
+  context, ~1.27× at 16k, and less KV memory, for a small quality cost; and **smaller tool outputs**
+  (`[agent] max_tool_output_chars` 16000 → 8000) which roughly halves the context of a tool-heavy session
+  (27k → 15k tokens) with no cache cost, since it caps each output at creation.
 - **Claude Code (subscription)**: `provider = "claude-code"` or `/backend claude [model]` (default `claude-fable-5`).
   The harness runs the official `claude` CLI headlessly (`--print`, stream-json in/out) and exposes its own tools
   to it over an MCP bridge, so permissions, hooks, memory, redaction and the UI all still apply while your

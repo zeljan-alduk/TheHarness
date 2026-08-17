@@ -2522,6 +2522,26 @@ impl App {
                             self.start_mlx_ex(true);
                         }
                     }
+                    _ if a == "kv" || a.starts_with("kv ") => {
+                        let val = a.strip_prefix("kv").unwrap_or("").trim().to_string();
+                        if val.is_empty() {
+                            let b = self.cfg.local_model.kv_bits;
+                            self.blocks.push(Block::System(if b == 8 || b == 4 {
+                                format!("KV-cache quantization: {b}-bit · /localmodel kv off to disable")
+                            } else {
+                                "KV-cache quantization: off (fp16). /localmodel kv 8 (or 4) shrinks the KV the context holds — less memory pressure, faster long-context decode, small quality cost. mlx_vlm only.".into()
+                            }));
+                        } else {
+                            let bits: u8 = match val.as_str() { "off"|"none"|"0"|"16"|"fp16" => 0, "8" => 8, "4" => 4, _ => 255 };
+                            if bits == 255 { self.blocks.push(Block::Error("usage: /localmodel kv 8 | 4 | off".into())); }
+                            else {
+                                self.cfg.local_model.kv_bits = bits;
+                                let _ = harness::config::Config::save_setting("local_model.kv_bits", &bits.to_string());
+                                self.blocks.push(Block::System(format!("KV-cache quantization → {} · restarting the MLX server", if bits == 0 { "off (fp16)".into() } else { format!("{bits}-bit") })));
+                                self.start_mlx_ex(true);
+                            }
+                        }
+                    }
                     "cancel" | "stop" | "unload" | "kill" => {
                         // `stop`/`cancel` cancel a running download first; otherwise (and always for
                         // `unload`/`kill`) they shut the MLX server down and reclaim its ~16–30GB of RAM.
@@ -2553,9 +2573,10 @@ impl App {
                         }
                         lines.push(format!("server: {} → {} on 127.0.0.1:{} · /localmodel vision|text|auto switches (mlx_vlm sees images, mlx_lm is text-only)", self.cfg.local_model.server, lm::server_plan(&self.cfg.local_model.server).join(" then "), self.cfg.local_model.port));
                         lines.push(format!("speculative decoding: {} · /localmodel draft <hf-id|off>", if self.cfg.local_model.draft_model.is_empty() { "off".to_string() } else { format!("on · drafter {} (kind {})", self.cfg.local_model.draft_model, self.cfg.local_model.draft_kind) }));
+                        lines.push(format!("KV-cache quant: {} · /localmodel kv 8|4|off", if self.cfg.local_model.kv_bits == 8 || self.cfg.local_model.kv_bits == 4 { format!("{}-bit", self.cfg.local_model.kv_bits) } else { "off (fp16)".to_string() }));
                         self.blocks.push(Block::Banner(lines));
                     }
-                    _ => self.blocks.push(Block::Error("usage: /localmodel [4|6|8|resume|serve|stop|restart|status|vision|text|draft <id|off>]".into())),
+                    _ => self.blocks.push(Block::Error("usage: /localmodel [4|6|8|resume|serve|stop|restart|status|vision|text|draft <id|off>|kv <8|4|off>]".into())),
                 }
             }
             "/delegate" => {
@@ -2813,7 +2834,7 @@ impl App {
                 let approver: Arc<dyn harness::permissions::Approver> = Arc::new(TuiApprover(tx.clone()));
                 let mut env_ = harness::agent::SubAgentEnv::new(client.clone(), registry.clone(), policy.clone(), approver.clone(), sink.clone(), budget, true); env_.cc_effort = cfg.llm.effort.clone(); env_.max_depth = cfg.agent.max_subagent_depth.max(1); let env = Arc::new(env_); let _ = tx.send(Msg::SubEnv(env.clone()));
                 let ctx = ToolCtx { workdir: workdir.clone(), timeout: Duration::from_secs(cfg.agent.tool_timeout_secs), max_output: cfg.agent.max_tool_output_chars, net: cfg.net.clone(), memory: store.clone(), subagent: Some(env), redact_secrets: cfg.security.redact_secrets, injection_scan: cfg.security.injection_scan, hooks: cfg.hooks.clone(), todos: todos.clone(), lsp_servers: cfg.lsp.servers.clone(), format: cfg.format.clone(), extra_roots: extra_roots.clone(), approver: Some(approver.clone()), inbox: inbox.clone(), cancel: None, cwd: Some(cwd.clone()), session_id: Some(session_id.clone()) };
-                let agent = Agent { client: &client, registry, ctx: &ctx, max_turns: cfg.agent.max_turns, context_budget: budget, sink: sink.as_ref(), stream: true, policy: &policy, approver: approver.as_ref() };
+                let agent = Agent { client: &client, registry, ctx: &ctx, max_turns: cfg.agent.max_turns, context_budget: budget, sink: sink.as_ref(), stream: true, policy: &policy, tool_history_keep: cfg.agent.tool_history_keep, tool_history_chars: cfg.agent.tool_history_max_chars, approver: approver.as_ref() };
                 let extra = format!("You are in an interactive session: the user can see everything and will reply; keep final answers concise.{extra_prompt}");
                 let system = harness::agent::system_prompt_with_memory(&workdir.display().to_string(), &registry.names(), Some(&extra), store.as_ref());
                 // provider = "acp:<cmd>": another agent runs the turn; we stream its updates
@@ -3527,9 +3548,11 @@ impl App {
             return;
         }
         let (tx, dir, port, kind) = (self.tx.clone(), build.dir(), self.cfg.local_model.port, self.cfg.local_model.server.clone());
-        let draft = lm::Draft::from_cfg(&self.cfg.local_model);
+        let opts = lm::ServeOpts::from_cfg(&self.cfg.local_model);
+        let draft = opts.draft.clone();
+        let kv = opts.kv_bits;
         let first = lm::server_plan(&kind).first().copied().unwrap_or("mlx_lm.server");
-        self.set_status(format!("{} {first} on port {port}{}", if force { "restarting" } else { "starting" }, if draft.on() { format!(" · speculative draft {}", draft.model) } else { String::new() }));
+        self.set_status(format!("{} {first} on port {port}{}{}", if force { "restarting" } else { "starting" }, if draft.on() { format!(" · speculative draft {}", draft.model) } else { String::new() }, if kv == 8 || kv == 4 { format!(" · kv {kv}-bit") } else { String::new() }));
         tokio::spawn(async move {
             // Keep it ready: a warm server of the right kind from an earlier session is reused as-is —
             // no reload of 16–30GB of weights, the prefix cache survives. `force` skips this to restart.
@@ -3551,7 +3574,7 @@ impl App {
             // ours from an earlier session (or the other server kind) may still hold the port: replace it
             lm::stop_on_port(port).await;
             let _ = tx.send(Msg::Notice(format!("loading {} GB of weights — a moment", build.bytes / 1_000_000_000)));
-            let msg = match lm::serve_spec(&dir, port, &kind, &draft).await {
+            let msg = match lm::serve_spec(&dir, port, &kind, &opts).await {
                 Ok(s) => Msg::MlxUp(Ok((s.base_url.clone(), s.model.clone(), s.module))),
                 Err(e) => Msg::MlxUp(Err(format!("{e:#}"))),
             };
@@ -3775,7 +3798,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ("/resume", "resume a saved session: /resume <n|id|last>"),
     ("/model", "browse every model you can switch to — Claude, the downloaded MLX build, and this server (enter switches backend + model); /model <name> switches directly"),
     ("/backend", "switch backend: local (LM Studio etc.) | claude [model] [effort] (Claude Code CLI, subscription) | anthropic <model>"),
-    ("/localmodel", "the local Qwen3.8-27B: download 4/6/8-bit · serve · stop (reclaim RAM) · restart · status · vision|text · draft <hf-id|off> (speculative decoding: a drafter proposes tokens the 27B verifies)"),
+    ("/localmodel", "the local Qwen3.8-27B: download 4/6/8-bit · serve · stop · restart · status · vision|text · draft <hf-id|off> (speculative decoding) · kv <8|4|off> (KV-cache quantization: less RAM, faster long context)"),
     ("/delegate", "Claude orchestrates while the local model runs the delegated work (sub-agents): /delegate on|off"),
     ("/effort", "Claude Code backend reasoning effort: /effort low|medium|high|xhigh|max (default medium)"),
     ("/cd", "change working directory"),

@@ -142,7 +142,7 @@ impl Tool for SpawnAgent {
                     }
                 }
             } else {
-                let agent = crate::agent::Agent { client: &client, registry: &registry, ctx: &sub_ctx, max_turns, context_budget: budget, sink: sink.as_ref(), stream, policy: &policy, approver: approver.as_ref() };
+                let agent = crate::agent::Agent { client: &client, registry: &registry, ctx: &sub_ctx, max_turns, context_budget: budget, sink: sink.as_ref(), stream, policy: &policy, tool_history_keep: 4, tool_history_chars: 4000, approver: approver.as_ref() };
                 let mut msgs = prior;
                 let out = if msgs.is_empty() { agent.run(&system, &task).await } else { agent.run_turn(&mut msgs, &system, &task).await };
                 match out {

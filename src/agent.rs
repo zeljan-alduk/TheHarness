@@ -15,6 +15,8 @@ pub struct RunStats {
     pub completion_tokens: u64,
     pub wall_secs: f64,
     pub compactions: usize,
+    /// Tool outputs shrunk by context-output trimming.
+    pub trims: usize,
     pub stop_reason: String,
 }
 
@@ -29,6 +31,10 @@ pub struct Agent<'a> {
     pub stream: bool,
     pub policy: &'a crate::permissions::Policy,
     pub approver: &'a dyn crate::permissions::Approver,
+    /// Context-output trimming (0 chars = off): keep the last `tool_history_keep` tool outputs full,
+    /// shrink older ones larger than `tool_history_chars` to a head+tail (once, stably).
+    pub tool_history_keep: usize,
+    pub tool_history_chars: usize,
 }
 
 /// Precise LLM compaction: summarize everything but the last `keep_last` messages into a dense,
@@ -433,6 +439,13 @@ impl<'a> Agent<'a> {
             }
             if let Some(c) = &self.ctx.cancel { if c.load(std::sync::atomic::Ordering::Relaxed) { stats.stop_reason = "cancelled".into(); stats.wall_secs = start.elapsed().as_secs_f64(); self.finish(&stats); return Ok((last_text(msgs).unwrap_or_else(|| "(cancelled by user)".into()), stats)); } }
             if let Some(m) = self.ctx.inbox.take_message() { msgs.push(Message::user(m)); }
+            // Context-output trimming: shrink tool outputs that have aged past the last `keep` to a
+            // head+tail, once and stably, so the context (and prefill cost / KV memory) does not grow
+            // without bound as tools accumulate. Done here, before the model call, only when configured.
+            if self.tool_history_chars > 0 {
+                let t = trim_tool_history(msgs, self.tool_history_keep, self.tool_history_chars);
+                if t > 0 { stats.trims += t; }
+            }
             stats.turns += 1;
             defs = self.registry.defs();
             self.sink.emit(&Event::Turn { n: stats.turns });
@@ -648,6 +661,31 @@ fn last_text(msgs: &[Message]) -> Option<String> {
     msgs.iter().rev().find(|m| m.role == "assistant").map(|m| m.text()).filter(|c| !c.trim().is_empty())
 }
 
+/// Marker appended to a tool output once it has been trimmed, so the trim is idempotent (a trimmed
+/// message is stable across turns and does not keep busting the prefix cache).
+const TRIM_MARK: &str = "\n…[middle trimmed to save context; re-run the tool for the full output]\n";
+
+/// Shrink tool outputs older than the last `keep_last` tool messages to a head+tail of ~`max_chars`,
+/// preserving the beginning and end (where the useful signal usually is). Idempotent: a message already
+/// carrying TRIM_MARK is left alone, so this only rewrites each output the one turn it ages out — after
+/// which it is stable and the server's prefix cache reuses it. Returns how many were trimmed this call.
+fn trim_tool_history(msgs: &mut [Message], keep_last: usize, max_chars: usize) -> usize {
+    if max_chars == 0 { return 0; }
+    let idxs: Vec<usize> = msgs.iter().enumerate().filter(|(_, m)| m.role == "tool").map(|(i, _)| i).collect();
+    if idxs.len() <= keep_last { return 0; }
+    let mut n = 0;
+    for &i in &idxs[..idxs.len() - keep_last] {
+        let text = msgs[i].text();
+        if text.contains(TRIM_MARK) || text.chars().count() <= max_chars { continue; }
+        let half = max_chars / 2;
+        let head: String = text.chars().take(half).collect();
+        let tail: String = { let c: Vec<char> = text.chars().collect(); c[c.len().saturating_sub(half)..].iter().collect() };
+        msgs[i].content = Some(Content::Text(format!("{head}{TRIM_MARK}{tail}")));
+        n += 1;
+    }
+    n
+}
+
 /// Replace the content of tool results older than the last `keep_last` tool messages with a stub.
 fn compact(msgs: &mut [Message], keep_last: usize) -> usize {
     let idxs: Vec<usize> = msgs.iter().enumerate().filter(|(_, m)| m.role == "tool").map(|(i, _)| i).collect();
@@ -668,4 +706,38 @@ fn compact(msgs: &mut [Message], keep_last: usize) -> usize {
         }
     }
     n
+}
+
+#[cfg(test)]
+mod trim_tests {
+    use super::*;
+    fn tool_msg(id: &str, text: &str) -> Message { Message::tool(id.to_string(), "bash".to_string(), text) }
+    #[test]
+    fn trims_old_large_outputs_keeps_recent_and_is_idempotent() {
+        let big = "X".repeat(10_000);
+        let mut msgs = vec![
+            Message::system("sys"),
+            Message::user("do it"),
+            tool_msg("1", &big),   // oldest — should trim
+            tool_msg("2", &big),   // should trim
+            tool_msg("3", &big),   // within keep_last=2 — full
+            tool_msg("4", &big),   // within keep_last=2 — full
+        ];
+        let n = trim_tool_history(&mut msgs, 2, 1000);
+        assert_eq!(n, 2, "two oldest tool outputs trimmed");
+        assert!(msgs[2].text().contains(TRIM_MARK) && msgs[2].text().chars().count() < 2000);
+        assert!(msgs[3].text().contains(TRIM_MARK));
+        assert_eq!(msgs[4].text().chars().count(), 10_000, "recent kept full");
+        assert_eq!(msgs[5].text().chars().count(), 10_000);
+        // idempotent: a second pass trims nothing new
+        assert_eq!(trim_tool_history(&mut msgs, 2, 1000), 0);
+    }
+    #[test]
+    fn leaves_small_outputs_and_respects_off() {
+        let mut msgs = vec![Message::system("s"), tool_msg("1","short"), tool_msg("2","short"), tool_msg("3","short")];
+        assert_eq!(trim_tool_history(&mut msgs, 1, 1000), 0, "small outputs untouched");
+        let big = "Y".repeat(5000);
+        let mut m2 = vec![tool_msg("1",&big), tool_msg("2",&big), tool_msg("3",&big)];
+        assert_eq!(trim_tool_history(&mut m2, 1, 0), 0, "max_chars=0 is off");
+    }
 }

@@ -66,13 +66,19 @@ pub struct LocalModelConfig {
     #[serde(default = "d_auto")] pub draft_kind: String,
     /// Override the drafter's block size (0 = the drafter's own default).
     #[serde(default)] pub draft_block_size: u32,
+    /// KV-cache quantization (mlx_vlm only): 0 = off (fp16), or 8 | 4 bits. Roughly halves/quarters the KV
+    /// memory the context holds — which relieves memory pressure and speeds long-context decode — for a
+    /// small quality cost. The first `kv_quant_start` tokens stay full-precision. `/localmodel kv`.
+    #[serde(default)] pub kv_bits: u8,
+    /// Keep the first N tokens of the KV cache at full precision before quantizing (0 = the server default).
+    #[serde(default)] pub kv_quant_start: u32,
 }
 fn d_auto() -> String { "auto".into() }
 fn d_mlx_port() -> u16 { 8890 }
 fn d_mlx_server() -> String { "auto".into() }
 fn d_segments() -> usize { 8 }
 impl Default for LocalModelConfig {
-    fn default() -> Self { Self { build: String::new(), port: d_mlx_port(), server: d_mlx_server(), autostart: true, download_segments: d_segments(), first_run_prompt: true, draft_model: String::new(), draft_kind: d_auto(), draft_block_size: 0 } }
+    fn default() -> Self { Self { build: String::new(), port: d_mlx_port(), server: d_mlx_server(), autostart: true, download_segments: d_segments(), first_run_prompt: true, draft_model: String::new(), draft_kind: d_auto(), draft_block_size: 0, kv_bits: 0, kv_quant_start: 0 } }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -234,7 +240,20 @@ pub struct AgentConfig {
     /// How deep sub-agents may nest (1 = only the main agent delegates; default 2).
     #[serde(default = "d_depth")]
     pub max_subagent_depth: usize,
+    /// Context-output trimming (OPT-IN, 0 = off): keep the last `tool_history_keep` tool results at full
+    /// size; older ones larger than `tool_history_max_chars` are shrunk to a head+tail once. This reclaims
+    /// context and KV memory from long tool-heavy sessions (measured ~44% smaller on a 6-file-read run).
+    /// TRADE-OFF: trimming an old message changes the prompt prefix the turn it ages out, so it busts the
+    /// MLX prefix cache once at that point (a one-time re-prefill of the now-smaller tail). Prefer LOWERING
+    /// `max_tool_output_chars` for cache-friendly shrinking (that caps each output at creation, stably);
+    /// use this when you specifically want to reclaim memory from an already-large history. Default: off.
+    #[serde(default = "d_hist_keep")]
+    pub tool_history_keep: usize,
+    /// The head+tail size an aged-out tool output is trimmed to (chars). 0 = off (keep full history).
+    #[serde(default)]
+    pub tool_history_max_chars: usize,
 }
+fn d_hist_keep() -> usize { 4 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct EvalConfig {
@@ -445,6 +464,11 @@ impl Config {
             "local_model.server" => self.local_model.server = val.into(),
             "local_model.autostart" => self.local_model.autostart = b(val),
             "local_model.first_run_prompt" => self.local_model.first_run_prompt = b(val),
+            "local_model.draft_model" => self.local_model.draft_model = val.into(),
+            "local_model.draft_kind" => self.local_model.draft_kind = val.into(),
+            "local_model.draft_block_size" => self.local_model.draft_block_size = val.parse().context("bad number")?,
+            "local_model.kv_bits" => self.local_model.kv_bits = val.parse().context("bad number")?,
+            "local_model.kv_quant_start" => self.local_model.kv_quant_start = val.parse().context("bad number")?,
             "permissions.mode" => self.permissions.mode = crate::permissions::Mode::parse(val).context("bad mode")?,
             "llm.compact_at_fraction" => self.llm.compact_at_fraction = val.parse().context("bad fraction")?,
             "llm.effort" => self.llm.effort = if val.is_empty() || val == "default" { None } else { Some(val.into()) },
@@ -472,6 +496,8 @@ impl Config {
             "agent.tool_timeout_secs" => self.agent.tool_timeout_secs = val.parse().context("bad number")?,
             "agent.max_tool_output_chars" => self.agent.max_tool_output_chars = val.parse().context("bad number")?,
             "agent.max_subagent_depth" => self.agent.max_subagent_depth = val.parse().context("bad number")?,
+            "agent.tool_history_keep" => self.agent.tool_history_keep = val.parse().context("bad number")?,
+            "agent.tool_history_max_chars" => self.agent.tool_history_max_chars = val.parse().context("bad number")?,
             "eval.tasks_dir" => self.eval.tasks_dir = val.into(),
             "eval.runs_dir" => self.eval.runs_dir = val.into(),
             "eval.task_timeout_secs" => self.eval.task_timeout_secs = val.parse().context("bad number")?,

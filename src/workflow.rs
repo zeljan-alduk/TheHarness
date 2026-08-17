@@ -175,7 +175,7 @@ async fn run_agent_step(wenv: &WorkflowEnv, sid: &str, label: &str, task: &str, 
     for attempt in 1..=step.max_attempts.max(1) {
         wenv.sink.emit(&Event::ToolCall { id: format!("{sid}:{attempt}"), name: format!("workflow ▸ agent {label}"), args: crate::llm::truncate_for_log(&task_now, 400) });
         let t0 = std::time::Instant::now();
-        let agent = Agent { client: &env.client, registry: &registry, ctx: &wenv.ctx, max_turns: step.max_turns.unwrap_or(25), context_budget: env.context_budget, sink: &sink, stream: env.stream, policy: &policy, approver: env.approver.as_ref() };
+        let agent = Agent { client: &env.client, registry: &registry, ctx: &wenv.ctx, max_turns: step.max_turns.unwrap_or(25), context_budget: env.context_budget, sink: &sink, stream: env.stream, policy: &policy, tool_history_keep: 4, tool_history_chars: 4000, approver: env.approver.as_ref() };
         let system = format!("{}\n\nYou are running as one step of the workflow; do exactly the step's task and end with a concise report.", wenv.base_system);
         let (text, stats) = agent.run(&system, &task_now).await?;
         last = text.clone();
