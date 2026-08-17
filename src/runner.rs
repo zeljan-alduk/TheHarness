@@ -83,6 +83,7 @@ pub async fn prepare(setup: RunSetup) -> Result<Prepared> {
     if let Some(m) = perm_mode { pcfg.mode = m; }
     pcfg.allow.extend(crate::permissions::persisted_rules());
     let policy = Arc::new(Policy::new(pcfg, &workdir));
+    crate::mcp::set_elicitor(approver.clone()); // MCP servers may ask the user for input mid-call
     // a configured vision model lets text-only backends still look at images
     crate::llm::set_vision_client(cfg.llm.roles.contains_key("vision").then(|| client.role("vision")));
     let mut env = SubAgentEnv::new(client.clone(), toolset.registry.clone(), policy.clone(), approver.clone(), sink.clone(), budget, true);

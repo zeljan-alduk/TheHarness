@@ -362,7 +362,8 @@ impl<'a> Agent<'a> {
         if msgs.is_empty() { msgs.push(Message::system(system)); } else if msgs[0].role == "system" { msgs[0] = Message::system(system); }
         repair_dangling(msgs);
         msgs.push(user);
-        let defs = self.registry.defs();
+        // recomputed each turn: tool_search can make deferred tools callable mid-run
+        let mut defs: Vec<crate::llm::ToolDef>;
         let mut stats = RunStats::default();
         let mut last_usage = Usage::default();
         let mut truncations = 0u32;
@@ -402,6 +403,7 @@ impl<'a> Agent<'a> {
             if let Some(c) = &self.ctx.cancel { if c.load(std::sync::atomic::Ordering::Relaxed) { stats.stop_reason = "cancelled".into(); stats.wall_secs = start.elapsed().as_secs_f64(); self.finish(&stats); return Ok((last_text(msgs).unwrap_or_else(|| "(cancelled by user)".into()), stats)); } }
             if let Some(m) = self.ctx.inbox.take_message() { msgs.push(Message::user(m)); }
             stats.turns += 1;
+            defs = self.registry.defs();
             self.sink.emit(&Event::Turn { n: stats.turns });
             if self.ctx.hooks.any("before_model") {
                 let est: u64 = context_map(msgs).iter().map(|x| x.1).sum();

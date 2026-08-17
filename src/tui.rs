@@ -1799,6 +1799,52 @@ impl App {
                     dir.join(name.unwrap_or_else(|| "<kebab-case-name>".into())).display());
                 if self.running.is_some() { self.queued.push(prompt); self.set_status("queued /learn"); } else { self.start_run(prompt); }
             }
+            "/prompt" | "/mcp-prompt" => {
+                let (name, rest) = arg.split_once(' ').map(|(a, b)| (a.trim().to_string(), b.trim().to_string())).unwrap_or((arg.trim().to_string(), String::new()));
+                let tx = self.tx.clone();
+                let busy = self.running.is_some();
+                tokio::spawn(async move {
+                    let servers = harness::mcp::connected_servers();
+                    if servers.is_empty() { let _ = tx.send(Msg::Notice("no MCP servers connected (/mcp)".into())); return; }
+                    // no name: list what the servers offer
+                    if name.is_empty() {
+                        let mut lines = vec!["MCP prompts — run one with /prompt <server>:<name> [arguments]".to_string()];
+                        for (sname, s) in servers {
+                            let mut g = s.lock().await;
+                            if !g.has_prompts() { continue; }
+                            for p in g.list_prompts().await.unwrap_or_default() {
+                                lines.push(format!("  /prompt {sname}:{:<24} {}", p["name"].as_str().unwrap_or(""), truncate(p["description"].as_str().unwrap_or(""), 70)));
+                            }
+                        }
+                        if lines.len() == 1 { lines.push("  (no server advertises prompts)".into()); }
+                        let _ = tx.send(Msg::Block(Block::Banner(lines)));
+                        return;
+                    }
+                    let (want_server, want_prompt) = name.split_once(':').map(|(a, b)| (a.to_string(), b.to_string())).unwrap_or((String::new(), name.clone()));
+                    for (sname, s) in servers {
+                        if !want_server.is_empty() && sname != want_server { continue; }
+                        let mut g = s.lock().await;
+                        if !g.has_prompts() { continue; }
+                        let found = g.list_prompts().await.unwrap_or_default().into_iter().find(|p| p["name"].as_str() == Some(want_prompt.as_str()));
+                        let Some(spec) = found else { continue };
+                        // positional words fill the prompt's declared arguments in order
+                        let mut args = serde_json::Map::new();
+                        let words: Vec<&str> = rest.split_whitespace().collect();
+                        for (i, a) in spec["arguments"].as_array().cloned().unwrap_or_default().iter().enumerate() {
+                            if let Some(k) = a["name"].as_str() {
+                                let v = if i + 1 == spec["arguments"].as_array().map(|x| x.len()).unwrap_or(0) { words[i.min(words.len())..].join(" ") } else { words.get(i).copied().unwrap_or("").to_string() };
+                                if !v.is_empty() { args.insert(k.to_string(), serde_json::Value::String(v)); }
+                            }
+                        }
+                        match g.get_prompt(&want_prompt, serde_json::Value::Object(args)).await {
+                            Ok(text) => { let _ = tx.send(if busy { Msg::QueueTask(text) } else { Msg::RunTask(text) }); }
+                            Err(e) => { let _ = tx.send(Msg::Notice(format!("prompt {want_prompt}: {e:#}"))); }
+                        }
+                        return;
+                    }
+                    let _ = tx.send(Msg::Notice(format!("no MCP prompt '{name}' (/prompt lists them)")));
+                });
+            }
             "/commands" => {
                 let cmds = harness::commands::discover(&self.workdir);
                 if cmds.is_empty() {
@@ -2684,6 +2730,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ("/todos", "show the agent's todo list"),
     ("/hooks", "show configured hooks"),
     ("/skills", "list installed skills"),
+    ("/prompt", "run a prompt offered by an MCP server: /prompt <server>:<name> [args] (bare /prompt lists them)"),
     ("/commands", "list markdown slash commands (.harness/commands/*.md, .claude/commands, plugins)"),
     ("/btw", "ask a side question about this session without touching the conversation"),
     ("/recap", "summarise the session so far (aux model)"),

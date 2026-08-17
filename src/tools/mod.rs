@@ -28,6 +28,7 @@ pub mod skill;
 pub mod subagent;
 pub mod terminal;
 pub mod todo;
+pub mod tool_search;
 pub mod web;
 pub mod worktree;
 
@@ -137,6 +138,10 @@ pub trait Tool: Send + Sync {
 #[derive(Clone)]
 pub struct Registry {
     tools: Vec<std::sync::Arc<dyn Tool>>,
+    /// Tools kept out of the model's tool list until `tool_search` surfaces them. With a dozen MCP
+    /// servers connected the catalogue alone can cost more context than the conversation.
+    deferred: std::collections::HashSet<String>,
+    activated: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
 }
 
 impl Registry {
@@ -185,15 +190,15 @@ impl Registry {
             tools.push(Arc::new(web::WebSearch));
             tools.push(Arc::new(download::DownloadFile));
         }
-        Self { tools }
+        Self { tools, deferred: Default::default(), activated: Default::default() }
     }
     /// A copy keeping only the named tools (custom agents' `tools:` allow-list). Empty list = unchanged.
     pub fn only(&self, names: &[String]) -> Registry {
         if names.is_empty() { return self.clone(); }
-        Registry { tools: self.tools.iter().filter(|t| names.iter().any(|n| n == t.name())).cloned().collect() }
+        Registry { tools: self.tools.iter().filter(|t| names.iter().any(|n| n == t.name())).cloned().collect(), deferred: self.deferred.clone(), activated: self.activated.clone() }
     }
     /// A copy without the named tool (used for sub-agents).
-    pub fn without(&self, name: &str) -> Registry { Registry { tools: self.tools.iter().filter(|t| t.name() != name).cloned().collect() } }
+    pub fn without(&self, name: &str) -> Registry { Registry { tools: self.tools.iter().filter(|t| t.name() != name).cloned().collect(), deferred: self.deferred.clone(), activated: self.activated.clone() } }
     pub fn is_parallel_safe(&self, name: &str) -> bool { self.tools.iter().find(|t| t.name() == name).map(|t| t.parallel_safe()).unwrap_or(false) }
 
     /// Add tools at runtime (MCP servers, plugins).
@@ -201,8 +206,24 @@ impl Registry {
     pub fn len(&self) -> usize { self.tools.len() }
     pub fn is_empty(&self) -> bool { self.tools.is_empty() }
 
+    /// The tool list sent to the model: everything except deferred tools that have not been
+    /// surfaced by `tool_search` yet.
     pub fn defs(&self) -> Vec<ToolDef> {
-        self.tools.iter().map(|t| ToolDef::new(t.name(), t.description(), t.parameters())).collect()
+        let active = self.activated.lock().map(|g| g.clone()).unwrap_or_default();
+        self.tools.iter()
+            .filter(|t| !self.deferred.contains(t.name()) || active.contains(t.name()))
+            .map(|t| ToolDef::new(t.name(), t.description(), t.parameters())).collect()
+    }
+
+    /// Hold these tools back until they are searched for.
+    pub fn defer(&mut self, names: Vec<String>) { self.deferred = names.into_iter().collect(); }
+    pub fn deferred_names(&self) -> Vec<&'static str> { self.tools.iter().map(|t| t.name()).filter(|n| self.deferred.contains(*n)).collect() }
+    pub fn is_deferred(&self, name: &str) -> bool { self.deferred.contains(name) }
+    /// Make deferred tools callable from now on (used by `tool_search`).
+    pub fn activate(&self, names: &[String]) { if let Ok(mut g) = self.activated.lock() { for n in names { g.insert(n.clone()); } } }
+    /// (name, description) of every deferred tool, for searching.
+    pub fn deferred_catalogue(&self) -> Vec<(&'static str, &'static str)> {
+        self.tools.iter().filter(|t| self.deferred.contains(t.name())).map(|t| (t.name(), t.description())).collect()
     }
 
     pub fn names(&self) -> Vec<&'static str> { self.tools.iter().map(|t| t.name()).collect() }
@@ -277,14 +298,25 @@ pub async fn build_toolset(net_enabled: bool, workdir: &Path, with_mcp: bool) ->
     let mut registry = Registry::defaults(net_enabled);
     let mut notes = Vec::new();
     let mut servers = Vec::new();
-    let prompt_extra = String::new();
+    let mut prompt_extra = String::new();
     let plugins = crate::plugins::Plugins::open().ok();
     if with_mcp {
         let extra = plugins.as_ref().map(|p| p.mcp_files()).unwrap_or_default();
         let (tools, errs, srv) = crate::mcp::start_all(workdir, &extra).await;
         if !tools.is_empty() { notes.push(format!("MCP: {} tool(s) from {} server(s)", tools.len(), srv.len())); }
         for e in errs { notes.push(format!("MCP: {e}")); }
+        let mcp_names: Vec<String> = tools.iter().map(|t| t.name().to_string()).collect();
         registry.extend(tools);
+        // a large MCP catalogue costs more context than most conversations: hand it over on demand
+        let threshold: usize = std::env::var("HARNESS_TOOL_SEARCH_AT").ok().and_then(|v| v.parse().ok()).unwrap_or(25);
+        if mcp_names.len() > threshold {
+            registry.defer(mcp_names.clone());
+            let shared = std::sync::Arc::new(std::sync::Mutex::new(None));
+            registry.extend(vec![std::sync::Arc::new(tool_search::ToolSearch { registry: shared.clone() }) as std::sync::Arc<dyn Tool>]);
+            *shared.lock().unwrap() = Some(registry.clone());
+            notes.push(format!("MCP: {} tool(s) deferred behind tool_search (over {threshold})", mcp_names.len()));
+            prompt_extra.push_str(&format!("\n\n# Deferred tools\n{} MCP tools are not listed above to save context. When you need one — browser control, an issue tracker, a database, anything a server might provide — call tool_search {{query}} first; matching tools become callable.\n", mcp_names.len()));
+        }
         servers = srv;
     }
     Toolset { registry, notes, servers, prompt_extra }
@@ -347,7 +379,7 @@ mod tests {
     }
     #[tokio::test]
     async fn panicking_tool_becomes_error() {
-        let mut r = Registry { tools: vec![] };
+        let mut r = Registry { tools: vec![], deferred: Default::default(), activated: Default::default() };
         r.extend(vec![std::sync::Arc::new(Boom)]);
         let out = r.call("boom", "{}", &ctx()).await;
         assert!(out.text.contains("tool panicked: kaboom"), "{}", out.text);

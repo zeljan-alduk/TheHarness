@@ -87,6 +87,58 @@ static SERVERS: OnceLock<std::sync::Mutex<Vec<(String, Weak<Mutex<McpServer>>)>>
 
 fn registry() -> &'static std::sync::Mutex<Vec<(String, Weak<Mutex<McpServer>>)>> { SERVERS.get_or_init(|| std::sync::Mutex::new(Vec::new())) }
 
+/// Who answers an MCP server's `elicitation/create` (the user, through whichever UI is running).
+static ELICITOR: OnceLock<std::sync::Mutex<Option<Arc<dyn crate::permissions::Approver>>>> = OnceLock::new();
+fn elicitor() -> &'static std::sync::Mutex<Option<Arc<dyn crate::permissions::Approver>>> { ELICITOR.get_or_init(|| std::sync::Mutex::new(None)) }
+/// Called once per session so servers can ask the user for input mid-call.
+pub fn set_elicitor(a: Arc<dyn crate::permissions::Approver>) { *elicitor().lock().unwrap() = Some(a); }
+
+/// Answer a request the server sent us. Elicitation goes to the user; roots list the working dir.
+async fn server_request(name: &str, v: &Value) -> Value {
+    let id = v["id"].clone();
+    let method = v["method"].as_str().unwrap_or("");
+    match method {
+        "elicitation/create" => {
+            let message = v["params"]["message"].as_str().unwrap_or("(the MCP server needs input)").to_string();
+            let schema = &v["params"]["requestedSchema"];
+            // enum properties become choices; anything else is free text
+            let mut options: Vec<crate::permissions::QuestionOption> = Vec::new();
+            if let Some(props) = schema["properties"].as_object() {
+                if let Some((_, spec)) = props.iter().next() {
+                    if let Some(vals) = spec["enum"].as_array() {
+                        options = vals.iter().filter_map(|x| x.as_str()).map(|x| crate::permissions::QuestionOption { label: x.to_string(), description: String::new() }).collect();
+                    }
+                }
+            }
+            let approver = elicitor().lock().unwrap().clone();
+            let answer = match approver {
+                Some(a) => a.question(crate::permissions::Question { question: format!("[{name}] {message}"), options: options.clone(), allow_free_text: options.is_empty(), timeout_secs: Some(120) }).await,
+                None => None,
+            };
+            let result = match answer {
+                Some(ans) if !ans.declined => {
+                    let key = schema["properties"].as_object().and_then(|p| p.keys().next().cloned()).unwrap_or_else(|| "value".into());
+                    let value = match (ans.choice, ans.text) {
+                        (Some(i), _) => options.get(i).map(|o| o.label.clone()).unwrap_or_default(),
+                        (None, Some(t)) => t,
+                        _ => String::new(),
+                    };
+                    json!({"action": "accept", "content": {key: value}})
+                }
+                Some(_) => json!({"action": "decline"}),
+                None => json!({"action": "cancel"}),
+            };
+            json!({"jsonrpc": "2.0", "id": id, "result": result})
+        }
+        "roots/list" => {
+            let cwd = std::env::current_dir().map(|p| format!("file://{}", p.display())).unwrap_or_default();
+            json!({"jsonrpc": "2.0", "id": id, "result": {"roots": [{"uri": cwd, "name": "workspace"}]}})
+        }
+        "ping" => json!({"jsonrpc": "2.0", "id": id, "result": {}}),
+        _ => json!({"jsonrpc": "2.0", "id": id, "error": {"code": -32601, "message": format!("{method} is not supported by harness")}}),
+    }
+}
+
 /// Register a live server handle (called by `start_all`).
 pub fn register_server(name: &str, server: &Arc<Mutex<McpServer>>) {
     let mut g = registry().lock().unwrap_or_else(|e| e.into_inner());
@@ -127,7 +179,7 @@ impl McpServer {
 
     async fn handshake(&mut self) -> Result<()> {
         let name = self.name.clone();
-        let init = self.request("initialize", json!({"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "harness", "version": env!("CARGO_PKG_VERSION")}}), Duration::from_secs(30)).await
+        let init = self.request("initialize", json!({"protocolVersion": "2025-06-18", "capabilities": {"elicitation": {}, "roots": {"listChanged": false}}, "clientInfo": {"name": "harness", "version": env!("CARGO_PKG_VERSION")}}), Duration::from_secs(30)).await
             .with_context(|| format!("mcp '{name}': initialize failed"))?;
         self.capabilities = init.get("capabilities").cloned().unwrap_or(Value::Null);
         self.notify("notifications/initialized", json!({})).await?;
@@ -175,8 +227,9 @@ impl McpServer {
                         return Ok(v.get("result").cloned().unwrap_or(Value::Null));
                     }
                     if v.get("method").is_some() && v.get("id").is_some() {
-                        let resp = json!({"jsonrpc": "2.0", "id": v["id"], "error": {"code": -32601, "message": "not supported by harness"}});
+                        let resp = server_request(&name, &v).await;
                         let _ = stdin.write_all(format!("{}\n", resp).as_bytes()).await;
+                        let _ = stdin.flush().await;
                     }
                 }
             }
@@ -225,6 +278,23 @@ impl McpServer {
 
     /// Whether the server advertised `capabilities.resources` during initialize.
     pub fn supports_resources(&self) -> bool { self.capabilities.get("resources").map(|r| !r.is_null()).unwrap_or(false) }
+
+    /// Whether the server advertised `capabilities.prompts`.
+    pub fn has_prompts(&self) -> bool { self.capabilities.get("prompts").is_some() }
+    /// `prompts/list` — server-provided prompt templates, offered as slash commands.
+    pub async fn list_prompts(&mut self) -> Result<Vec<Value>> { self.list_paged("prompts/list", "prompts").await }
+    /// `prompts/get` — render one prompt with arguments; returns the messages' text.
+    pub async fn get_prompt(&mut self, name: &str, args: Value) -> Result<String> {
+        let v = self.request("prompts/get", json!({"name": name, "arguments": args}), Duration::from_secs(60)).await?;
+        let mut out = String::new();
+        for m in v["messages"].as_array().cloned().unwrap_or_default() {
+            let c = &m["content"];
+            let text = c["text"].as_str().map(|s| s.to_string()).unwrap_or_else(|| c.as_str().unwrap_or("").to_string());
+            if !text.trim().is_empty() { out.push_str(text.trim()); out.push('\n'); }
+        }
+        if out.trim().is_empty() { out = v.to_string(); }
+        Ok(out)
+    }
 
     /// `resources/list` (follows `nextCursor` pagination). Returns the raw resource objects.
     pub async fn list_resources(&mut self) -> Result<Vec<Value>> { self.list_paged("resources/list", "resources").await }
