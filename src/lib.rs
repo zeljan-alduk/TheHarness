@@ -48,6 +48,7 @@ pub mod setup;
 pub mod skills;
 pub mod telemetry;
 pub mod tools;
+pub mod update;
 pub mod workflow;
 pub mod worktree;
 

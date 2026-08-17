@@ -25,7 +25,14 @@ jobs:
       - name: Build
         run: HARNESS_NO_BUMP=1 cargo build --release --locked -p harness --target aarch64-apple-darwin
       - name: Smoke-test the binary
-        run: ./target/aarch64-apple-darwin/release/harness --version
+        env:
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        # The self-updater installs a download only if `--version` matches the release tag, so a tag that
+        # does not match .build-number would publish an update nobody can install. Fail here instead.
+        run: |
+          V=$(./target/aarch64-apple-darwin/release/harness --version | awk '{print $2}')
+          echo "binary says $V, tag is $TAG"
+          [ "v$V" = "$TAG" ] || { echo "::error::tag $TAG does not match the binary version $V — bump .build-number (echo ${TAG#v} | cut -d. -f3) and tag again"; exit 1; }
       - name: Package
         id: pkg
         run: |
@@ -38,11 +45,19 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        # The notes matter beyond the release page: the harness's self-updater (src/update.rs) shows their
+        # first line as the one-line "what's new" — so the commit subjects since the previous tag come first,
+        # the install line last.
         run: |
-          gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" \
-            --title "$TAG" \
-            --notes "${{ steps.pkg.outputs.version }} — install with:
-          \`\`\`sh
-          curl -fsSL https://zeljan-alduk.github.io/TheHarness/install.sh | sh
-          \`\`\`"
+          git fetch --tags --quiet
+          PREV=$(git tag --sort=-v:refname | grep -v "^$TAG$" | head -1)
+          if [ -n "$PREV" ] && git rev-parse -q --verify "$PREV" >/dev/null; then
+            CHANGES=$(git log --no-merges --format='- %s' "$PREV..HEAD" | head -40)
+          fi
+          [ -n "${CHANGES:-}" ] || CHANGES="- ${{ steps.pkg.outputs.version }}"
+          NOTES="$CHANGES
+
+          Install or update: \`curl -fsSL https://zeljan-alduk.github.io/TheHarness/install.sh | sh\` — an installed harness updates itself to this release the next time it starts (\`harness update\` to do it now).
+          sha256: \`$(cut -d' ' -f1 "${{ steps.pkg.outputs.name }}.sha256")\`"
+          gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --title "$TAG" --notes "$NOTES"
           gh release upload "$TAG" "${{ steps.pkg.outputs.name }}" "${{ steps.pkg.outputs.name }}.sha256" --clobber

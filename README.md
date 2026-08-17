@@ -37,9 +37,27 @@ or to keep Claude as the orchestrator and hand the local model the delegated wor
 
 Uninstall: `rm -rf ~/.config/harness ~/Applications/TheHarness.app ~/Desktop/TheHarness.app ~/.local/bin/harness`.
 
-## Version
+## Version and updates
 `harness --version` → `1.0.NNN (sha)`; the build number increments on every release build (`build.rs`,
 `.build-number`). Set `HARNESS_NO_BUMP=1` to build without bumping.
+
+**The harness updates itself from [GitHub Releases](https://github.com/zeljan-alduk/TheHarness/releases)
+when it starts** — never under a running session. Each start (at most one API call per hour) it compares
+its version with the latest release tag; when a newer one exists it downloads the tarball the installer
+uses, checks the published sha256, runs `--version` on the new binary, swaps it into place atomically
+and starts *that* one — the session that opens is already on the new version. The old binary stays next
+to it as `harness.prev`.
+
+```sh
+harness update              # check + install now (a running session keeps its version until it restarts)
+harness update --check      # only report (exit code 10 when a newer release exists)
+harness update --rollback   # put harness.prev back
+```
+
+`/update` in the TUI only checks and tells you — quitting and starting again is what applies it.
+`[update] mode = "notify"` makes the start-up pass announce instead of install, `"off"` never asks
+GitHub; `HARNESS_NO_UPDATE=1` skips it for one start. Development builds (a `-dev` version or a binary
+under `target/`) are left alone.
 
 ## Backends
 - **MLX** (default): the harness downloads Qwen3.8-27B and serves it with `mlx-lm` on loopback — see [Install](#install) and `/localmodel`. Any other OpenAI-compatible server works too (LM Studio, llama-server, OpenAI, OpenRouter…) via `base_url`/`api_key`.

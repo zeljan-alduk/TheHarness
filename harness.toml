@@ -173,3 +173,10 @@ arbiter_runs = 1
 restart_grace_secs = 60
 # skip_arbiter = true      # gate merges on build + tests only (faster, less safe)
 # repo = "/path/to/TheHarness"   # default: located from cwd / the binary / HARNESS_REPO
+
+[update]
+# Self-update from GitHub Releases. The binary is only ever replaced when `harness` starts — never under a
+# running session: a newer release is downloaded, sha256-verified, installed and started in one go
+# (the old binary stays as harness.prev; `harness update --rollback` goes back).
+mode = "auto"            # auto (install on start) | notify (only say so) | off (never ask GitHub)
+interval_hours = 1       # at most one GitHub API call per this many hours; `harness update` always asks

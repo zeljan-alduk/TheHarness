@@ -300,6 +300,18 @@ enum Cmd {
     /// (internal) stdio↔socket proxy used to expose harness tools to Claude Code
     #[command(name = "mcp-proxy", hide = true)]
     McpProxy { addr: String },
+    /// Update to the latest GitHub release (checked automatically on start — see [update] in harness.toml)
+    Update {
+        /// Only report whether a newer release exists (exit code 10 when one does)
+        #[arg(long)]
+        check: bool,
+        /// Put the previous binary (harness.prev) back
+        #[arg(long)]
+        rollback: bool,
+        /// Install even when the release is not newer, or over a development build
+        #[arg(long)]
+        force: bool,
+    },
     /// List models on the configured server
     Models,
     /// Print the effective configuration
@@ -395,9 +407,39 @@ async fn main() -> Result<()> {
 
     match cli.cmd.unwrap_or(Cmd::Chat) {
         Cmd::Chat => {
+            // Update *before* anything is running: a newer release is installed and exec'd right here, so
+            // the session that opens is already on it. Nothing ever swaps the binary under a live session.
+            let update_note = self_update_on_start(&cfg).await;
             if relaunch_in_kitty(&cfg) { return Ok(()); }
             let resume = cli.resume.clone().or(if cli.r#continue { Some("last".into()) } else { None });
-            tui::run(cfg, resume).await?;
+            tui::run(cfg, resume, update_note).await?;
+        }
+        Cmd::Update { check, rollback, force } => {
+            use harness::update::{self as up, Stage};
+            let dest = up::installed_exe()?;
+            if rollback {
+                let p = up::rollback(&dest)?;
+                let v = std::process::Command::new(&p).arg("--version").output().map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).unwrap_or_default();
+                println!("rolled back → {} ({v}); sessions already running keep the version they started with", p.display());
+                return Ok(());
+            }
+            let cur = up::Version::current();
+            if check {
+                let rel = up::latest().await?;
+                if rel.is_newer() { println!("{} is available (you have {}) — {}\n  harness update   installs it", rel.version, cur, rel.html_url); std::process::exit(10); }
+                println!("up to date: {cur} (latest release {})", rel.version);
+                return Ok(());
+            }
+            if !force && up::is_dev_build() { bail!("{} is a development build ({}) — `cargo build --release` / `cargo install --path .` updates it; --force installs the release over it anyway", cur, dest.display()); }
+            let report: std::sync::Arc<dyn Fn(Stage) + Send + Sync> = std::sync::Arc::new(print_update_stage);
+            match up::run(&dest, force, report).await? {
+                Stage::Installed { release, exe, previous } => {
+                    println!("installed {} → {}{}", release.version, exe.display(), previous.map(|p| format!(" (previous kept as {})", p.file_name().unwrap_or_default().to_string_lossy())).unwrap_or_default());
+                    println!("sessions already running keep {cur} until they /restart or quit");
+                }
+                Stage::UpToDate { current, latest } => println!("up to date: {current} (latest release {latest})"),
+                _ => {}
+            }
         }
         Cmd::Arbiter { branch, runs, filter, merge, baseline } => {
             let repo = repo_root()?;
@@ -816,6 +858,44 @@ fn relaunch_in_kitty(cfg: &config::Config) -> bool {
     match cmd.spawn() {
         Ok(_) => { eprintln!("· opening TheHarness in kitty (HARNESS_NO_KITTY=1 to stay here, or /set ui.prefer_kitty false)"); true }
         Err(_) => false,
+    }
+}
+
+/// One line per update stage on stderr, with an in-place progress bar for the download.
+fn print_update_stage(st: harness::update::Stage) {
+    use harness::update::{fmt_bytes, Stage, Version};
+    match st {
+        Stage::Checking => eprintln!("· checking github.com/{} for a newer release", harness::update::REPO),
+        Stage::UpToDate { .. } => {}
+        Stage::Available(r) => { let h = harness::update::headline(&r.notes); eprintln!("⬆ TheHarness {} is out (you have {}) — {}", r.version, Version::current(), if h.is_empty() { r.html_url.clone() } else { h }); }
+        Stage::Downloading { done, total } => {
+            let pct = if total > 0 { done * 100 / total } else { 0 };
+            let w = 24; let filled = (pct as usize * w / 100).min(w);
+            eprint!("\r  ↓ [{}{}] {:>3}% {}{}", "━".repeat(filled), " ".repeat(w - filled), pct, fmt_bytes(done), if total > 0 { format!(" / {}", fmt_bytes(total)) } else { String::new() });
+            if total > 0 && done >= total { eprintln!(); }
+        }
+        Stage::Verifying => eprintln!("  · sha256 verified against the release · smoke-testing the new binary"),
+        Stage::Installed { release, exe, .. } => eprintln!("  ✓ {} installed → {}", release.version, exe.display()),
+        Stage::Failed(e) => eprintln!("  ✗ {e}"),
+    }
+}
+
+/// The start-of-`harness` update pass (see update.rs). Re-execs into the freshly installed binary and never
+/// returns in that case; otherwise returns a note for the TUI's start-up card (an update that could not be
+/// installed, or is only being announced) — or None when there is nothing to say.
+async fn self_update_on_start(cfg: &config::Config) -> Option<String> {
+    use harness::update::{Startup, Version};
+    let report: std::sync::Arc<dyn Fn(harness::update::Stage) + Send + Sync> = std::sync::Arc::new(print_update_stage);
+    match harness::update::startup(&cfg.update, report).await {
+        Startup::Skipped(_) | Startup::UpToDate => None,
+        Startup::Available { release, note } => Some(format!("⬆ TheHarness {} is available (you have {}) — {note}", release.version, Version::current())),
+        Startup::Installed { release, exe } => {
+            eprintln!("  ↻ starting {}", release.version);
+            let mut cmd = std::process::Command::new(&exe);
+            cmd.args(std::env::args_os().skip(1)).env("HARNESS_UPDATED_FROM", Version::current().to_string());
+            #[cfg(unix)] { let err = cmd.exec(); Some(format!("updated to {} but could not restart into it ({err}) — quit and start harness again", release.version)) }
+            #[cfg(not(unix))] { match cmd.status() { Ok(st) => std::process::exit(st.code().unwrap_or(0)), Err(e) => Some(format!("updated to {} but could not restart into it ({e}) — quit and start harness again", release.version)) } }
+        }
     }
 }
 

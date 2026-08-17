@@ -190,7 +190,9 @@ enum Msg { Toast(String), Title(String), Question(harness::permissions::Question
     /// The MLX server answered on this base_url with this model id, or failed to come up.
     MlxUp(Result<(String, String), String>),
     /// Whether the Claude Code CLI can run a turn (installed + signed in).
-    ClaudeAuth(harness::claude_code::Auth) }
+    ClaudeAuth(harness::claude_code::Auth),
+    /// /update: what GitHub says the latest release is (the TUI only reports; installing happens on start).
+    Update(Result<harness::update::Release, String>) }
 
 /// One hunk of the working-tree diff, as `/review-diff` shows it.
 #[derive(Clone, Debug)]
@@ -736,7 +738,7 @@ struct App {
     run_external: Option<String>,
 }
 
-pub async fn run(cfg: Config, resume: Option<String>) -> Result<()> {
+pub async fn run(cfg: Config, resume: Option<String>, update_note: Option<String>) -> Result<()> {
     let workdir = std::env::current_dir()?;
     // Detect the terminal's graphics protocol (kitty / iterm2 / sixel) and cell size; fall back to half-blocks.
     // Only query terminals known to answer — a plain pty or Terminal.app would block forever on the query.
@@ -760,6 +762,9 @@ pub async fn run(cfg: Config, resume: Option<String>) -> Result<()> {
     if app.cfg.ui.event_log { { let d = config_dir().join("logs").join(harness::memory::today_iso()); let _ = std::fs::create_dir_all(&d); app.event_log = std::fs::OpenOptions::new().create(true).append(true).open(d.join(format!("tui-{}.jsonl", std::process::id()))).ok(); } }
     if app.cfg.ui.theme == "light" { LIGHT.store(true, std::sync::atomic::Ordering::Relaxed); }
     app.banner();
+    // The start-up update pass (main.rs) either exec'd us from a fresh install — say so once — or left a note.
+    if let Ok(from) = std::env::var("HARNESS_UPDATED_FROM") { std::env::remove_var("HARNESS_UPDATED_FROM"); if !from.is_empty() { app.blocks.push(Block::System(format!("⬆ updated to {} (from {from}) — the previous binary is kept as harness.prev; `harness update --rollback` goes back", harness::update::Version::current()))); } }
+    if let Some(n) = update_note { app.blocks.push(Block::System(n)); }
     if let Ok(p) = harness::plugins::Plugins::open() { let st = p.stale(7); if !st.is_empty() { app.blocks.push(Block::System(format!("plugins not updated for 7+ days: {} — /plugin update all", st.join(", ")))); } }
     if !harness::permissions::is_trusted(&app.workdir) && app.perm_mode != harness::permissions::Mode::Plan { app.blocks.push(Block::System(format!("first time in {} — tools run here in '{}' mode. /trust remembers this directory; /plan for read-only.", short_path(&app.workdir), app.perm_mode.label()))); }
     // after /restart (or an automatic restart following /improve): restore the previously picked backend/model/effort
@@ -2583,6 +2588,12 @@ impl App {
             }
             "/next" | "/skip" => self.next_task(),
             "/exit" | "/quit" | "/q" => self.quit = true,
+            "/update" => {
+                // Only a check: the binary is never replaced under a running session — starting harness is what updates.
+                self.set_status(format!("asking github.com/{} for the latest release", harness::update::REPO));
+                let tx = self.tx.clone();
+                tokio::spawn(async move { let r = harness::update::latest().await.map_err(|e| format!("{e:#}")); let _ = tx.send(Msg::Update(r)); });
+            }
             "/restart" => {
                 if self.running.is_some() { self.set_status("finish or interrupt the current task first (esc)"); }
                 else { self.restart = true; self.quit = true; }
@@ -2973,6 +2984,19 @@ impl App {
         match m {
             Msg::Block(b) => self.blocks.push(b),
             Msg::Improve(st) => self.on_improve(st),
+            Msg::Update(r) => {
+                let cur = harness::update::Version::current();
+                match r {
+                    Ok(rel) if rel.is_newer() => {
+                        let mut lines = vec![format!("⬆ TheHarness {} is available (you have {cur})", rel.version)];
+                        let h = harness::update::headline(&rel.notes); if !h.is_empty() { lines.push(format!("  {h}")); }
+                        lines.push(if self.cfg.update.mode == "auto" { "  quit and start harness again — it updates itself on start (or run `harness update` in another terminal; this session keeps running on the current version)".into() } else { "  run `harness update` (this session keeps running on the current version)".into() });
+                        self.blocks.push(Block::Banner(lines));
+                    }
+                    Ok(rel) => self.blocks.push(Block::System(format!("⬆ up to date: {cur} is the latest release{}", if rel.version < cur { format!(" (the release is {}; this build is ahead of it)", rel.version) } else { String::new() }))),
+                    Err(e) => self.blocks.push(Block::Error(format!("/update: {e}"))),
+                }
+            }
             Msg::CcSession(s) => { self.cc = Some(s); }
             Msg::Policy(p) => { p.set_mode(self.perm_mode); self.live_policy = Some(p); }
             Msg::SubEnv(e) => { self.subenv = Some(e); }
@@ -3633,6 +3657,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ("/mcp", "show configured MCP servers and live MCP tools"),
     ("/reload", "restart tools, MCP servers and plugins"),
     ("/restart", "restart the harness (re-exec the installed binary) and resume this session"),
+    ("/update", "check GitHub for a newer release (installing happens when harness starts, never under a running session; `harness update` on demand)"),
     ("/improve", "self-improvement loop: /improve [focus] — propose → confirm (auto with a frontier backend) → implement → arbiter → merge → install → restart (60s to cancel)"),
     ("/cancel", "cancel the pending automatic restart or the running /improve job"),
     ("/permissions", "show or set permission mode: bypass|auto|ask|plan"),

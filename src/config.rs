@@ -35,6 +35,9 @@ pub struct Config {
     pub selfimprove: SelfConfig,
     #[serde(default)]
     pub local_model: LocalModelConfig,
+    /// Self-update from GitHub Releases on start (`harness update` on demand).
+    #[serde(default)]
+    pub update: crate::update::UpdateConfig,
 }
 
 /// The model the harness downloads and serves itself: Qwen3.8-27B on MLX, under `~/.config/harness`.

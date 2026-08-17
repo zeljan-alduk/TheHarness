@@ -25,7 +25,7 @@ IMG = os.path.join(WORK, "gradient.png"); png(IMG)
 ISO = os.path.join(WORK, "config"); import shutil; shutil.rmtree(ISO, ignore_errors=True); os.makedirs(ISO, exist_ok=True)
 pid, fd = pty.fork()
 if pid == 0:
-    os.environ.update(TERM="xterm-256color", COLUMNS=str(COLS), LINES=str(ROWS), HARNESS_SESSIONS_DIR=os.path.join(ISO, "sessions"), HARNESS_PLUGINS_DIR=os.path.join(ISO, "plugins"), HARNESS_MEMORY_DIR=os.path.join(ISO, "memory"))
+    os.environ.update(TERM="xterm-256color", COLUMNS=str(COLS), LINES=str(ROWS), HARNESS_NO_UPDATE="1", HARNESS_SESSIONS_DIR=os.path.join(ISO, "sessions"), HARNESS_PLUGINS_DIR=os.path.join(ISO, "plugins"), HARNESS_MEMORY_DIR=os.path.join(ISO, "memory"))
     os.chdir(WORK); os.execv(HARNESS, ["harness"])
 fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", ROWS, COLS, 0, 0))
 buf = b""
