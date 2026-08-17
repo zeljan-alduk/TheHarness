@@ -75,7 +75,9 @@ under `target/`) are left alone.
   Other builds are opt-in in the `/localmodel` picker (or `/localmodel <id>`): **abliterated MLX** builds
   (`abliterated-mxfp4`, `abliterated-6bit`) serve through the MLX server like the defaults, and an
   **uncensored GGUF** (`heretic-gguf`, ~12.6GB IQ3_M — lighter on RAM) is served by `llama-server`
-  (llama.cpp, `brew install llama.cpp`). These have safety refusals removed — use responsibly.
+  (llama.cpp). Picking any build auto-downloads it, and the harness installs the runtime it needs on demand —
+  the MLX server for MLX builds, llama.cpp (via Homebrew) for the GGUF — so there's no manual setup. These
+  abliterated builds have safety refusals removed — use responsibly.
 - **Claude Code (subscription)**: `provider = "claude-code"` or `/backend claude [model]` (default `claude-fable-5`).
   The harness runs the official `claude` CLI headlessly (`--print`, stream-json in/out) and exposes its own tools
   to it over an MCP bridge, so permissions, hooks, memory, redaction and the UI all still apply while your
