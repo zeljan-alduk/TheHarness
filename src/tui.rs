@@ -216,6 +216,9 @@ struct VideoPicker {
     error: Option<String>,
     /// How the frames were sampled ("32 keyframes", "750 frames (no keyframes)", …).
     note: String,
+    /// Image key of the large preview and which frame it holds — kept separate from the strip's
+    /// thumbnail protocol, which is resized to a dozen cells.
+    preview: Option<(usize, String)>,
 }
 
 fn video_ext(p: &std::path::Path) -> bool {
@@ -227,6 +230,9 @@ fn video_ext(p: &std::path::Path) -> bool {
 /// itself considers a scene) when there are any, otherwise every single frame. Returns
 /// (video, duration, [(timestamp, file)], how it was sampled).
 async fn extract_frames(video: PathBuf, out_dir: PathBuf, max_frames: usize) -> Result<(PathBuf, f64, Vec<(f64, PathBuf)>, String), String> {
+    // a feature film has ~1500–2500 keyframes and they only cost a decode each, so keep them all;
+    // the every-frame fallback is the one that has to be thinned (140k frames for the same film)
+    let max_keyframes = max_frames.max(4000);
     let probe = |args: Vec<String>| {
         let video = video.clone();
         async move {
@@ -275,7 +281,7 @@ async fn extract_frames(video: PathBuf, out_dir: PathBuf, max_frames: usize) -> 
         if !files.is_empty() {
             let mut frames: Vec<(f64, PathBuf)> = files.into_iter().enumerate().map(|(i, p)| (keys.get(i).copied().unwrap_or(i as f64), p)).collect();
             let total = frames.len();
-            if total > max_frames { let stride = (total + max_frames - 1) / max_frames; frames = frames.into_iter().step_by(stride).collect(); }
+            if total > max_keyframes { let stride = (total + max_keyframes - 1) / max_keyframes; frames = frames.into_iter().step_by(stride).collect(); }
             let note = if total > frames.len() { format!("{} of {total} keyframes", frames.len()) } else { format!("{total} keyframes") };
             return Ok((video, duration, frames, note));
         }
@@ -1394,9 +1400,9 @@ impl App {
         let base = store.as_ref().map(|s| s.pastes_dir()).unwrap_or(std::env::temp_dir());
         let stem = path.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or("video".into());
         let out_dir = base.join(format!("{stem}-frames"));
-        self.video = Some(VideoPicker { path: path.clone(), duration: 0.0, frames: vec![], cur: 0, selected: Default::default(), loading: true, error: None, note: String::new() });
+        self.video = Some(VideoPicker { path: path.clone(), duration: 0.0, frames: vec![], cur: 0, selected: Default::default(), loading: true, error: None, note: String::new(), preview: None });
         let tx = self.tx.clone();
-        tokio::spawn(async move { let _ = tx.send(Msg::Frames(extract_frames(path, out_dir, 400).await)); });
+        tokio::spawn(async move { let _ = tx.send(Msg::Frames(extract_frames(path, out_dir, 1200).await)); });
     }
     /// Attach the selected frames (or the current one) as images with timestamps.
     fn video_confirm(&mut self) {
@@ -2767,7 +2773,7 @@ impl App {
             Msg::Pasted(Ok(p)) => { if image_mime(&p).is_some() { self.attach(&p) } else if video_ext(&p) { self.open_video(&p) } else { let t = format!("{} ", p.display()); self.insert_str(&t); self.set_status(format!("inserted file path {}", short_path(&p))); } }
             Msg::Frames(Ok((path, duration, frames, note))) => {
                 let fr: Vec<(f64, PathBuf, Option<String>)> = frames.into_iter().map(|(ts, p)| (ts, p, None)).collect();
-                if let Some(v) = &mut self.video { if v.path == path { v.frames = fr; v.duration = duration; v.loading = false; v.cur = 0; v.note = note; } }
+                if let Some(v) = &mut self.video { if v.path == path { v.frames = fr; v.duration = duration; v.loading = false; v.cur = 0; v.note = note; v.preview = None; } }
             }
             Msg::Frames(Err(e)) => { if let Some(v) = &mut self.video { v.loading = false; v.error = Some(e); } }
             Msg::Pasted(Err(e)) => self.set_status(e),
@@ -3560,9 +3566,10 @@ fn draw_video(f: &mut Frame, app: &mut App, area: Rect) {
     let frames: Vec<(f64, Option<String>)> = v.frames.iter().map(|(t, _, k)| (*t, k.clone())).collect();
     let selected = v.selected.clone();
     let (cw, ch) = app.picker.font_size();
-    // main frame: as large as the pane allows
-    if let Some((ts, key)) = frames.get(cur).cloned() {
-        if let Some((proto, (iw, ih))) = key.as_ref().and_then(|k| app.images.get_mut(k)) {
+    // main frame: as large as the pane allows, from its own protocol
+    let preview_key = app.video.as_ref().and_then(|v| v.preview.as_ref().map(|(_, k)| k.clone()));
+    if let Some((ts, _)) = frames.get(cur).cloned() {
+        if let Some((proto, (iw, ih))) = preview_key.as_ref().and_then(|k| app.images.get_mut(k)) {
             let (iw, ih) = (*iw as f64, *ih as f64);
             let max_cols = rows[1].width.saturating_sub(2) as f64;
             let max_rows = rows[1].height as f64;
@@ -3611,6 +3618,19 @@ fn ensure_frame_images(app: &mut App, area: Rect) {
     let half = per / 2 + 2;
     let (lo, hi) = (v.cur.saturating_sub(half), (v.cur + half).min(v.frames.len() - 1));
     let want: Vec<usize> = (lo..=hi).collect();
+    // the big preview gets a protocol of its own, rebuilt whenever the cursor moves
+    let (cur, cur_path, have_preview) = (v.cur, v.frames[v.cur].1.clone(), v.preview.as_ref().map(|(i, _)| *i) == Some(v.cur));
+    if !have_preview {
+        let old_key = app.video.as_ref().and_then(|v| v.preview.as_ref().map(|(_, k)| k.clone()));
+        if let Ok(bytes) = std::fs::read(&cur_path) {
+            if let Ok(img) = image::load_from_memory(&bytes) {
+                let key = app.register_image(img);
+                if let Some(v) = &mut app.video { v.preview = Some((cur, key)); }
+                if let Some(k) = old_key { app.images.remove(&k); }
+            }
+        }
+    }
+    let Some(v) = &app.video else { return };
     let paths: Vec<(usize, PathBuf, bool)> = want.iter().map(|i| (*i, v.frames[*i].1.clone(), v.frames[*i].2.is_some())).collect();
     for (i, path, have) in paths {
         if have { continue; }
