@@ -123,7 +123,7 @@ fn pal() -> Pal {
 const SPINNER: [&str; 10] = ["✻", "✼", "✽", "✾", "✿", "❀", "✿", "✾", "✽", "✼"];
 const WORDS: [&str; 12] = ["Thinking", "Pondering", "Working", "Reasoning", "Cooking", "Tinkering", "Brewing", "Mulling", "Crunching", "Percolating", "Noodling", "Computing"];
 
-enum Msg { Toast(String), Title(String), Question(harness::permissions::Question, tokio::sync::oneshot::Sender<harness::permissions::Answer>), SubEnv(Arc<harness::agent::SubAgentEnv>), Policy(Arc<harness::permissions::Policy>), CcSession(Arc<harness::claude_code::ClaudeCodeSession>), CcSid(String), Block(Block), Ask(harness::permissions::ApprovalRequest, tokio::sync::oneshot::Sender<harness::permissions::Approval>), Ev(Event), Done(Result<(String, harness::agent::RunStats), String>), Sys(SysSample), CtxLen(u64), Pasted(Result<PathBuf, String>), Frames(Result<(PathBuf, f64, Vec<(f64, PathBuf)>), String>), Toolset(Arc<Toolset>), Catalog(Result<harness::plugins::Catalog, String>), Notice(String), Improve(harness::selfimprove::Stage), GoalCheck(bool, String), Review(String), AcpSession(Arc<harness::acp_client::AcpSession>) }
+enum Msg { Toast(String), Title(String), Question(harness::permissions::Question, tokio::sync::oneshot::Sender<harness::permissions::Answer>), SubEnv(Arc<harness::agent::SubAgentEnv>), Policy(Arc<harness::permissions::Policy>), CcSession(Arc<harness::claude_code::ClaudeCodeSession>), CcSid(String), Block(Block), Ask(harness::permissions::ApprovalRequest, tokio::sync::oneshot::Sender<harness::permissions::Approval>), Ev(Event), Done(Result<(String, harness::agent::RunStats), String>), Sys(SysSample), CtxLen(u64), Pasted(Result<PathBuf, String>), Frames(Result<(PathBuf, f64, Vec<(f64, PathBuf)>), String>), Toolset(Arc<Toolset>), Catalog(Result<harness::plugins::Catalog, String>), Notice(String), Improve(harness::selfimprove::Stage), GoalCheck(bool, String), Review(String), AcpSession(Arc<harness::acp_client::AcpSession>), RunTask(String), QueueTask(String) }
 
 /// One hunk of the working-tree diff, as `/review-diff` shows it.
 #[derive(Clone, Debug)]
@@ -1719,6 +1719,70 @@ impl App {
                     let _ = tx.send(Msg::Review(diff));
                 });
             }
+            "/commands" => {
+                let cmds = harness::commands::discover(&self.workdir);
+                if cmds.is_empty() {
+                    self.blocks.push(Block::System("no markdown commands — add .harness/commands/<name>.md (body = prompt template; $ARGUMENTS, $1…$9, !`shell`, @file)".into()));
+                } else {
+                    self.blocks.push(Block::Banner(std::iter::once(format!("Commands ({}) — run with /<name> [args]", cmds.len()))
+                        .chain(cmds.iter().map(|c| format!("  /{:<20} {}  [{}]", c.name, truncate(&c.description, 70), c.source))).collect()));
+                }
+            }
+            "/btw" | "/side" => {
+                if arg.trim().is_empty() { self.blocks.push(Block::System("/btw <question> — answers from the session's context with the aux model, without adding anything to the conversation".into())); return; }
+                let (q, session, cfg, tx) = (arg.clone(), self.session.clone(), self.cfg.clone(), self.tx.clone());
+                self.blocks.push(Block::User(format!("[btw] {q}"), vec![]));
+                self.set_status("asking on the side…");
+                tokio::spawn(async move {
+                    let msgs = session.lock().await.clone();
+                    let Ok(client) = Client::new(&cfg.llm) else { return };
+                    let tail = harness::agent::render_tail(&msgs, 8000);
+                    let req = vec![
+                        Message::system("You answer a side question about an ongoing coding session. Use the transcript excerpt as context, answer in a few sentences, and do not propose actions — this is a question asked on the side, not a task."),
+                        Message::user(format!("Session so far:\n{tail}\n\nQuestion: {q}")),
+                    ];
+                    let text = match client.role("aux").chat(&req, &[]).await { Ok((r, _)) => r.text(), Err(e) => format!("(aux model unavailable: {e:#})") };
+                    let _ = tx.send(Msg::Block(Block::Banner(std::iter::once("[btw — not part of the conversation]".to_string()).chain(text.lines().map(String::from)).collect())));
+                });
+            }
+            "/recap" => {
+                let (session, cfg, tx) = (self.session.clone(), self.cfg.clone(), self.tx.clone());
+                self.set_status("summarising the session…");
+                tokio::spawn(async move {
+                    let msgs = session.lock().await.clone();
+                    let Ok(client) = Client::new(&cfg.llm) else { return };
+                    let tail = harness::agent::render_tail(&msgs, 12000);
+                    let req = vec![
+                        Message::system("Recap an ongoing coding session for the user in at most 12 short bullets: what was asked, what was actually done (files, commands, results), what is still open. No preamble."),
+                        Message::user(tail),
+                    ];
+                    let text = match client.role("aux").chat(&req, &[]).await { Ok((r, _)) => r.text(), Err(e) => format!("(aux model unavailable: {e:#})") };
+                    let _ = tx.send(Msg::Block(Block::Banner(std::iter::once("Recap".to_string()).chain(text.lines().map(String::from)).collect())));
+                });
+            }
+            "/find" | "/search" => {
+                if arg.trim().is_empty() { self.blocks.push(Block::System("/find <text> — search this transcript".into())); return; }
+                let needle = arg.to_lowercase();
+                let mut hits: Vec<String> = Vec::new();
+                for (i, b) in self.blocks.iter().enumerate() {
+                    let (kind, text) = match b {
+                        Block::User(t, _) => ("user", t.clone()),
+                        Block::Assistant { text, .. } => ("assistant", text.clone()),
+                        Block::Reasoning { text, .. } => ("thinking", text.clone()),
+                        Block::System(t) => ("system", t.clone()),
+                        Block::Error(t) => ("error", t.clone()),
+                        Block::Banner(l) => ("banner", l.join(" ")),
+                        _ => continue,
+                    };
+                    for line in text.lines() {
+                        if line.to_lowercase().contains(&needle) { hits.push(format!("  {:>3} {:<9} {}", i, kind, truncate(line.trim(), 110))); }
+                        if hits.len() >= 60 { break; }
+                    }
+                    if hits.len() >= 60 { break; }
+                }
+                if hits.is_empty() { self.blocks.push(Block::System(format!("no match for '{arg}' in this session"))); }
+                else { self.blocks.push(Block::Banner(std::iter::once(format!("{} match(es) for '{arg}' — block numbers on the left", hits.len())).chain(hits).collect())); }
+            }
             "/jobs" => {
                 let store = harness::scheduler::Store::open();
                 match store {
@@ -1821,11 +1885,19 @@ impl App {
                 else { self.set_status("nothing to cancel"); }
             }
             _ => {
-                let name = cmd.trim_start_matches('/');
-                let found = harness::plugins::Plugins::open().ok().and_then(|p| p.commands().into_iter().find(|c| c.name == name));
-                match found {
-                    Some(c) => { let prompt = c.template.replace("$ARGUMENTS", &arg); self.blocks.push(Block::System(format!("/{} (plugin {})", c.name, c.plugin))); if self.running.is_some() { self.queued.push(prompt); } else { self.start_run(prompt); } }
-                    None => self.blocks.push(Block::Error(format!("unknown command {cmd} — /help"))),
+                let name = cmd.trim_start_matches('/').to_string();
+                match harness::commands::find(&self.workdir, &name) {
+                    Some(c) => {
+                        self.blocks.push(Block::System(format!("/{} ({})", c.name, c.source)));
+                        let (wd, tx, arg2) = (self.workdir.clone(), self.tx.clone(), arg.clone());
+                        let busy = self.running.is_some();
+                        tokio::spawn(async move {
+                            let prompt = harness::commands::expand(&c, &arg2, &wd).await;
+                            let prompt = match &c.agent { Some(a) => format!("Use spawn_agent with subagent_type \"{a}\" for this:\n\n{prompt}"), None => prompt };
+                            let _ = tx.send(if busy { Msg::QueueTask(prompt) } else { Msg::RunTask(prompt) });
+                        });
+                    }
+                    None => self.blocks.push(Block::Error(format!("unknown command {cmd} — /help · /commands lists the markdown ones"))),
                 }
             }
         }
@@ -2222,6 +2294,8 @@ impl App {
             Msg::Frames(Err(e)) => { if let Some(v) = &mut self.video { v.loading = false; v.error = Some(e); } }
             Msg::Pasted(Err(e)) => self.set_status(e),
             Msg::Review(diff) => self.open_review(diff),
+            Msg::RunTask(t) => { if self.running.is_some() { self.queued.push(t); } else { self.start_run(t); } }
+            Msg::QueueTask(t) => { self.queued.push(t); self.set_status(format!("queued ({} waiting)", self.queued.len())); }
             Msg::AcpSession(s) => self.acp = Some(s),
             Msg::GoalCheck(met, reason) => {
                 let Some(goal) = self.goal.clone() else { return };
@@ -2527,6 +2601,10 @@ const COMMANDS: &[(&str, &str)] = &[
     ("/todos", "show the agent's todo list"),
     ("/hooks", "show configured hooks"),
     ("/skills", "list installed skills"),
+    ("/commands", "list markdown slash commands (.harness/commands/*.md, .claude/commands, plugins)"),
+    ("/btw", "ask a side question about this session without touching the conversation"),
+    ("/recap", "summarise the session so far (aux model)"),
+    ("/find", "search this session's transcript: /find <text>"),
     ("/diff", "git status + diff stat of the working tree"),
     ("/review-diff", "review the working tree hunk by hunk: keep · revert · comment, then send the comments to the agent"),
     ("/copy", "copy the last answer to the clipboard"),

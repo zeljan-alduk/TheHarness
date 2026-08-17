@@ -10,6 +10,7 @@ pub mod arena;
 pub mod attach;
 pub mod checkpoints;
 pub mod claude_code;
+pub mod commands;
 pub mod config;
 pub mod eval;
 pub mod events;
