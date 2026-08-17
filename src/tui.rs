@@ -164,7 +164,7 @@ fn builtin_pal() -> Pal {
 const SPINNER: [&str; 10] = ["✻", "✼", "✽", "✾", "✿", "❀", "✿", "✾", "✽", "✼"];
 const WORDS: [&str; 12] = ["Thinking", "Pondering", "Working", "Reasoning", "Cooking", "Tinkering", "Brewing", "Mulling", "Crunching", "Percolating", "Noodling", "Computing"];
 
-enum Msg { Toast(String), Title(String), Question(harness::permissions::Question, tokio::sync::oneshot::Sender<harness::permissions::Answer>), SubEnv(Arc<harness::agent::SubAgentEnv>), Policy(Arc<harness::permissions::Policy>), CcSession(Arc<harness::claude_code::ClaudeCodeSession>), CcSid(String), Block(Block), Ask(harness::permissions::ApprovalRequest, tokio::sync::oneshot::Sender<harness::permissions::Approval>), Ev(Event), Done(Result<(String, harness::agent::RunStats), String>), Sys(SysSample), CtxLen(u64), Pasted(Result<PathBuf, String>), Frames(Result<(PathBuf, f64, Vec<(f64, PathBuf)>, String), String>), Toolset(Arc<Toolset>), Catalog(Result<harness::plugins::Catalog, String>), Notice(String), Improve(harness::selfimprove::Stage), GoalCheck(bool, String), Review(String), AcpSession(Arc<harness::acp_client::AcpSession>), RunTask(String), QueueTask(String), StatusLine(String), Dictated(String) }
+enum Msg { Toast(String), Title(String), Question(harness::permissions::Question, tokio::sync::oneshot::Sender<harness::permissions::Answer>), SubEnv(Arc<harness::agent::SubAgentEnv>), Policy(Arc<harness::permissions::Policy>), CcSession(Arc<harness::claude_code::ClaudeCodeSession>), CcSid(String), Block(Block), Ask(harness::permissions::ApprovalRequest, tokio::sync::oneshot::Sender<harness::permissions::Approval>), Ev(Event), Done(Result<(String, harness::agent::RunStats), String>), Sys(SysSample), CtxLen(u64), Pasted(Result<PathBuf, String>), Frames(Result<Extracted, String>), Toolset(Arc<Toolset>), Catalog(Result<harness::plugins::Catalog, String>), Notice(String), Improve(harness::selfimprove::Stage), GoalCheck(bool, String), Review(String), AcpSession(Arc<harness::acp_client::AcpSession>), RunTask(String), QueueTask(String), StatusLine(String), Dictated(String) }
 
 /// One hunk of the working-tree diff, as `/review-diff` shows it.
 #[derive(Clone, Debug)]
@@ -217,8 +217,11 @@ struct VideoPicker {
     /// How the frames were sampled ("32 keyframes", "750 frames (no keyframes)", …).
     note: String,
     /// Image key of the large preview and which frame it holds — kept separate from the strip's
-    /// thumbnail protocol, which is resized to a dozen cells.
-    preview: Option<(usize, String)>,
+    /// thumbnail protocol, which is resized to a dozen cells. Carries the frame's pixel size and
+    /// file size for the info line.
+    preview: Option<(usize, String, (u32, u32), u64)>,
+    /// One line about the source video: resolution, codec, fps, bit rate, file size.
+    source: String,
 }
 
 fn video_ext(p: &std::path::Path) -> bool {
@@ -226,10 +229,13 @@ fn video_ext(p: &std::path::Path) -> bool {
 }
 
 /// Probe duration and extract up to `n` evenly spaced JPEG frames (max width 640) with ffmpeg.
+/// What `extract_frames` produced: the frames plus enough about the source to describe it on screen.
+struct Extracted { path: PathBuf, duration: f64, frames: Vec<(f64, PathBuf)>, note: String, source: String }
+
 /// Frames of a video, in the order a person would want to scrub them: the keyframes (what the codec
 /// itself considers a scene) when there are any, otherwise every single frame. Returns
 /// (video, duration, [(timestamp, file)], how it was sampled).
-async fn extract_frames(video: PathBuf, out_dir: PathBuf, max_frames: usize) -> Result<(PathBuf, f64, Vec<(f64, PathBuf)>, String), String> {
+async fn extract_frames(video: PathBuf, out_dir: PathBuf, max_frames: usize) -> Result<Extracted, String> {
     // a feature film has ~1500–2500 keyframes and they only cost a decode each, so keep them all;
     // the every-frame fallback is the one that has to be thinned (140k frames for the same film)
     let max_keyframes = max_frames.max(4000);
@@ -242,6 +248,17 @@ async fn extract_frames(video: PathBuf, out_dir: PathBuf, max_frames: usize) -> 
     };
     let sarg = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<String>>();
     let duration: f64 = probe(sarg(&["-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1"])).await?.trim().parse().unwrap_or(0.0);
+    // one line describing the source itself, for the info line under the preview
+    let src_raw = probe(sarg(&["-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height,codec_name,avg_frame_rate,bit_rate", "-of", "default=noprint_wrappers=1"])).await.unwrap_or_default();
+    let field_of = |raw: &str, k: &str| raw.lines().find_map(|l| l.strip_prefix(&format!("{k}="))).map(|v| v.trim().to_string()).unwrap_or_default();
+    let src_fps = field_of(&src_raw, "avg_frame_rate").split_once('/').and_then(|(a, b)| Some(a.parse::<f64>().ok()? / b.parse::<f64>().ok()?)).filter(|f| f.is_finite() && *f > 0.0);
+    let file_bytes = std::fs::metadata(&video).map(|m| m.len()).unwrap_or(0);
+    let source = format!("{}×{} · {} · {}{} · {}",
+        field_of(&src_raw, "width"), field_of(&src_raw, "height"),
+        field_of(&src_raw, "codec_name"),
+        src_fps.map(|f| format!("{f:.2} fps")).unwrap_or_else(|| "? fps".into()),
+        match field_of(&src_raw, "bit_rate").parse::<f64>() { Ok(b) if b > 0.0 => format!(" · {:.1} Mb/s", b / 1e6), _ => String::new() },
+        fmt_bytes(file_bytes));
     let _ = std::fs::remove_dir_all(&out_dir);
     std::fs::create_dir_all(&out_dir).map_err(|e| e.to_string())?;
     let scale = "scale='min(1280,iw)':-2";
@@ -283,7 +300,7 @@ async fn extract_frames(video: PathBuf, out_dir: PathBuf, max_frames: usize) -> 
             let total = frames.len();
             if total > max_keyframes { let stride = (total + max_keyframes - 1) / max_keyframes; frames = frames.into_iter().step_by(stride).collect(); }
             let note = if total > frames.len() { format!("{} of {total} keyframes", frames.len()) } else { format!("{total} keyframes") };
-            return Ok((video, duration, frames, note));
+            return Ok(Extracted { path: video, duration, frames, note, source });
         }
     }
 
@@ -308,7 +325,7 @@ async fn extract_frames(video: PathBuf, out_dir: PathBuf, max_frames: usize) -> 
     let step = if estimated > max_frames { duration / files.len().max(1) as f64 } else { 1.0 / fps };
     let frames: Vec<(f64, PathBuf)> = files.into_iter().enumerate().map(|(i, p)| (i as f64 * step, p)).collect();
     let note = if note_prefix.is_empty() { format!("{} frames (no keyframes)", frames.len()) } else { format!("{note_prefix} (no keyframes)") };
-    Ok((video, duration, frames, note))
+    Ok(Extracted { path: video, duration, frames, note, source })
 }
 
 /// An image attached to the next prompt.
@@ -1400,7 +1417,7 @@ impl App {
         let base = store.as_ref().map(|s| s.pastes_dir()).unwrap_or(std::env::temp_dir());
         let stem = path.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or("video".into());
         let out_dir = base.join(format!("{stem}-frames"));
-        self.video = Some(VideoPicker { path: path.clone(), duration: 0.0, frames: vec![], cur: 0, selected: Default::default(), loading: true, error: None, note: String::new(), preview: None });
+        self.video = Some(VideoPicker { path: path.clone(), duration: 0.0, frames: vec![], cur: 0, selected: Default::default(), loading: true, error: None, note: String::new(), preview: None, source: String::new() });
         let tx = self.tx.clone();
         tokio::spawn(async move { let _ = tx.send(Msg::Frames(extract_frames(path, out_dir, 1200).await)); });
     }
@@ -2771,9 +2788,9 @@ impl App {
             Msg::Catalog(Ok(c)) => self.show_catalog(&c),
             Msg::Catalog(Err(e)) => self.blocks.push(Block::Error(format!("plugin catalog: {e}"))),
             Msg::Pasted(Ok(p)) => { if image_mime(&p).is_some() { self.attach(&p) } else if video_ext(&p) { self.open_video(&p) } else { let t = format!("{} ", p.display()); self.insert_str(&t); self.set_status(format!("inserted file path {}", short_path(&p))); } }
-            Msg::Frames(Ok((path, duration, frames, note))) => {
-                let fr: Vec<(f64, PathBuf, Option<String>)> = frames.into_iter().map(|(ts, p)| (ts, p, None)).collect();
-                if let Some(v) = &mut self.video { if v.path == path { v.frames = fr; v.duration = duration; v.loading = false; v.cur = 0; v.note = note; v.preview = None; } }
+            Msg::Frames(Ok(ex)) => {
+                let fr: Vec<(f64, PathBuf, Option<String>)> = ex.frames.into_iter().map(|(ts, p)| (ts, p, None)).collect();
+                if let Some(v) = &mut self.video { if v.path == ex.path { v.frames = fr; v.duration = ex.duration; v.loading = false; v.cur = 0; v.note = ex.note; v.source = ex.source; v.preview = None; } }
             }
             Msg::Frames(Err(e)) => { if let Some(v) = &mut self.video { v.loading = false; v.error = Some(e); } }
             Msg::Pasted(Err(e)) => self.set_status(e),
@@ -3567,24 +3584,59 @@ fn draw_video(f: &mut Frame, app: &mut App, area: Rect) {
     let selected = v.selected.clone();
     let (cw, ch) = app.picker.font_size();
     // main frame: as large as the pane allows, from its own protocol
-    let preview_key = app.video.as_ref().and_then(|v| v.preview.as_ref().map(|(_, k)| k.clone()));
+    let preview = app.video.as_ref().and_then(|v| v.preview.clone());
+    let source = app.video.as_ref().map(|v| v.source.clone()).unwrap_or_default();
     if let Some((ts, _)) = frames.get(cur).cloned() {
-        if let Some((proto, (iw, ih))) = preview_key.as_ref().and_then(|k| app.images.get_mut(k)) {
-            let (iw, ih) = (*iw as f64, *ih as f64);
-            let max_cols = rows[1].width.saturating_sub(2) as f64;
-            let max_rows = rows[1].height as f64;
-            let scale = f64::min(max_cols * cw as f64 / iw, max_rows * ch as f64 / ih);
-            let cols = ((iw * scale / cw as f64).floor() as u16).max(1).min(rows[1].width);
-            let rws = ((ih * scale / ch as f64).floor() as u16).max(1).min(rows[1].height);
-            let x = rows[1].x + (rows[1].width.saturating_sub(cols)) / 2;
-            let y = rows[1].y + (rows[1].height.saturating_sub(rws)) / 2;
-            f.render_stateful_widget(StatefulImage::default(), Rect { x, y, width: cols, height: rws }, proto);
+        // (rendered rect of the image, so the info can sit directly under it)
+        let mut shown: Option<(Rect, (u32, u32), u64)> = None;
+        if let Some((_, key, dims, bytes)) = &preview {
+            if let Some((proto, (iw, ih))) = app.images.get_mut(key) {
+                let (iw, ih) = (*iw as f64, *ih as f64);
+                let max_cols = rows[1].width.saturating_sub(2) as f64;
+                let max_rows = rows[1].height.saturating_sub(2) as f64; // two rows for the info lines
+                let scale = f64::min(max_cols * cw as f64 / iw, max_rows * ch as f64 / ih);
+                let cols = ((iw * scale / cw as f64).floor() as u16).max(1).min(rows[1].width);
+                let rws = ((ih * scale / ch as f64).floor() as u16).max(1).min(rows[1].height.saturating_sub(2));
+                let x = rows[1].x + (rows[1].width.saturating_sub(cols)) / 2;
+                let y = rows[1].y + (rows[1].height.saturating_sub(rws + 2)) / 2;
+                let r = Rect { x, y, width: cols, height: rws };
+                f.render_stateful_widget(StatefulImage::default(), r, proto);
+                shown = Some((r, *dims, *bytes));
+            }
         }
+        // info directly under the image: which frame, what it is, and what the source was
         let mark = if selected.contains(&cur) { "● selected" } else { "○ not selected" };
-        f.render_widget(Paragraph::new(Line::from(vec![
-            Span::styled(format!("  frame {}/{}  ·  t = {:.2}s  ·  ", cur + 1, frames.len(), ts), dim),
+        let mut l1 = vec![
+            Span::styled(format!("frame {}/{}", cur + 1, frames.len()), Style::default().fg(pal().fg).bold()),
+            Span::styled(format!("  ·  t = {}  ·  ", fmt_timecode(ts)), dim),
             Span::styled(mark, Style::default().fg(if selected.contains(&cur) { pal().ok } else { pal().dim })),
-        ])), rows[2]);
+        ];
+        let mut l2: Vec<Span> = Vec::new();
+        if let Some((r, (fw, fh), bytes)) = shown {
+            // the image renderer fits without upscaling, so the size on screen is capped at 1:1
+            let (cell_w, cell_h) = (r.width as f64 * cw as f64, r.height as f64 * ch as f64);
+            let zoom = f64::min(f64::min(cell_w / fw.max(1) as f64, cell_h / fh.max(1) as f64), 1.0);
+            let file = frames.get(cur).and_then(|_| app.video.as_ref().map(|v| v.frames[cur].1.clone()))
+                .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_string())).unwrap_or_default();
+            l1.push(Span::styled(format!("   {fw}×{fh} px · {} · {:.2}:1", fmt_bytes(bytes), fw as f64 / fh.max(1) as f64), dim));
+            l2.push(Span::styled(format!("shown {}×{} cells ≈ {}×{} px ({:.0}%{})", r.width, r.height, (fw as f64 * zoom) as u32, (fh as f64 * zoom) as u32, zoom * 100.0, if zoom >= 0.999 { ", 1:1" } else { "" }), dim));
+            if !source.is_empty() { l2.push(Span::styled(format!("   ·   source {source}"), dim)); }
+            if !file.is_empty() { l2.push(Span::styled(format!("   ·   {file}"), dim)); }
+            // centre both lines under the image when it is narrower than the pane
+            let pad = |line: &Vec<Span>| -> u16 {
+                let w: usize = line.iter().map(|s| s.content.chars().count()).sum();
+                let mid = r.x + r.width / 2;
+                mid.saturating_sub((w / 2) as u16).max(rows[1].x)
+            };
+            let (p1, p2) = (pad(&l1), pad(&l2));
+            let y = r.y + r.height;
+            if y + 1 < rows[1].y + rows[1].height {
+                f.render_widget(Paragraph::new(Line::from(l1)), Rect { x: p1, y, width: rows[1].width.saturating_sub(p1 - rows[1].x), height: 1 });
+                f.render_widget(Paragraph::new(Line::from(l2)), Rect { x: p2, y: y + 1, width: rows[1].width.saturating_sub(p2 - rows[1].x), height: 1 });
+            }
+        } else {
+            f.render_widget(Paragraph::new(Line::from(l1)), rows[2]);
+        }
     }
     // strip: thumbnails around the cursor
     app.strip_rects.clear();
@@ -3619,13 +3671,14 @@ fn ensure_frame_images(app: &mut App, area: Rect) {
     let (lo, hi) = (v.cur.saturating_sub(half), (v.cur + half).min(v.frames.len() - 1));
     let want: Vec<usize> = (lo..=hi).collect();
     // the big preview gets a protocol of its own, rebuilt whenever the cursor moves
-    let (cur, cur_path, have_preview) = (v.cur, v.frames[v.cur].1.clone(), v.preview.as_ref().map(|(i, _)| *i) == Some(v.cur));
+    let (cur, cur_path, have_preview) = (v.cur, v.frames[v.cur].1.clone(), v.preview.as_ref().map(|(i, ..)| *i) == Some(v.cur));
     if !have_preview {
-        let old_key = app.video.as_ref().and_then(|v| v.preview.as_ref().map(|(_, k)| k.clone()));
+        let old_key = app.video.as_ref().and_then(|v| v.preview.as_ref().map(|(_, k, ..)| k.clone()));
         if let Ok(bytes) = std::fs::read(&cur_path) {
             if let Ok(img) = image::load_from_memory(&bytes) {
+                let dims = (img.width(), img.height());
                 let key = app.register_image(img);
-                if let Some(v) = &mut app.video { v.preview = Some((cur, key)); }
+                if let Some(v) = &mut app.video { v.preview = Some((cur, key, dims, bytes.len() as u64)); }
                 if let Some(k) = old_key { app.images.remove(&k); }
             }
         }
@@ -4080,6 +4133,13 @@ fn wrap_text(text: &str, width: usize) -> Vec<String> {
     if !cur.is_empty() { out.push(cur); }
     if out.is_empty() { out.push(String::new()); }
     out
+}
+
+/// mm:ss.mmm for a timestamp in seconds (h:mm:ss.mmm past an hour).
+fn fmt_timecode(t: f64) -> String {
+    let total = t.max(0.0);
+    let (h, m, sec) = ((total / 3600.0) as u64, ((total % 3600.0) / 60.0) as u64, total % 60.0);
+    if h > 0 { format!("{h}:{m:02}:{sec:06.3}") } else { format!("{m}:{sec:06.3}") }
 }
 
 fn wrap_input(input: &str, width: usize) -> Vec<String> {
