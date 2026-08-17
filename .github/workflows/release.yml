@@ -18,6 +18,8 @@ jobs:
     runs-on: macos-latest          # Apple Silicon; the only target we ship (see ci.yml)
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0       # the release notes list the commits since the previous tag
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-apple-darwin
