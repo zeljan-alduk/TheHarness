@@ -162,10 +162,14 @@ say "Installing the Rust toolchain"
 if [ "${NO_RUST:-0}" = 1 ]; then skip "skipped (NO_RUST=1)"
 elif command -v cargo >/dev/null; then skip "already installed ($(cargo --version 2>/dev/null | cut -d' ' -f1-2))"
 else
-    runsh "curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs | sh -s -- -y --no-modify-path --default-toolchain stable --profile minimal"
-    run ln -sf "$HOME/.cargo/bin/cargo" "$BIN/cargo"
-    run ln -sf "$HOME/.cargo/bin/rustc" "$BIN/rustc"
-    ok "rustup + stable toolchain → ~/.cargo (linked into $BIN)"
+    # `default`, not `minimal`: the harness works on its own Rust source, so clippy and rustfmt earn their
+    # disk space, and rust-analyzer is what the `lsp` tool talks to.
+    runsh "curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs | sh -s -- -y --no-modify-path --default-toolchain stable --profile default"
+    run "$HOME/.cargo/bin/rustup" component add rust-analyzer
+    for b in cargo rustc rustfmt rust-analyzer; do
+        [ "$DRY_RUN" = 1 ] || [ ! -x "$HOME/.cargo/bin/$b" ] || ln -sf "$HOME/.cargo/bin/$b" "$BIN/$b"
+    done
+    ok "rustup + stable toolchain (clippy, rustfmt, rust-analyzer) → ~/.cargo"
 fi
 if [ "${NO_RUST:-0}" != 1 ] && ! xcode-select -p >/dev/null 2>&1; then
     warn "no Xcode command line tools — cargo cannot link without them"
