@@ -457,6 +457,9 @@ impl harness::permissions::Approver for TuiApprover {
 
 enum Block {
     Banner(Vec<String>),
+    /// The start-up card: the same content as a banner, but it types itself in when first drawn
+    /// (the clock starts at the first paint — see `App::banner_at`).
+    Startup(Vec<String>),
     User(String, Vec<String>),
     Assistant { text: String, streaming: bool, folded: bool },
     Reasoning { text: String, streaming: bool, show: Option<bool>, started: Instant, ended: Option<Instant> },
@@ -545,6 +548,12 @@ struct App {
     sessions_pick: Option<SessionPicker>,
     /// Generic list picker (/tools, /skills, /commands, …).
     pick: Option<ListPicker>,
+    /// Last window title written, so it is only rewritten when something changed.
+    title_shown: Option<String>,
+    /// How many frames the start-up card has been on screen — its animation clock. Counting frames
+    /// rather than milliseconds means the reveal is always seen, even when start-up work stalls the
+    /// loop for a moment.
+    banner_step: u32,
     live_policy: Option<Arc<harness::permissions::Policy>>,
     extra_roots: Vec<PathBuf>,
     /// worktree enter/exit state (shared with the running agent; persists across turns)
@@ -583,7 +592,7 @@ pub async fn run(cfg: Config, resume: Option<String>) -> Result<()> {
         quit: false, restart: false, improve: None, improve_cancel: Default::default(), restart_at: None, tick: 0, word: 0, models: vec![],
         metrics: Metrics::new(0), panel: None, attachments: vec![], tool_previews: Default::default(),
         picker, images: Default::default(), img_seq: 0,
-        think_scroll: 0, toolset: None, perm_mode: harness::permissions::Mode::Auto, vim: false, vim_normal: false, keymap: Keymap::load(), sel_anchor: None, sel_cur: None, sel_dragging: false, visible_text: vec![], toast: None, tool_view: "summary".into(), tool_groups_open: Default::default(), settings_open: false, settings_cursor: 0, sessions_pick: None, pick: None, live_policy: None, cc_rate: None, extra_roots: vec![], wt_cwd: harness::worktree::new_cell(), cc: None, cc_last_session: None, compact_progress: None, session_meta: harness::sessions::Meta::default(), todos: Default::default(), inbox: Default::default(), event_log: None, pending_ask: None, pending_q: None, subenv: None, attached: None, video: None, strip_rects: vec![], tr_rect: Rect::default(), panel_rect: Rect::default(), tr_start: 0, line_map: vec![],
+        think_scroll: 0, toolset: None, perm_mode: harness::permissions::Mode::Auto, vim: false, vim_normal: false, keymap: Keymap::load(), sel_anchor: None, sel_cur: None, sel_dragging: false, visible_text: vec![], toast: None, tool_view: "summary".into(), tool_groups_open: Default::default(), settings_open: false, settings_cursor: 0, sessions_pick: None, pick: None, title_shown: None, banner_step: 0, live_policy: None, cc_rate: None, extra_roots: vec![], wt_cwd: harness::worktree::new_cell(), cc: None, cc_last_session: None, compact_progress: None, session_meta: harness::sessions::Meta::default(), todos: Default::default(), inbox: Default::default(), event_log: None, pending_ask: None, pending_q: None, subenv: None, attached: None, video: None, strip_rects: vec![], tr_rect: Rect::default(), panel_rect: Rect::default(), tr_start: 0, line_map: vec![],
     };
     app.metrics.ctx_len = app.cfg.llm.context_budget_tokens.unwrap_or(0);
     app.perm_mode = app.cfg.permissions.mode;
@@ -626,6 +635,7 @@ pub async fn run(cfg: Config, resume: Option<String>) -> Result<()> {
             tokio::select! {
                 _ = ticker.tick() => {
                     app.tick += 1; if app.tick % 30 == 0 { app.word = (app.word + 1) % WORDS.len(); }
+                    app.update_title();
                     if app.tick % 2 == 0 { if let Some(p) = &mut app.sessions_pick { p.marquee.1 += 1; } }
                     // cross-session: heartbeat every ~5s, poll our mailbox every ~2s
                     if app.tick % 60 == 0 { if app.session_meta.id.is_empty() { app.session_meta.id = harness::sessions::SessionStore::new_id(); } harness::mailbox::heartbeat(&harness::mailbox::Live { id: app.session_meta.id.clone(), title: if app.session_meta.title.is_empty() { "(new session)".into() } else { app.session_meta.title.clone() }, workdir: app.workdir.display().to_string(), pid: std::process::id(), backend: app.cfg.llm.provider.clone().unwrap_or("local".into()), updated: 0, busy: app.running.is_some() }); }
@@ -658,6 +668,7 @@ pub async fn run(cfg: Config, resume: Option<String>) -> Result<()> {
         }
         Ok(())
     }.await;
+    { use std::io::Write; let mut o = std::io::stdout(); let _ = write!(o, "\x1b]0;\x07"); let _ = o.flush(); } // hand the title back to the shell
     if kbd_enh { let _ = crossterm::execute!(std::io::stdout(), crossterm::event::PopKeyboardEnhancementFlags); }
     let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableMouseCapture, crossterm::event::DisableBracketedPaste);
     ratatui::restore();
@@ -707,7 +718,8 @@ async fn restart_process(app: &mut App) -> Result<()> {
 impl App {
     fn banner(&mut self) {
         let wd = short_path(&self.workdir);
-        self.blocks.push(Block::Banner(vec![
+        self.banner_step = 0;
+        self.blocks.push(Block::Startup(vec![
             format!("✻ TheHarness {} — local coding agent", harness::version()),
             format!("  model  {}", self.model),
             if self.cfg.llm.provider.as_deref() == Some("claude-code") { "  server claude-code (official CLI, your Anthropic subscription; tools bridged over MCP)".to_string() } else { format!("  server {}", self.cfg.llm.base_url) },
@@ -721,6 +733,39 @@ impl App {
             String::new(),
             "  /help for commands · esc interrupts · ctrl+o expands tool output · ctrl+t shows thinking · ctrl+p panel".into(),
         ]));
+    }
+
+    /// Terminal window/tab title: where you are, what is driving it, and whether it is busy — the
+    /// things you want to see when the window is in the background. OSC 0 sets both icon and title.
+    fn title_text(&self) -> String {
+        let dir = self.workdir.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| short_path(&self.workdir));
+        let mut parts: Vec<String> = Vec::new();
+        if self.running.is_some() {
+            let secs = self.run_started.elapsed().as_secs();
+            parts.push(format!("{} {}", SPINNER[(self.tick as usize / 4) % SPINNER.len()], if secs >= 60 { format!("{}m{:02}s", secs / 60, secs % 60) } else { format!("{secs}s") }));
+        }
+        parts.push(dir);
+        parts.push(self.model.clone());
+        if self.cfg.llm.provider.as_deref() == Some("claude-code") { if let Some(e) = &self.cfg.llm.effort { parts.push(format!("effort {e}")); } }
+        match self.perm_mode {
+            harness::permissions::Mode::Bypass => parts.push("bypass".into()),
+            harness::permissions::Mode::Plan => parts.push("plan".into()),
+            _ => {}
+        }
+        if !self.queued.is_empty() { parts.push(format!("{} queued", self.queued.len())); }
+        if let Some(g) = &self.goal { parts.push(format!("goal: {}", truncate(g, 24))); }
+        format!("{} — harness", parts.join(" · "))
+    }
+
+    /// Write the title when it changed (a redraw every 80ms would otherwise spam the terminal).
+    fn update_title(&mut self) {
+        let t = self.title_text();
+        if self.title_shown.as_deref() == Some(t.as_str()) { return; }
+        use std::io::Write;
+        let mut o = std::io::stdout();
+        let _ = write!(o, "\x1b]0;{t}\x07");
+        let _ = o.flush();
+        self.title_shown = Some(t);
     }
 
     fn set_status(&mut self, s: impl Into<String>) { self.status_msg = Some((s.into(), Instant::now())); }
@@ -2121,6 +2166,7 @@ impl App {
                         Block::System(t) => ("system", t.clone()),
                         Block::Error(t) => ("error", t.clone()),
                         Block::Banner(l) => ("banner", l.join(" ")),
+                        Block::Startup(lines) => ("banner", lines.join(" ")),
                         _ => continue,
                     };
                     for line in text.lines() {
@@ -3030,6 +3076,8 @@ const COMMANDS: &[(&str, &str)] = &[
 // ───────────────────────── rendering ─────────────────────────
 fn draw(f: &mut Frame, app: &mut App) {
     let full = f.area();
+    // the start-up card animates one step per rendered frame
+    if app.blocks.iter().any(|b| matches!(b, Block::Startup(_))) { app.banner_step = app.banner_step.saturating_add(1); }
     let show_panel = app.panel_visible(full.width);
     let (area, panel_area) = if show_panel {
         let pw = (full.width / 3).clamp(36, 56);
@@ -3612,6 +3660,43 @@ fn image_slot(app: &App, key: &str, max_cols: u16, max_rows: u16, indent: usize,
 fn render_block(b: &Block, app: &App, width: usize, out: &mut Vec<Line<'static>>, ph: &mut Vec<Placeholder>) {
     let w = width.max(10);
     match b {
+        Block::Startup(lines) => {
+            // reveal: the border sweeps out, then each line types itself in; the ✻ spins until it settles
+            const START: u32 = 2;        // frames before the first line starts
+            const STAGGER: u32 = 2;      // frames between lines
+            const CHARS_PER_FRAME: usize = 7;
+            let step = app.banner_step;
+            let inner = lines.iter().map(|l| l.chars().count()).max().unwrap_or(0).min(w.saturating_sub(4));
+            let bs = Style::default().fg(pal().orange);
+            let border = |open: bool| -> Line<'static> {
+                let full = inner + 2;
+                let shown = ((step as usize * full) / 3).min(full);
+                let bar = "─".repeat(shown);
+                let (l, r) = if open { ("╭", "╮") } else { ("╰", "╯") };
+                Line::from(Span::styled(if shown >= full { format!("{l}{bar}{r}") } else { format!("{l}{bar}") }, bs))
+            };
+            out.push(border(true));
+            let mut animating = false;
+            for (i, l) in lines.iter().enumerate() {
+                let start = START + i as u32 * STAGGER;
+                let text = truncate(l, inner);
+                let chars: Vec<char> = text.chars().collect();
+                let shown = if step <= start { 0 } else { ((step - start) as usize * CHARS_PER_FRAME).min(chars.len()) };
+                let done = shown >= chars.len();
+                if !done { animating = true; }
+                let mut visible: String = chars[..shown].iter().collect();
+                if !done && shown > 0 { visible.push('▌'); } // a cursor rides the line being typed
+                if i == 0 && !done {
+                    // the ✻ is multi-byte: swap the first *character*, not the first byte
+                    if let Some(first) = visible.chars().next() { visible.replace_range(0..first.len_utf8(), SPINNER[(step as usize / 2) % SPINNER.len()]); }
+                }
+                let style = if i == 0 { Style::default().fg(pal().orange).bold() } else { Style::default() };
+                out.push(Line::from(vec![Span::styled("│ ", bs), Span::styled(format!("{:<inner$}", visible), style), Span::styled(" │", bs)]));
+            }
+            let _ = animating;
+            out.push(border(false));
+            out.push(Line::raw(""));
+        }
         Block::Banner(ls) => {
             let inner = ls.iter().map(|l| l.chars().count()).max().unwrap_or(0).min(w.saturating_sub(4));
             let bs = Style::default().fg(pal().orange);
