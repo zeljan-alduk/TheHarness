@@ -3156,7 +3156,8 @@ impl App {
                         self.cfg.llm.model = model.clone(); self.model = model.clone();
                         let note = if module == "llama-server" { " (GGUF via llama.cpp)" } else if vision { " (vision: images and video frames work)" } else { " (text-only — /localmodel vision restarts it with the vision tower)" };
                         self.blocks.push(Block::System(format!("local model ready: {} on {base_url} · {module}{note}", model_label(&model))));
-                        tokio::spawn(fetch_ctx_len(base_url, model, self.tx.clone()));
+                        tokio::spawn(fetch_ctx_len(base_url.clone(), model.clone(), self.tx.clone()));
+                        self.prewarm_prefix(&base_url, &model);
                     }
                 }
                 Err(e) => self.blocks.push(Block::Error(format!("MLX server: {e}"))),
@@ -3548,6 +3549,32 @@ impl App {
         self.blocks.push(Block::System("TheHarness is uninstalled. Reinstall any time: curl -fsSL https://zeljan-alduk.github.io/TheHarness/install.sh | sh".into()));
         // do NOT restart — the binary is gone. Just quit.
         self.restart = false; self.quit = true;
+    }
+
+    /// Pre-fill the server's prefix cache with the EXACT system prompt the first turn will send, so that
+    /// first turn is a fast cache hit instead of a ~1–2 minute cold prefill of the 7–13k-token prompt.
+    /// (Warming the model with a bare "hi" — as the server does — doesn't touch this big prefix, which is
+    /// why the first response felt as slow as a reload.) Best-effort and off the UI thread.
+    fn prewarm_prefix(&self, base_url: &str, model: &str) {
+        if self.cfg.llm.provider.as_deref() == Some("claude-code") { return; }
+        let (base_url, model) = (base_url.to_string(), model.to_string());
+        let workdir = self.workdir.display().to_string();
+        let store = if self.cfg.memory.enabled { harness::memory::MemoryStore::open(&self.cfg.memory).ok() } else { None };
+        let (names, extra): (Vec<String>, String) = match &self.toolset {
+            Some(ts) => (ts.registry.names().into_iter().map(String::from).collect(), ts.prompt_extra.clone()),
+            None => (vec![], String::new()),
+        };
+        let prov = match self.cfg.llm.provider.as_deref() { Some("anthropic") => harness::llm::Provider::Anthropic, Some("claude-code") => harness::llm::Provider::ClaudeCode, _ => harness::llm::Provider::OpenAi };
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            let name_refs: Vec<&str> = names.iter().map(String::as_str).collect();
+            let system = harness::agent::full_system_prompt(&workdir, &name_refs, Some(&extra), store.as_ref(), &model, prov);
+            let http = match reqwest::Client::builder().timeout(Duration::from_secs(300)).build() { Ok(c) => c, Err(_) => return };
+            let body = serde_json::json!({"model": model, "messages": [{"role":"system","content": system}, {"role":"user","content":"Ready."}], "max_tokens": 1, "temperature": 0});
+            let t = Instant::now();
+            let ok = http.post(format!("{base_url}/chat/completions")).json(&body).send().await.map(|r| r.status().is_success()).unwrap_or(false);
+            if ok { let _ = tx.send(Msg::Notice(format!("pre-warmed the model with the system prompt ({:.0}s) — the first message will be fast", t.elapsed().as_secs_f64()))); }
+        });
     }
 
     /// Start (or reuse) the MLX server for the configured build and report where it landed.

@@ -241,6 +241,25 @@ Rules:
 - When done, your final message (with no tool calls) must state what changed and how you verified it.
 - Finish decisively: once the task is verified, stop calling tools and answer. Do not re-verify, re-read, or polish beyond what was asked; the user may have queued the next task.";
 
+/// The identity line appended to the system prompt (names the model actually answering). Public so the
+/// TUI can build the *exact* system prompt a turn will use, to pre-warm the server's prefix cache with it.
+pub fn identity_line(id: &str, provider: crate::llm::Provider) -> String {
+    let name = if id.starts_with('/') { id.trim_end_matches('/').rsplit('/').next().unwrap_or(id) } else { id };
+    let via = match provider {
+        crate::llm::Provider::ClaudeCode => " through the Claude Code CLI on the user's Anthropic subscription",
+        crate::llm::Provider::Anthropic => " through the Anthropic API",
+        _ => " on a local OpenAI-compatible server",
+    };
+    format!("You are running on the model `{name}`{via}, inside TheHarness. If asked which model you are, say this rather than guessing or claiming you cannot know.")
+}
+
+/// The complete system prompt a turn sends — `system_prompt_with_memory` plus the identity line, assembled
+/// exactly as `run_turn_message` does — so the caller can pre-fill it into the model's prefix cache.
+pub fn full_system_prompt(workdir: &str, tools: &[&str], extra: Option<&str>, memory: Option<&crate::memory::MemoryStore>, model: &str, provider: crate::llm::Provider) -> String {
+    let base = system_prompt_with_memory(workdir, tools, extra, memory);
+    format!("{}\n{}", base.trim_end(), identity_line(model, provider))
+}
+
 pub fn system_prompt_with_memory(workdir: &str, tools: &[&str], extra: Option<&str>, memory: Option<&crate::memory::MemoryStore>) -> String {
     let mut s = base_prompt_template().replace("{workdir}", workdir).replace("{tools}", &tools.join(", "));
 
@@ -367,16 +386,7 @@ impl<'a> Agent<'a> {
     /// One-shot: fresh transcript, run to completion.
     /// One line naming the model actually answering and how it is reached. A path-shaped id (what
     /// `mlx_lm.server` reports) is shown by its directory name, which is the build the user chose.
-    fn identity_line(&self) -> String {
-        let id = self.client.model();
-        let name = if id.starts_with('/') { id.trim_end_matches('/').rsplit('/').next().unwrap_or(id) } else { id };
-        let via = match self.client.provider() {
-            crate::llm::Provider::ClaudeCode => " through the Claude Code CLI on the user's Anthropic subscription".to_string(),
-            crate::llm::Provider::Anthropic => " through the Anthropic API".to_string(),
-            _ => " on a local OpenAI-compatible server".to_string(),
-        };
-        format!("You are running on the model `{name}`{via}, inside TheHarness. If asked which model you are, say this rather than guessing or claiming you cannot know.")
-    }
+    fn identity_line(&self) -> String { identity_line(self.client.model(), self.client.provider()) }
 
     pub async fn run(&self, system: &str, task: &str) -> Result<(String, RunStats)> {
         let mut msgs = Vec::new();
