@@ -26,6 +26,7 @@ pub mod lsp;
 pub mod mailbox;
 pub mod mcp;
 pub mod mcp_bridge;
+pub mod mcp_server;
 pub mod memory;
 pub mod permissions;
 pub mod plugins;

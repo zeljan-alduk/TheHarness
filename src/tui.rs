@@ -1789,6 +1789,28 @@ impl App {
                     let _ = tx.send(Msg::Notice(msg));
                 });
             }
+            "/spec" => {
+                let a = arg.trim().to_string();
+                if a.is_empty() {
+                    let dir = self.workdir.join(".harness/specs");
+                    let existing: Vec<String> = std::fs::read_dir(&dir).into_iter().flatten().flatten().filter(|e| e.path().is_dir()).map(|e| e.file_name().to_string_lossy().to_string()).collect();
+                    let mut lines = vec!["/spec <feature>            write requirements, design and tasks for it (.harness/specs/<slug>/)".to_string(),
+                                         "/spec implement <slug>     work through that spec's tasks, ticking them off".to_string()];
+                    if !existing.is_empty() { lines.push(format!("existing specs: {}", existing.join(", "))); }
+                    self.blocks.push(Block::Banner(lines));
+                    return;
+                }
+                let prompt = if let Some(slug) = a.strip_prefix("implement ") {
+                    let slug = slug.trim();
+                    format!(
+"Implement the spec in .harness/specs/{slug}/.\n\n1. Read requirements.md, design.md and tasks.md there.\n2. Load tasks.md into the todo tool (one item per unchecked task, in order).\n3. Work through them one at a time: implement, run the tests, tick the checkbox in tasks.md as each is done.\n4. If a task turns out to be wrong or missing, fix the spec file too and say so.\n5. Finish with what was built, what was verified, and anything left.")
+                } else {
+                    let slug: String = a.to_lowercase().chars().map(|c| if c.is_alphanumeric() { c } else { '-' }).collect::<String>().split('-').filter(|p| !p.is_empty()).collect::<Vec<_>>().join("-").chars().take(40).collect();
+                    format!(
+"Write a spec for: {a}\n\nExplore the codebase first — a spec that ignores what exists is fiction. Then write three files under .harness/specs/{slug}/:\n\nrequirements.md — numbered requirements in EARS form (\"When <trigger>, the system shall <response>\"; \"While <state>…\"; \"If <condition>, then…\"), each testable, plus explicit non-goals.\ndesign.md — how it fits this codebase: the files and functions you would touch, data flow, error handling, migration/compatibility concerns, and the alternatives you rejected with reasons.\ntasks.md — an ordered checklist of implementable steps (`- [ ] …`), each small enough to verify on its own, each naming the requirement it satisfies and how it will be tested.\n\nAsk me about anything genuinely ambiguous with ask_user rather than guessing. Do not implement anything yet; finish by listing the three files and the open questions.")
+                };
+                if self.running.is_some() { self.queued.push(prompt); self.set_status("queued /spec"); } else { self.start_run(prompt); }
+            }
             "/learn" => {
                 if arg.trim().is_empty() { self.blocks.push(Block::System("/learn <url|path> [as <name>] — read it and write a skill you can load later".into())); return; }
                 let (src, name) = match arg.split_once(" as ") { Some((s, n)) => (s.trim().to_string(), Some(n.trim().to_string())), None => (arg.trim().to_string(), None) };
@@ -2700,6 +2722,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ("/remember", "add a note: /remember <text> | brain: <text> | workflows: <text>"),
     ("/reflect", "ask the model what to remember from this session"),
     ("/dream", "consolidate memory: merge duplicates, drop stale notes, draft skills from what was learned"),
+    ("/spec", "spec-driven work: /spec <feature> writes requirements/design/tasks · /spec implement <slug>"),
     ("/learn", "learn a URL or directory into a skill: /learn <url|path> [as <name>]"),
     ("/video", "open the frame scrubber for a video: /video <path>"),
     ("/plugin", "plugins: list · install <owner/repo> · enable|disable|remove|update|info <name>"),

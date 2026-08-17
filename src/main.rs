@@ -274,6 +274,9 @@ enum Cmd {
         #[arg(long)]
         html: bool,
     },
+    /// Expose this harness as an MCP server on stdio, so another agent can delegate work to it
+    #[command(name = "mcp-serve")]
+    McpServe,
     /// (internal) stdio↔socket proxy used to expose harness tools to Claude Code
     #[command(name = "mcp-proxy", hide = true)]
     McpProxy { addr: String },
@@ -590,6 +593,7 @@ async fn main() -> Result<()> {
             for n in &ts.notes { println!("· {n}"); }
             for d in ts.registry.defs().into_iter().filter(|d| d.function.name.starts_with("mcp__")) { println!("  {:<40} {}", d.function.name, llm::truncate_for_log(&d.function.description, 90)); }
         }
+        Cmd::McpServe => { harness::mcp_server::serve(cfg).await?; }
         Cmd::McpProxy { addr } => { harness::mcp_bridge::proxy(&addr).await?; }
         Cmd::Models => {
             for m in client.list_models().await? { println!("{m}"); }

@@ -26,6 +26,7 @@ pub mod search;
 pub mod sessions;
 pub mod skill;
 pub mod subagent;
+pub mod team;
 pub mod terminal;
 pub mod todo;
 pub mod tool_search;
@@ -168,6 +169,7 @@ impl Registry {
             Arc::new(pdf::PdfEdit),
             Arc::new(archive::ExtractArchive),
             Arc::new(subagent::SpawnAgent),
+            Arc::new(team::Team),
             Arc::new(process::Process),
             Arc::new(run_code::RunCode),
             Arc::new(terminal::Terminal),
