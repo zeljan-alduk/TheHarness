@@ -73,14 +73,7 @@ pub async fn compact_llm_with(client: &Client, msgs: &mut Vec<Message>, keep_las
     // size the note to what it replaces: ~1/4 of the compacted content, between 120 and 900 words
     let max_words = (old_tokens / 5).clamp(120, 900);
     let transcript = render_for_summary(&old, 60_000);
-    let system_base = "You compact the working context of an autonomous coding agent mid-session. Write a HANDOFF NOTE so the agent can continue seamlessly without the original messages. Be precise and dense; never invent; keep exact file paths, function/identifier names, commands, numbers, URLs, and error messages verbatim. Use this structure with markdown headings:
-## Goal & constraints (the user's requests, key phrases verbatim)
-## Done so far (files created/edited with paths and what changed; commands run and their outcomes; tests/eval results)
-## Key facts & findings (config values, APIs, gotchas, exact errors)
-## Decisions & reasons
-## Current state & remaining work (ordered next steps; open questions)
-## Notes for the user (anything promised or to report)
-Output only the note.";
+    let system_base = prompt_file("compaction", DEFAULT_COMPACTION_PROMPT);
     let system = format!("{system_base}\nHard limit: at most {max_words} words — the note MUST be much shorter than the transcript it replaces; drop detail before exceeding it.");
     let mut user = format!("Transcript to compact ({} messages):
 
@@ -159,7 +152,7 @@ pub async fn reflect_after_run(client: &Client, store: &crate::memory::MemorySto
 /// Returns (met, reason). Errors and unparseable answers mean "not met" — the loop keeps working
 /// rather than declaring victory.
 pub async fn goal_check(client: &Client, goal: &str, last_answer: &str, transcript_tail: &[Message]) -> (bool, String) {
-    let system = "You check whether an autonomous coding agent has met the user's success condition. Judge only from evidence in the transcript (files written, commands run and their output, tests passing). Reply with JSON only: {\"met\": true|false, \"reason\": \"<= 20 words\"}. If the evidence is missing or ambiguous, answer false — the agent will keep working.";
+    let system = prompt_file("goal-check", "You check whether an autonomous coding agent has met the user's success condition. Judge only from evidence in the transcript (files written, commands run and their output, tests passing). Reply with JSON only: {\"met\": true|false, \"reason\": \"<= 20 words\"}. If the evidence is missing or ambiguous, answer false — the agent will keep working.");
     let tail = crate::agent::render_tail(transcript_tail, 6000);
     let user = format!("Success condition:\n{goal}\n\nThe agent's last answer:\n{}\n\nRecent activity:\n{tail}\n\nJSON:", crate::llm::truncate_for_log(last_answer, 3000));
     let Ok((reply, _)) = client.role("goal").chat(&[Message::system(system), Message::user(user)], &[]).await else { return (false, "goal check failed (model unavailable)".into()) };
@@ -194,6 +187,18 @@ pub fn system_prompt(workdir: &str, tools: &[&str], extra: Option<&str>) -> Stri
     system_prompt_with_memory(workdir, tools, extra, None)
 }
 
+/// A prompt kept as a file so it can be tuned (and proposed by `harness self`, judged by the arbiter)
+/// instead of being frozen in the binary: `~/.config/harness/prompts/<name>.md`, created from the
+/// built-in default the first time it is needed.
+pub fn prompt_file(name: &str, default: &str) -> String {
+    let dir = crate::setup::config_dir().join("prompts");
+    let p = dir.join(format!("{name}.md"));
+    if let Ok(t) = std::fs::read_to_string(&p) { if t.trim().len() > 30 { return t; } }
+    let _ = std::fs::create_dir_all(&dir);
+    let _ = std::fs::write(&p, default);
+    default.to_string()
+}
+
 /// The base system prompt template. If `~/.config/harness/prompts/system.md` exists it is used instead
 /// (placeholders: {workdir}, {tools}); it is created from the built-in default on first use so it can be
 /// tuned by the user — or proposed by `harness self` and judged by the arbiter.
@@ -205,6 +210,15 @@ pub fn base_prompt_template() -> String {
     let _ = std::fs::create_dir_all(&dir); let _ = std::fs::write(&p, &default);
     default
 }
+
+const DEFAULT_COMPACTION_PROMPT: &str = "You compact the working context of an autonomous coding agent mid-session. Write a HANDOFF NOTE so the agent can continue seamlessly without the original messages. Be precise and dense; never invent; keep exact file paths, function/identifier names, commands, numbers, URLs, and error messages verbatim. Use this structure with markdown headings:
+## Goal & constraints (the user's requests, key phrases verbatim)
+## Done so far (files created/edited with paths and what changed; commands run and their outcomes; tests/eval results)
+## Key facts & findings (config values, APIs, gotchas, exact errors)
+## Decisions & reasons
+## Current state & remaining work (ordered next steps; open questions)
+## Notes for the user (anything promised or to report)
+Output only the note.";
 
 const DEFAULT_PROMPT: &str = "You are an autonomous software engineering agent running locally with a real toolchain.
 Working directory: {workdir}

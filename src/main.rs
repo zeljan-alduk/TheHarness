@@ -267,8 +267,15 @@ enum Cmd {
         #[command(subcommand)]
         action: WorkflowCmd,
     },
-    /// List saved sessions
-    Sessions,
+    /// List saved sessions (or search their contents with --search)
+    Sessions {
+        /// Only sessions whose transcript contains this text
+        #[arg(long)]
+        search: Option<String>,
+        /// Only sessions from this directory
+        #[arg(long)]
+        dir: Option<String>,
+    },
     /// Import Claude Code / Codex transcripts into the session store (then `harness --resume <id>`)
     Import {
         /// A .jsonl transcript, a directory of them, or nothing to scan ~/.claude and ~/.codex
@@ -499,9 +506,18 @@ async fn main() -> Result<()> {
                 println!("\n{out}");
             }
         },
-        Cmd::Sessions => {
+        Cmd::Sessions { search, dir } => {
             let store = harness::sessions::SessionStore::open()?;
-            for (i, m) in store.list(None).iter().take(40).enumerate() { println!("{:>2}. {}  {:<50} {:<30} {} turns · {}", i + 1, m.id, llm::truncate_for_log(&m.title, 50), m.workdir, m.turns, harness::sessions::fmt_age(m.updated)); }
+            match search {
+                Some(q) => {
+                    let hits = store.search(&q, dir.as_deref(), 40);
+                    if hits.is_empty() { println!("no session mentions '{q}'"); }
+                    for (m, line) in hits { println!("{}  {:<44} {:<28} {}\n     {}", m.id, llm::truncate_for_log(&m.title, 44), llm::truncate_for_log(&m.workdir, 28), harness::sessions::fmt_age(m.updated), line); }
+                }
+                None => for (i, m) in store.list(dir.as_deref()).iter().take(40).enumerate() {
+                    println!("{:>2}. {}  {:<50} {:<30} {} turns · {}", i + 1, m.id, llm::truncate_for_log(&m.title, 50), m.workdir, m.turns, harness::sessions::fmt_age(m.updated));
+                },
+            }
         }
         Cmd::Checkpoint { dir, session, action } => {
             let workdir = dir.unwrap_or(std::env::current_dir()?).canonicalize().context("workdir does not exist")?;

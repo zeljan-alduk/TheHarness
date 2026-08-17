@@ -1315,6 +1315,22 @@ impl App {
                 self.blocks.push(Block::Banner(lines));
             }
             "/sessions" if arg.is_empty() || arg == "pick" => {
+                if let Some(q) = arg.strip_prefix("search ") {
+                    let q = q.trim().to_string();
+                    match harness::sessions::SessionStore::open() {
+                        Ok(store) => {
+                            let hits = store.search(&q, None, 25);
+                            if hits.is_empty() { self.blocks.push(Block::System(format!("no session mentions '{q}'"))); }
+                            else {
+                                let mut lines = vec![format!("{} session(s) mention '{q}' — /resume <id>", hits.len())];
+                                for (m, line) in hits { lines.push(format!("  {}  {:<40} {}", m.id, truncate(&m.title, 40), harness::sessions::fmt_age(m.updated))); lines.push(format!("      {}", truncate(&line, 110))); }
+                                self.blocks.push(Block::Banner(lines));
+                            }
+                        }
+                        Err(e) => self.blocks.push(Block::Error(e.to_string())),
+                    }
+                    return;
+                }
                 match harness::sessions::SessionStore::open() {
                     Ok(store) => { let all = store.list(None); if all.is_empty() { self.blocks.push(Block::Banner(vec!["no saved sessions yet".into()])); } else { self.sessions_pick = Some(SessionPicker { all, cursor: 0, filter: String::new(), top: 0, rows: Rect::default(), marquee: (0, 0) }); } }
                     Err(e) => self.blocks.push(Block::Error(format!("sessions: {e}"))),
@@ -2546,6 +2562,9 @@ impl App {
                     let body = truncate(&self.blocks.iter().rev().find_map(|b| if let Block::User(t, _) = b { Some(t.clone()) } else { None }).unwrap_or_default(), 80).replace('"', "'");
                     let title = title.to_string();
                     { let h = self.cfg.hooks.clone(); let wd = self.workdir.clone(); let (t2, b2) = (title.clone(), body.clone()); if !h.notification.is_empty() { tokio::spawn(async move { let _ = harness::hooks::run_event(&h, "notification", &t2, serde_json::json!({"title": t2, "body": b2}), &wd).await; }); } }
+                    // OSC 9: terminals that support it (kitty, iTerm2, WezTerm, Ghostty) show a native
+                    // notification even when the window is in the background; the bell is opt-in.
+                    { use std::io::Write; let mut o = std::io::stdout(); let _ = write!(o, "\x1b]9;{title}: {body}\x07"); if self.cfg.ui.sound { let _ = write!(o, "\x07"); } let _ = o.flush(); }
                     tokio::spawn(async move {
                         if cfg!(target_os = "macos") { let script = format!("display notification \"{body}\" with title \"{title}\" sound name \"Glass\""); let _ = tokio::process::Command::new("osascript").arg("-e").arg(script).output().await; }
                         else if cfg!(target_os = "linux") { let _ = tokio::process::Command::new("notify-send").arg(&title).arg(&body).output().await; }
@@ -2802,7 +2821,7 @@ fn voice_transcribe_command() -> Option<String> {
 const COMMANDS: &[(&str, &str)] = &[
     ("/help", "show commands and keys"),
     ("/clear", "start a new session (forget the transcript)"),
-    ("/sessions", "pick a saved session to resume (↑/↓/click, enter) · /sessions list = plain list · /sessions live = other running sessions"),
+    ("/sessions", "pick a saved session (↑/↓/click, enter) · /sessions list · /sessions live · /sessions search <text>"),
     ("/msg", "message another live session: /msg <id|prefix|title|all> <text>"),
     ("/resume", "resume a saved session: /resume <n|id|last>"),
     ("/model", "show or switch the model: /model <name>"),

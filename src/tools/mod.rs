@@ -209,12 +209,18 @@ impl Registry {
     pub fn is_empty(&self) -> bool { self.tools.is_empty() }
 
     /// The tool list sent to the model: everything except deferred tools that have not been
-    /// surfaced by `tool_search` yet.
+    /// surfaced by `tool_search` yet. Descriptions can be overridden per tool in
+    /// `~/.config/harness/prompts/tools.toml` (`bash = "…"`), so they are tunable data like the
+    /// system prompt rather than strings frozen in the binary.
     pub fn defs(&self) -> Vec<ToolDef> {
         let active = self.activated.lock().map(|g| g.clone()).unwrap_or_default();
+        let overrides = description_overrides();
         self.tools.iter()
             .filter(|t| !self.deferred.contains(t.name()) || active.contains(t.name()))
-            .map(|t| ToolDef::new(t.name(), t.description(), t.parameters())).collect()
+            .map(|t| {
+                let desc = overrides.get(t.name()).map(|s| s.as_str()).unwrap_or_else(|| t.description());
+                ToolDef::new(t.name(), desc, t.parameters())
+            }).collect()
     }
 
     /// Hold these tools back until they are searched for.
@@ -322,6 +328,17 @@ pub async fn build_toolset(net_enabled: bool, workdir: &Path, with_mcp: bool) ->
         servers = srv;
     }
     Toolset { registry, notes, servers, prompt_extra }
+}
+
+/// `~/.config/harness/prompts/tools.toml`: tool name → replacement description.
+fn description_overrides() -> &'static std::collections::HashMap<String, String> {
+    static O: std::sync::OnceLock<std::collections::HashMap<String, String>> = std::sync::OnceLock::new();
+    O.get_or_init(|| {
+        let p = crate::setup::config_dir().join("prompts").join("tools.toml");
+        let Ok(text) = std::fs::read_to_string(p) else { return Default::default() };
+        let Ok(v) = text.parse::<toml::Value>() else { return Default::default() };
+        v.as_table().map(|t| t.iter().filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string()))).collect()).unwrap_or_default()
+    })
 }
 
 static TODO_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);

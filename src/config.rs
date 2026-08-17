@@ -96,6 +96,8 @@ pub struct UiConfig {
     #[serde(default = "d_true")] pub fold_previous: bool,
     /// Typing while a task runs steers it (delivered at the next tool boundary) instead of queueing.
     #[serde(default = "d_true")] pub steer: bool,
+    /// Ring the terminal bell when a long task finishes (an OSC 9 notification is always sent).
+    #[serde(default)] pub sound: bool,
     /// Shell command whose first line of stdout is shown on the right of the mode line. It receives a
     /// JSON snapshot (model, workdir, session, tokens, cost, permission mode) on stdin.
     #[serde(default)] pub statusline: String,
@@ -105,7 +107,7 @@ pub struct UiConfig {
 fn d_theme() -> String { "dark".into() }
 fn d_tool_view() -> String { "summary".into() }
 fn d_panel() -> String { "auto".into() }
-impl Default for UiConfig { fn default() -> Self { Self { notify: true, theme: d_theme(), event_log: true, tool_view: d_tool_view(), show_thinking: false, panel: d_panel(), vim: false, fold_previous: true, steer: true, statusline: String::new(), font_size: 0 } } }
+impl Default for UiConfig { fn default() -> Self { Self { notify: true, theme: d_theme(), event_log: true, tool_view: d_tool_view(), show_thinking: false, panel: d_panel(), vim: false, fold_previous: true, steer: true, sound: false, statusline: String::new(), font_size: 0 } } }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct SecurityConfig {
@@ -389,6 +391,7 @@ impl Config {
             "ui.fold_previous" => self.ui.fold_previous = b(val),
             "ui.steer" => self.ui.steer = b(val),
             "ui.statusline" => self.ui.statusline = val.into(),
+            "ui.sound" => self.ui.sound = b(val),
             "ui.font_size" => self.ui.font_size = val.parse().context("bad size")?,
             "permissions.mode" => self.permissions.mode = crate::permissions::Mode::parse(val).context("bad mode")?,
             "llm.compact_at_fraction" => self.llm.compact_at_fraction = val.parse().context("bad fraction")?,
