@@ -2493,13 +2493,13 @@ impl App {
                         Some(b) => self.start_model_download(b),
                         None => self.blocks.push(Block::Error("nothing to resume — /localmodel picks a build".into())),
                     },
-                    "serve" | "start" | "restart" => self.start_mlx(),
+                    "serve" | "start" | "restart" => self.start_mlx_ex(a == "restart"),
                     "vision" | "text" | "auto" => {
                         let kind = match a { "vision" => "mlx-vlm", "text" => "mlx-lm", _ => "auto" };
                         self.cfg.local_model.server = kind.into();
                         let _ = harness::config::Config::save_setting("local_model.server", kind);
                         self.blocks.push(Block::System(format!("local_model.server → {kind} · restarting the MLX server ({}{})", lm::server_plan(kind).first().copied().unwrap_or("?"), if a == "vision" || a == "auto" { " — the same weights with the vision tower, so images and video frames work" } else { " — text-only" })));
-                        self.start_mlx();
+                        self.start_mlx_ex(true);
                     }
                     "cancel" | "stop" => {
                         match self.dl_cancel.take() {
@@ -2601,6 +2601,8 @@ impl App {
                 if arg == "clear" { self.queued.clear(); self.blocks.push(Block::System("queue cleared".into())); }
             }
             "/next" | "/skip" => self.next_task(),
+            "/factory-reset" | "/factory_reset" | "/reset" => self.factory_reset(arg.trim() == "confirm"),
+            "/uninstall" => self.uninstall(arg.trim() == "confirm"),
             "/exit" | "/quit" | "/q" => self.quit = true,
             "/update" => {
                 // Only a check: the binary is never replaced under a running session — starting harness is what updates.
@@ -3065,7 +3067,7 @@ impl App {
             }
             Msg::MlxTextOnly(base_url) => {
                 self.blocks.push(Block::System(format!("{base_url} is served by mlx_lm.server, which is text-only (images get \"Only 'text' content type is supported\") — restarting it as mlx_vlm.server, same weights plus the vision tower; back in a moment")));
-                self.start_mlx();
+                self.start_mlx_ex(true);
             }
             Msg::MlxUp(r) => match r {
                 Ok((base_url, model, module)) => {
@@ -3426,8 +3428,63 @@ impl App {
         }
     }
 
-    /// Start the MLX server for the configured build and report where it landed.
-    fn start_mlx(&mut self) {
+    /// `/factory-reset`: back to first-run state. Shows the plan; `confirm` performs it, stops the MLX
+    /// server, and restarts the harness so the next launch is a clean first run.
+    fn factory_reset(&mut self, confirmed: bool) {
+        use harness::reset;
+        let plan = reset::factory_reset_plan();
+        if plan.is_empty() { self.blocks.push(Block::System("factory reset: nothing to remove — the harness is already at first-run state".into())); return; }
+        let total: u64 = plan.iter().map(|i| i.bytes).sum();
+        if !confirmed {
+            let mut lines = vec![format!("⚠ /factory-reset will delete {} across {} item(s), returning the harness to first-run state:", reset::human(total), plan.len())];
+            for i in &plan { lines.push(format!("  · {} — {}", i.label, reset::human(i.bytes))); }
+            lines.push("Kept: the MLX runtime, the source checkout, tool links (the installer parts). The model re-downloads on next launch.".into());
+            lines.push("Type  /factory-reset confirm  to proceed. This cannot be undone.".into());
+            self.blocks.push(Block::Banner(lines));
+            return;
+        }
+        let port = self.cfg.local_model.port;
+        tokio::spawn(async move { harness::localmodel::stop_on_port(port).await; });
+        let (removed, errs) = reset::execute(&plan);
+        let _ = reset::seed_after_reset();
+        self.blocks.push(Block::System(format!("factory reset: removed {removed} item(s), freed {}", reset::human(total))));
+        for e in &errs { self.blocks.push(Block::Error(format!("  could not remove {e}"))); }
+        self.blocks.push(Block::System("restarting into a clean first run…".into()));
+        self.restart = true; self.quit = true;
+    }
+
+    /// `/uninstall`: remove everything the harness owns. Shows the plan; `confirm` performs it and quits.
+    fn uninstall(&mut self, confirmed: bool) {
+        use harness::reset;
+        let plan = reset::uninstall_plan();
+        let total: u64 = plan.iter().map(|i| i.bytes).sum();
+        if !confirmed {
+            let mut lines = vec![format!("⚠ /uninstall will remove {} — everything the harness owns:", reset::human(total))];
+            for i in &plan { lines.push(format!("  · {} ({})", i.path.display(), reset::human(i.bytes))); }
+            let shared = reset::shared_tools_left();
+            if !shared.is_empty() {
+                lines.push("Left in place (shared tools the installer also set up — remove by hand if you want):".into());
+                for (n, p) in &shared { lines.push(format!("  · {n}: {}", p.display())); }
+            }
+            lines.push("Type  /uninstall confirm  to proceed. The harness quits when done; this cannot be undone.".into());
+            self.blocks.push(Block::Banner(lines));
+            return;
+        }
+        let port = self.cfg.local_model.port;
+        // stop the server synchronously-ish before the runtime dir is deleted under it
+        tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(harness::localmodel::stop_on_port(port)));
+        let (removed, errs) = reset::execute(&plan);
+        self.blocks.push(Block::System(format!("uninstall: removed {removed} item(s), freed {}", reset::human(total))));
+        for e in &errs { self.blocks.push(Block::Error(format!("  could not remove {e}"))); }
+        self.blocks.push(Block::System("TheHarness is uninstalled. Reinstall any time: curl -fsSL https://zeljan-alduk.github.io/TheHarness/install.sh | sh".into()));
+        // do NOT restart — the binary is gone. Just quit.
+        self.restart = false; self.quit = true;
+    }
+
+    /// Start (or reuse) the MLX server for the configured build and report where it landed.
+    /// `force` restarts even a healthy server — for `/localmodel restart` and switching vision↔text.
+    fn start_mlx(&mut self) { self.start_mlx_ex(false); }
+    fn start_mlx_ex(&mut self, force: bool) {
         use harness::localmodel as lm;
         let Some(build) = lm::by_name(&self.cfg.local_model.build) else { self.set_status("no local build chosen — /localmodel"); return };
         if lm::mlx_python().is_none() {
@@ -3436,8 +3493,17 @@ impl App {
         }
         let (tx, dir, port, kind) = (self.tx.clone(), build.dir(), self.cfg.local_model.port, self.cfg.local_model.server.clone());
         let first = lm::server_plan(&kind).first().copied().unwrap_or("mlx_lm.server");
-        self.set_status(format!("starting {first} on port {port} — loading {} GB of weights takes a moment", build.bytes / 1_000_000_000));
+        self.set_status(format!("{} {first} on port {port}", if force { "restarting" } else { "starting" }));
         tokio::spawn(async move {
+            // Keep it ready: a warm server of the right kind from an earlier session is reused as-is —
+            // no reload of 16–30GB of weights, the prefix cache survives. `force` skips this to restart.
+            if !force {
+                if let Some(model) = lm::running(port, &kind).await {
+                    let module = lm::server_kind(&format!("http://127.0.0.1:{port}/v1")).await.unwrap_or("mlx_vlm.server");
+                    let _ = tx.send(Msg::MlxUp(Ok((format!("http://127.0.0.1:{port}/v1"), model, module))));
+                    return;
+                }
+            }
             // The runtime may predate the vision server (an updated harness on an old venv): fetch it first.
             if !matches!(kind.as_str(), "mlx-lm" | "mlx_lm" | "text") {
                 match lm::ensure_mlx_vlm().await {
@@ -3448,6 +3514,7 @@ impl App {
             }
             // ours from an earlier session (or the other server kind) may still hold the port: replace it
             lm::stop_on_port(port).await;
+            let _ = tx.send(Msg::Notice(format!("loading {} GB of weights — a moment", build.bytes / 1_000_000_000)));
             let msg = match lm::serve(&dir, port, &kind).await {
                 Ok(s) => Msg::MlxUp(Ok((s.base_url.clone(), s.model.clone(), s.module))),
                 Err(e) => Msg::MlxUp(Err(format!("{e:#}"))),
@@ -3700,6 +3767,8 @@ const COMMANDS: &[(&str, &str)] = &[
     ("/mcp", "show configured MCP servers and live MCP tools"),
     ("/reload", "restart tools, MCP servers and plugins"),
     ("/restart", "restart the harness (re-exec the installed binary) and resume this session"),
+    ("/factory-reset", "wipe user state + the downloaded model → first-run state (keeps the MLX runtime/source); /factory-reset confirm"),
+    ("/uninstall", "remove everything the harness owns (config, model, runtime, app, binary); /uninstall confirm — then it quits"),
     ("/update", "check GitHub for a newer release (installing happens when harness starts, never under a running session; `harness update` on demand)"),
     ("/improve", "self-improvement loop: /improve [focus] — propose → confirm (auto with a frontier backend) → implement → arbiter → merge → install → restart (60s to cancel)"),
     ("/cancel", "cancel the pending automatic restart or the running /improve job"),

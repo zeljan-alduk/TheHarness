@@ -237,6 +237,10 @@ async fn serve_with(model_dir: &Path, port: u16, module: &'static str) -> Result
     // conversation (~85s for 10k tokens on a 27B 4-bit): APC_ENABLED=1 makes a repeated or extended
     // prompt cost only its new tail (measured 16s → 0.6s). 2048 blocks × 16 = 32k tokens of KV cache.
     if module == "mlx_vlm.server" { cmd.env("APC_ENABLED", "1"); }
+    // setsid: give the server its own session and process group, so it is NOT killed when the terminal
+    // closes (SIGHUP goes to the foreground group) or the harness exits — it stays warm for the next start.
+    #[cfg(unix)]
+    unsafe { cmd.pre_exec(|| { libc::setsid(); Ok(()) }); }
     let child = cmd
         .stdout(log.try_clone()?)
         .stderr(log)
@@ -260,6 +264,7 @@ async fn serve_with(model_dir: &Path, port: u16, module: &'static str) -> Result
                     // exactly as it lists it — so take the entry that is our directory, never just the first.
                     if let Some(id) = pick_model_id(&v, model_dir) { server.model = id; }
                 }
+                warm(&http, &base_url, &server.model).await;
                 return Ok(server);
             }
         }
@@ -267,6 +272,24 @@ async fn serve_with(model_dir: &Path, port: u16, module: &'static str) -> Result
     }
     let _ = server.child.kill().await;
     bail!("{module} did not answer on {base_url} within 5 minutes — see {}", log_dir.join("mlx-server.log").display())
+}
+
+/// One tiny generation so the weights are touched and the compute graph compiled before the user's first
+/// turn — otherwise that first token pays a one-off cold cost on top of the load.
+async fn warm(http: &reqwest::Client, base_url: &str, model: &str) {
+    let body = serde_json::json!({"model": model, "messages": [{"role":"user","content":"hi"}], "max_tokens": 1, "temperature": 0});
+    let _ = http.post(format!("{base_url}/chat/completions")).timeout(Duration::from_secs(120)).json(&body).send().await;
+}
+
+/// Is a server of `kind` already up and answering on `port`? Then a new harness reuses it instead of
+/// restarting (which would drop the resident weights and the prefix cache). Returns the model id it serves.
+pub async fn running(port: u16, kind: &str) -> Option<String> {
+    let module_ok = server_kind(&format!("http://127.0.0.1:{port}/v1")).await?;
+    if !server_plan(kind).contains(&module_ok) { return None; }
+    let http = reqwest::Client::builder().timeout(Duration::from_secs(2)).build().ok()?;
+    let v: serde_json::Value = http.get(format!("http://127.0.0.1:{port}/v1/models")).send().await.ok()?.json().await.ok()?;
+    let ours = models_dir().display().to_string();
+    v.get("data").and_then(|d| d.as_array()).and_then(|a| a.iter().filter_map(|m| m.get("id").and_then(|i| i.as_str())).find(|i| i.starts_with(&ours)).map(String::from))
 }
 
 /// The id under which a `/v1/models` listing offers `model_dir` (exact path, or the directory name), else the first id.
