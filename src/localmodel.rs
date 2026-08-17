@@ -251,9 +251,21 @@ async fn serve_with(model_dir: &Path, port: u16, module: &'static str, draft: &D
     let mut cmd = tokio::process::Command::new(&py);
     cmd.args(["-m", module, "--host", "127.0.0.1", "--port", &port.to_string(), "--model"]).arg(model_dir);
     // mlx_vlm's prefix cache is off by default, and without it every agent turn re-prefills the whole
-    // conversation (~85s for 10k tokens on a 27B 4-bit): APC_ENABLED=1 makes a repeated or extended
-    // prompt cost only its new tail (measured 16s → 0.6s). 2048 blocks × 16 = 32k tokens of KV cache.
-    if module == "mlx_vlm.server" { cmd.env("APC_ENABLED", "1"); }
+    // conversation (~110s for 13k tokens on a 27B 4-bit): APC_ENABLED=1 makes a repeated or extended
+    // prompt cost only its new tail (measured 16s → 0.6s).
+    //
+    // Qwen3.5 is a hybrid attention/recurrent model, so mlx_vlm can't use its block cache and falls back
+    // to the "exact" whole-prefix snapshot cache. That cache is an LRU whose default size is only TWO
+    // entries — so any small model call interleaved between two agent turns (the session-title, goal-check,
+    // reflection or compaction aux calls all hit the same server) evicts the conversation's snapshot, and
+    // the next turn re-prefills all 13k tokens from scratch. That looks exactly like the model reloading.
+    // Raising it to 8 keeps the conversation cached across those interleaved calls (verified: a 2.4k prompt
+    // stays a 0.7s cache hit after two interleaved aux requests, vs a 20s full re-prefill at the default).
+    // Cost is bounded: ~0.2GB per 5k-token snapshot, so ≤ ~6GB with a large conversation.
+    if module == "mlx_vlm.server" {
+        cmd.env("APC_ENABLED", "1");
+        cmd.env("APC_EXACT_CACHE_ENTRIES", "8");
+    }
     // Speculative decoding: a drafter proposes tokens the target verifies in a batch (opt-in, mlx_vlm only).
     if module == "mlx_vlm.server" && draft.on() {
         cmd.args(["--draft-model", &draft.model]);
