@@ -1,7 +1,8 @@
 # Harness configuration. Every key can be overridden with HARNESS_<UPPER_KEY> env vars.
 
 [llm]
-# Any OpenAI-compatible server: LM Studio (:1234), llama-server (:8080), Ollama (:11434/v1),
+# The harness serves Qwen3.8-27B itself with MLX (see [local_model] and /localmodel); this can point at
+# any other OpenAI-compatible server instead: LM Studio (:1234), llama-server (:8080),
 # OpenAI/OpenRouter/Gemini-compat (set api_key), or Anthropic: provider = "anthropic",
 # base_url = "https://api.anthropic.com", model = "claude-sonnet-5", api_key from ANTHROPIC_API_KEY.
 base_url = "http://localhost:1234/v1"
@@ -18,7 +19,7 @@ temperature = 0.2
 # Reasoning models spend a lot of this budget on thinking; keep it generous.
 max_tokens = 16384
 # Auto-compaction threshold. By default the harness detects the model's loaded context length at
-# start (LM Studio / llama.cpp / Ollama) and compacts at compact_at_fraction × that. Set
+# start (MLX / LM Studio / llama.cpp) and compacts at compact_at_fraction × that. Set
 # context_budget_tokens to pin an explicit value instead.
 compact_at_fraction = 0.75
 # context_budget_tokens = 60000

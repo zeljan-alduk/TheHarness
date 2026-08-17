@@ -23,7 +23,7 @@ One line, no sudo, nothing outside `$HOME`. It installs the `harness` binary, [k
 (the terminal the TUI is built for), a private MLX runtime under `~/.config/harness/runtime`, the Claude
 Code CLI, and a **TheHarness.app** in `~/Applications` with an alias on your Desktop. Read it first if you
 like — it is [`docs/install.sh`](docs/install.sh), and `DRY_RUN=1` makes it print every step instead of
-doing it (`NO_KITTY=1`, `NO_MLX=1`, `NO_CLAUDE=1`, `NO_APP=1`, `WITH_OLLAMA=1` are the other knobs).
+doing it (`NO_KITTY=1`, `NO_MLX=1`, `NO_CLAUDE=1`, `NO_APP=1`, `NO_TOOLS=1`, `NO_RUST=1`, `NO_SOURCE=1` are the other knobs).
 
 Then just run `harness` in any terminal — it re-opens itself in kitty, because that is where inline
 images, the graphics protocol and `ctrl+=` / `ctrl+-` font control work. `HARNESS_NO_KITTY=1 harness`
@@ -42,7 +42,7 @@ Uninstall: `rm -rf ~/.config/harness ~/Applications/TheHarness.app ~/Desktop/The
 `.build-number`). Set `HARNESS_NO_BUMP=1` to build without bumping.
 
 ## Backends
-- **Local / OpenAI-compatible** (default): LM Studio, llama.cpp, Ollama, OpenAI, OpenRouter… (`base_url`, `api_key`).
+- **MLX** (default): the harness downloads Qwen3.8-27B and serves it with `mlx-lm` on loopback — see [Install](#install) and `/localmodel`. Any other OpenAI-compatible server works too (LM Studio, llama-server, OpenAI, OpenRouter…) via `base_url`/`api_key`.
 - **Claude Code (subscription)**: `provider = "claude-code"` or `/backend claude [model]` (default `claude-fable-5`).
   The harness runs the official `claude` CLI headlessly (`--print`, stream-json in/out) and exposes its own tools
   to it over an MCP bridge, so permissions, hooks, memory, redaction and the UI all still apply while your
@@ -84,7 +84,7 @@ an untrusted directory may not set `permissions.mode = bypass`.
 ## Quick start
 
 ```sh
-# 1. Have a model served (LM Studio on :1234, or llama-server / ollama — edit harness.toml)
+# 1. Have a model served: /localmodel downloads Qwen3.8-27B for MLX, or point base_url at your own server
 cargo build --release
 ./target/release/harness models                       # sanity check the server
 ./target/release/harness run -C /path/to/project "Add a --json flag to the CLI and tests"
@@ -230,7 +230,7 @@ Turn it off with `[checkpoints] enabled = false`.
   `harness mcp` lists them.
 
 ## Context management
-The context window is detected at start (LM Studio / llama.cpp / Ollama). When the prompt exceeds
+The context window is detected at start (MLX / LM Studio / llama.cpp). When the prompt exceeds
 `compact_at_fraction` × context (or `context_budget_tokens`), the agent **compacts**: an LLM-written
 handoff note (goals verbatim, files/commands/results with exact paths, findings, decisions, next steps)
 replaces older messages; recent ones stay verbatim. `/compact [focus]` forces it.

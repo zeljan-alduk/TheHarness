@@ -19,7 +19,6 @@
 # Nothing needs sudo; nothing is written outside $HOME. Knobs:
 #   DRY_RUN=1     print every step instead of doing it
 #   NO_KITTY=1  NO_MLX=1  NO_CLAUDE=1  NO_APP=1  NO_TOOLS=1   skip that step
-#   WITH_OLLAMA=1                                    also install Ollama (GGUF models, ~150MB)
 #   PREFIX=~/.local                                  where bin/ and kitty.app go
 set -eu
 
@@ -127,21 +126,6 @@ else
     # mlx-lm serves the text path (it knows the qwen3_5 architecture); mlx-vlm adds the vision tower.
     run "$UV" pip install --python "$RUNTIME/mlx/bin/python" --quiet --upgrade mlx-lm mlx-vlm
     ok "mlx-lm + mlx-vlm → $RUNTIME/mlx"
-fi
-
-# ── ollama (optional second runtime) ──────────────────────────────────────────
-if [ "${WITH_OLLAMA:-0}" = 1 ]; then
-    say "Installing Ollama (optional)"
-    if command -v ollama >/dev/null; then skip "already installed"
-    else
-        TMP2=$(mktemp -d)
-        run curl -fSL --progress-bar https://ollama.com/download/ollama-darwin.tgz -o "$TMP2/ollama.tgz"
-        run mkdir -p "$RUNTIME/ollama"
-        run tar -xzf "$TMP2/ollama.tgz" -C "$RUNTIME/ollama"
-        run rm -rf "$TMP2"
-        [ "$DRY_RUN" = 1 ] || { O=$(find "$RUNTIME/ollama" -type f -name ollama -perm -u+x | head -1); [ -n "$O" ] && ln -sf "$O" "$BIN/ollama"; }
-        ok "ollama → $RUNTIME/ollama (models would live in $HOME_DIR/models)"
-    fi
 fi
 
 # ── claude code cli ───────────────────────────────────────────────────────────

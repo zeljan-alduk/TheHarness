@@ -165,8 +165,8 @@ const SPINNER: [&str; 10] = ["✻", "✼", "✽", "✾", "✿", "❀", "✿", "�
 const WORDS: [&str; 12] = ["Thinking", "Pondering", "Working", "Reasoning", "Cooking", "Tinkering", "Brewing", "Mulling", "Crunching", "Percolating", "Noodling", "Computing"];
 
 enum Msg { Toast(String), Title(String), Question(harness::permissions::Question, tokio::sync::oneshot::Sender<harness::permissions::Answer>), SubEnv(Arc<harness::agent::SubAgentEnv>), Policy(Arc<harness::permissions::Policy>), CcSession(Arc<harness::claude_code::ClaudeCodeSession>), CcSid(String), Block(Block), Ask(harness::permissions::ApprovalRequest, tokio::sync::oneshot::Sender<harness::permissions::Approval>), Ev(Event), Done(Result<(String, harness::agent::RunStats), String>), Sys(SysSample), CtxLen(u64), Pasted(Result<PathBuf, String>), Frames(Result<Extracted, String>), Toolset(Arc<Toolset>), Catalog(Result<harness::plugins::Catalog, String>), Notice(String), Improve(harness::selfimprove::Stage), GoalCheck(bool, String), Review(String), AcpSession(Arc<harness::acp_client::AcpSession>), RunTask(String), QueueTask(String), StatusLine(String), Dictated(String),
-    /// First-run model bootstrap: is a local server already answering?
-    LocalProbe(bool),
+    /// First-run model bootstrap: what the configured local endpoint can actually do.
+    LocalProbe(harness::localmodel::Endpoint),
     /// Weights coming down: aggregate progress across the repo's files.
     ModelDl(harness::localmodel::Progress),
     /// The download finished (Ok) or gave up (Err) — a partial download is resumable, not lost.
@@ -707,6 +707,14 @@ struct App {
     dl: Option<harness::localmodel::Progress>,
     dl_build: Option<&'static harness::localmodel::Build>,
     dl_cancel: Option<tokio::task::JoinHandle<()>>,
+    /// No model can serve a turn: the mode line says so instead of naming one that cannot answer.
+    no_model: bool,
+    /// The Claude offer is made once per session, whichever no-model path gets there first.
+    claude_asked: bool,
+    /// The first-run picker is open; closing it (however) still owes the user the Claude question.
+    first_run_pending: bool,
+    /// The "waiting for Qwen3.8" explanation is worth saying once, not on every picker close.
+    said_waiting: bool,
     /// A command that needs the terminal to itself (the Claude sign-in): the loop suspends the UI,
     /// runs it, and comes back — the same trick as ctrl+g's $EDITOR.
     run_external: Option<String>,
@@ -727,7 +735,7 @@ pub async fn run(cfg: Config, resume: Option<String>) -> Result<()> {
         quit: false, restart: false, improve: None, improve_cancel: Default::default(), restart_at: None, tick: 0, word: 0, models: vec![],
         metrics: Metrics::new(0), panel: None, attachments: vec![], tool_previews: Default::default(),
         picker, images: Default::default(), img_seq: 0,
-        think_scroll: 0, toolset: None, perm_mode: harness::permissions::Mode::Auto, vim: false, vim_normal: false, keymap: Keymap::load(), sel_anchor: None, sel_cur: None, sel_dragging: false, visible_text: vec![], toast: None, tool_view: "summary".into(), tool_groups_open: Default::default(), settings_open: false, settings_cursor: 0, sessions_pick: None, pick: None, title_shown: None, banner_step: 0, live_policy: None, cc_rate: None, extra_roots: vec![], wt_cwd: harness::worktree::new_cell(), cc: None, cc_last_session: None, compact_progress: None, session_meta: harness::sessions::Meta::default(), todos: Default::default(), inbox: Default::default(), event_log: None, pending_ask: None, pending_q: None, subenv: None, attached: None, video: None, strip_rects: vec![], tr_rect: Rect::default(), panel_rect: Rect::default(), tr_start: 0, line_map: vec![], dl: None, dl_build: None, dl_cancel: None, run_external: None,
+        think_scroll: 0, toolset: None, perm_mode: harness::permissions::Mode::Auto, vim: false, vim_normal: false, keymap: Keymap::load(), sel_anchor: None, sel_cur: None, sel_dragging: false, visible_text: vec![], toast: None, tool_view: "summary".into(), tool_groups_open: Default::default(), settings_open: false, settings_cursor: 0, sessions_pick: None, pick: None, title_shown: None, banner_step: 0, live_policy: None, cc_rate: None, extra_roots: vec![], wt_cwd: harness::worktree::new_cell(), cc: None, cc_last_session: None, compact_progress: None, session_meta: harness::sessions::Meta::default(), todos: Default::default(), inbox: Default::default(), event_log: None, pending_ask: None, pending_q: None, subenv: None, attached: None, video: None, strip_rects: vec![], tr_rect: Rect::default(), panel_rect: Rect::default(), tr_start: 0, line_map: vec![], dl: None, dl_build: None, dl_cancel: None, no_model: false, claude_asked: false, first_run_pending: false, said_waiting: false, run_external: None,
     };
     app.metrics.ctx_len = app.cfg.llm.context_budget_tokens.unwrap_or(0);
     app.perm_mode = app.cfg.permissions.mode;
@@ -769,7 +777,7 @@ pub async fn run(cfg: Config, resume: Option<String>) -> Result<()> {
     if app.cfg.llm.provider.is_none() && app.cfg.local_model.first_run_prompt {
         let (tx2, base) = (tx.clone(), app.cfg.llm.base_url.clone());
         tokio::spawn(async move {
-            let up = harness::localmodel::reachable(&base).await;
+            let up = harness::localmodel::probe(&base).await;
             // the picker warns when a build wants more RAM than the machine has, and that number comes
             // from the first sampler tick — wait for it rather than print advice without it
             tokio::time::sleep(Duration::from_millis(1200)).await;
@@ -1078,8 +1086,21 @@ impl App {
                         _ => {}
                     }
                 }
+                let closed = close || run.is_some();
                 if close { self.pick = None; }
                 if let Some(cmd) = run { self.command(&cmd); }
+                // The first-run picker is a fork in the road either way: whichever branch was taken (a
+                // build to download, "not now", or esc), the user still needs to be asked about Claude.
+                if closed && std::mem::take(&mut self.first_run_pending) { self.offer_claude_meanwhile(); }
+                else if closed && self.claude_asked && self.no_model && self.cfg.llm.provider.is_none() && !self.said_waiting {
+                    self.said_waiting = true;
+                    let dl = self.dl.is_some() || self.dl_cancel.is_some();
+                    self.blocks.push(Block::System(if dl {
+                        "no Claude, then — the harness will use Qwen3.8-27B as soon as the download finishes (⌃P watches it); turns before that will fail".into()
+                    } else {
+                        "no backend yet — /localmodel downloads Qwen3.8-27B, /backend claude uses Claude, or set [llm] base_url to a server you run".to_string()
+                    }));
+                }
             }
             CEvent::Key(k) if k.kind == KeyEventKind::Press && self.sessions_pick.is_some() => {
                 let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
@@ -2477,6 +2498,7 @@ impl App {
                 }
             }
             "/backend" | "/provider" => {
+                self.no_model = false;   // the user is choosing a backend explicitly; stop claiming nothing is loaded
                 let mut it = arg.split_whitespace(); let which = it.next().unwrap_or("").to_string(); let model = it.next().map(String::from); let effort = it.next().map(|e| e.to_lowercase());
                 match which.as_str() {
                     "" => { self.blocks.push(Block::Banner(vec![format!("backend: {} · model {}", self.cfg.llm.provider.clone().unwrap_or("openai (local/compatible server)".into()), self.model), "switch: /backend local [model]  ·  /backend claude [model] [effort]   (claude = official Claude Code CLI on your subscription, default claude-fable-5; effort low|medium|high|max, also /effort)".into(), "        /backend anthropic <model>  (Anthropic API key from ANTHROPIC_API_KEY)".into(),
@@ -2956,6 +2978,7 @@ impl App {
             }
             Msg::MlxUp(r) => match r {
                 Ok((base_url, model)) => {
+                    self.no_model = false;
                     let claude = self.cfg.llm.provider.as_deref() == Some("claude-code");
                     self.cfg.llm.base_url = base_url.clone();
                     let _ = harness::config::Config::save_setting("llm.base_url", &base_url);
@@ -3105,26 +3128,68 @@ impl App {
     }
     // ───────────────────────── first run: getting a model at all ─────────────────────────
 
-    /// Nothing is serving locally. Decide between "the weights are here, start the server", "a download
-    /// was interrupted, offer to resume" and "there is no model yet, offer the three builds".
-    fn on_local_probe(&mut self, up: bool) {
-        use harness::localmodel::{self as lm, ModelState};
-        if up { return; }
-        let chosen = lm::by_name(&self.cfg.local_model.build);
-        if let Some(b) = chosen {
+    /// What to do about the local endpoint. A server that merely *answers* is not a model that can
+    /// reply — LM Studio lists everything it has downloaded — so say what was actually found, then get
+    /// the user to a working model: our own weights if they are here, the download picker if not, and the
+    /// Claude question either way.
+    fn on_local_probe(&mut self, ep: harness::localmodel::Endpoint) {
+        use harness::localmodel::{self as lm, Endpoint, ModelState};
+        // The start-up card was printed before we knew any of this; it named a model on the strength of the
+        // config file alone. Correct it in place rather than leave a card that promises a working model.
+        if !ep.ready() {
+            for b in self.blocks.iter_mut() {
+                if let Block::Startup(lines) = b {
+                    for l in lines.iter_mut() {
+                        if l.starts_with("  model  ") && !l.contains("not loaded") { l.push_str("   ← not loaded"); }
+                    }
+                    break;
+                }
+            }
+        }
+        match &ep {
+            Endpoint::Ready { model } => {
+                // Whatever is loaded there is what answers, whatever the config file claims.
+                if !model.is_empty() && model != &self.model {
+                    self.blocks.push(Block::System(format!("{} is loaded on {} — using it", model, self.cfg.llm.base_url)));
+                    self.cfg.llm.model = model.clone(); self.model = model.clone();
+                }
+                return;
+            }
+            Endpoint::Idle { listed } if *listed > 0 => {
+                self.no_model = true;
+                self.blocks.push(Block::Error(format!(
+                    "{} is running but has no model loaded — it lists {listed} downloaded model{}, none of them resident, so a turn would fail with \"No models loaded\".",
+                    self.cfg.llm.base_url, if *listed == 1 { "" } else { "s" })));
+            }
+            Endpoint::Idle { .. } => {
+                self.no_model = true;
+                self.blocks.push(Block::Error(format!("{} is running but serving no models.", self.cfg.llm.base_url)));
+            }
+            Endpoint::Down => {
+                self.no_model = true;
+                self.blocks.push(Block::Error(format!("nothing is serving on {} — no model to talk to yet.", self.cfg.llm.base_url)));
+            }
+        }
+        // Our own weights beat any other server: this is the model the harness downloaded and controls.
+        if let Some(b) = lm::by_name(&self.cfg.local_model.build) {
             match lm::state_of(b) {
                 ModelState::Ready { .. } => {
-                    if self.cfg.local_model.autostart { self.blocks.push(Block::System(format!("{} is on disk · starting the MLX server", b.name()))); self.start_mlx(); }
-                    return;
+                    if self.cfg.local_model.autostart {
+                        self.blocks.push(Block::System(format!("{} is on disk · starting the MLX server", b.name())));
+                        self.start_mlx();
+                        return;
+                    }
                 }
                 ModelState::Partial { bytes } => {
-                    self.blocks.push(Block::System(format!("{} is {} of the way down — /localmodel resumes it (nothing re-downloads)",
+                    self.blocks.push(Block::System(format!("{} is {} of the way down — /localmodel resume continues it (nothing re-downloads)",
                         b.name(), harness::tools::download::human(bytes))));
+                    self.offer_claude_meanwhile();
                     return;
                 }
                 ModelState::Missing => {}
             }
         }
+        self.first_run_pending = true;      // closing the picker still owes the user the Claude question
         self.pick = Some(self.model_picker());
     }
 
@@ -3181,7 +3246,8 @@ impl App {
     /// Give the user something to work with while 16–30 GB comes down. Asking the CLI takes ~0.2s, so it
     /// happens off the UI thread and lands as Msg::ClaudeAuth.
     fn offer_claude_meanwhile(&mut self) {
-        if self.cfg.llm.provider.is_some() { return; }               // already on some other backend
+        if self.cfg.llm.provider.is_some() || self.claude_asked { return; }   // already answered, or on another backend
+        self.claude_asked = true;
         let tx = self.tx.clone();
         tokio::spawn(async move { let _ = tx.send(Msg::ClaudeAuth(harness::claude_code::auth().await)); });
     }
@@ -3193,11 +3259,39 @@ impl App {
         let downloading = self.dl.is_some() || self.dl_cancel.is_some();
         match auth {
             Auth::Ready { .. } => {
+                // Signed in, so the choice is the user's: which model, at effort high, or none at all.
+                // Fable is first, which is where the cursor starts.
                 let who = auth.who();
-                self.command("/backend claude claude-fable-5 high");
-                self.blocks.push(Block::System(format!(
-                    "working on Claude ({who}) until the local model is ready{}",
-                    if downloading { " — the download keeps running in the background" } else { "" })));
+                let models: &[(&str, &str)] = &[
+                    ("claude-fable-5", "the default — fast, strong at code"),
+                    ("claude-opus-5", "deepest reasoning, slowest"),
+                    ("claude-sonnet-5", "balanced"),
+                    ("claude-haiku-4-5", "cheapest, quickest"),
+                ];
+                let mut items: Vec<PickItem> = models.iter().map(|(m, note)| PickItem {
+                    label: (*m).to_string(),
+                    desc: format!("{note} · effort high"),
+                    detail: format!("Runs turns through the official Claude Code CLI on your subscription ({who}), with the \
+                                     harness's own tools bridged over MCP — permissions, hooks, memory and redaction all still apply.\n\n\
+                                     Effort starts at high; /effort changes it, /backend local switches away.{}",
+                                     if downloading { "\n\nThe Qwen3.8 download keeps running in the background either way." } else { "" }),
+                    run: Some(format!("/backend claude {m} high")),
+                }).collect();
+                items.push(PickItem {
+                    label: "No Claude".into(),
+                    desc: if downloading { "wait for Qwen3.8 to finish downloading".into() } else { "no backend until a local model exists".into() },
+                    detail: if downloading {
+                        "Nothing runs until the weights land — the harness will use Qwen3.8-27B as soon as they do, and turns \
+                         attempted before then will fail.".into()
+                    } else {
+                        "No usable backend is configured. /localmodel downloads one, or point [llm] base_url at a server you run.".into()
+                    },
+                    run: None,
+                });
+                self.pick = Some(ListPicker::new(
+                    format!("No local model yet — work on Claude? ({who})"),
+                    "enter picks a model at effort high · esc declines",
+                    items));
             }
             Auth::LoggedOut | Auth::Missing => {
                 let missing = auth == Auth::Missing;
@@ -3666,7 +3760,11 @@ fn draw(f: &mut Frame, app: &mut App) {
     let dot = || Span::styled(" · ", Style::default().fg(pal().dim));
     let (mode_txt, mode_col) = match app.perm_mode { harness::permissions::Mode::Bypass => ("▶▶ bypass permissions on", pal().pink), harness::permissions::Mode::Auto => ("▶▶ auto permissions", pal().cyan), harness::permissions::Mode::Ask => ("▶▶ ask before changes", pal().orange), harness::permissions::Mode::Plan => ("▶▶ plan mode · read-only", pal().think) };
     let mut st = vec![Span::styled(format!("  {mode_txt}"), Style::default().fg(mode_col)), dot(),
-        Span::styled(format!("{}{}", app.model, if app.cfg.llm.provider.as_deref() == Some("claude-code") { app.cfg.llm.effort.as_ref().map(|e| format!(" · effort {e}")).unwrap_or_default() } else { String::new() }), Style::default().fg(pal().cyan)), dot(),
+        // A model name here is a promise that a turn will work; when nothing is loaded, say that instead.
+        Span::styled(
+            if app.no_model && app.cfg.llm.provider.is_none() { "no model loaded".to_string() }
+            else { format!("{}{}", app.model, if app.cfg.llm.provider.as_deref() == Some("claude-code") { app.cfg.llm.effort.as_ref().map(|e| format!(" · effort {e}")).unwrap_or_default() } else { String::new() }) },
+            Style::default().fg(if app.no_model && app.cfg.llm.provider.is_none() { pal().err } else { pal().cyan })), dot(),
         Span::styled(short_path(&app.workdir), Style::default().fg(pal().cyan))];
     if !app.net { st.push(dot()); st.push(Span::styled("offline", Style::default().fg(pal().pink))); }
     if !app.queued.is_empty() { st.push(dot()); st.push(Span::styled(format!("{} queued", app.queued.len()), Style::default().fg(pal().cyan))); }

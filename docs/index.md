@@ -26,7 +26,7 @@ No sudo, nothing outside `$HOME`. It installs:
 
 Prefer to read before you run? It is [install.sh](install.sh) — and `DRY_RUN=1 sh install.sh` prints
 every step instead of taking it. `NO_KITTY=1`, `NO_MLX=1`, `NO_CLAUDE=1`, `NO_APP=1` skip a piece;
-`WITH_OLLAMA=1` adds Ollama for GGUF models.
+
 
 ## First run
 

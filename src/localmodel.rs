@@ -220,15 +220,57 @@ pub async fn serve(model_dir: &Path, port: u16, kind: &str) -> Result<Server> {
     bail!("{module} did not answer on {base_url} within 5 minutes — see {}", log_dir.join("mlx-server.log").display())
 }
 
-/// Is something already serving an OpenAI-compatible API here?
-pub async fn reachable(base_url: &str) -> bool {
-    let Ok(http) = reqwest::Client::builder().timeout(Duration::from_secs(2)).build() else { return false };
-    let url = format!("{}/models", base_url.trim_end_matches('/'));
-    match http.get(&url).send().await {
-        Ok(r) if r.status().is_success() => r.json::<serde_json::Value>().await
-            .map(|v| v.get("data").and_then(|d| d.as_array()).map(|a| !a.is_empty()).unwrap_or(false))
-            .unwrap_or(false),
-        _ => false,
+/// What the configured local endpoint can actually do for us.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Endpoint {
+    /// Nothing listening.
+    Down,
+    /// It answers, but no model can serve a turn — LM Studio lists every model it has *downloaded*,
+    /// loaded or not, which is exactly how "9 models available" turned into "No models loaded" on the
+    /// first real request. `listed` is how many it advertised.
+    Idle { listed: usize },
+    /// A model is loaded and will answer.
+    Ready { model: String },
+}
+
+impl Endpoint {
+    pub fn ready(&self) -> bool { matches!(self, Endpoint::Ready { .. }) }
+}
+
+/// Ask the local endpoint whether it can serve a turn — not merely whether it is listening.
+///
+/// `/v1/models` cannot answer that on its own, so where a server exposes load state we use it: LM Studio's
+/// `/api/v0/models` carries a `state` field per model. llama.cpp, `mlx_lm.server` and Ollama only serve
+/// what they have loaded, so for them a non-empty list is the answer.
+pub async fn probe(base_url: &str) -> Endpoint {
+    let Ok(http) = reqwest::Client::builder().timeout(Duration::from_secs(3)).build() else { return Endpoint::Down };
+    let base = base_url.trim_end_matches('/');
+    let listed: Vec<String> = match http.get(format!("{base}/models")).send().await {
+        Ok(r) if r.status().is_success() => match r.json::<serde_json::Value>().await {
+            Ok(v) => v.get("data").and_then(|d| d.as_array()).map(|a| a.iter().filter_map(|m| m.get("id").and_then(|i| i.as_str()).map(String::from)).collect()).unwrap_or_default(),
+            Err(_) => return Endpoint::Down,
+        },
+        _ => return Endpoint::Down,
+    };
+    // LM Studio: same host, native API, tells us which of those are actually resident.
+    let native = format!("{}/api/v0/models", base.trim_end_matches("/v1"));
+    if let Ok(r) = http.get(&native).send().await {
+        if r.status().is_success() {
+            if let Ok(v) = r.json::<serde_json::Value>().await {
+                if let Some(a) = v.get("data").and_then(|d| d.as_array()) {
+                    if a.iter().any(|m| m.get("state").is_some()) {
+                        return match a.iter().find(|m| m.get("state").and_then(|s| s.as_str()) == Some("loaded")).and_then(|m| m.get("id")).and_then(|i| i.as_str()) {
+                            Some(id) => Endpoint::Ready { model: id.to_string() },
+                            None => Endpoint::Idle { listed: a.len() },
+                        };
+                    }
+                }
+            }
+        }
+    }
+    match listed.into_iter().next() {
+        Some(model) => Endpoint::Ready { model },
+        None => Endpoint::Idle { listed: 0 },
     }
 }
 
