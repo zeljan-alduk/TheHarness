@@ -14,32 +14,58 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-/// The Qwen3.8-27B MLX builds the first-run picker offers. Sizes are the repos' actual totals (the HF
-/// API is asked again before downloading, so a stale number here only affects the menu text).
+/// Which runtime serves a build. MLX (mlx_vlm.server, our default — vision, prefix cache, KV-quant,
+/// speculative decoding) or GGUF (llama.cpp's llama-server, for models only published as GGUF).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Runtime { Mlx, Gguf }
+
+/// The local Qwen3.8-27B builds the picker offers. The first three (the `bits` 4/6/8 MLX builds) are the
+/// default first-run choice; the rest are opt-in alternatives (uncensored / abliterated), including one
+/// GGUF served by llama-server. Sizes are approximate (the HF API is asked again before downloading).
 pub const BUILDS: &[Build] = &[
-    Build { bits: 4, repo: "lmstudio-community/Qwen3.8-27B-MLX-4bit", bytes: 16_080_000_000, note: "fastest, smallest — the default" },
-    Build { bits: 6, repo: "lmstudio-community/Qwen3.8-27B-MLX-6bit", bytes: 22_800_000_000, note: "closer to full precision" },
-    Build { bits: 8, repo: "lmstudio-community/Qwen3.8-27B-MLX-8bit", bytes: 29_530_000_000, note: "best quality, needs the most RAM" },
+    Build { id: "4bit", bits: 4, repo: "lmstudio-community/Qwen3.8-27B-MLX-4bit", file: "", runtime: Runtime::Mlx, bytes: 16_080_000_000, label: "Qwen3.8-27B · 4-bit", note: "fastest, smallest — the default" },
+    Build { id: "6bit", bits: 6, repo: "lmstudio-community/Qwen3.8-27B-MLX-6bit", file: "", runtime: Runtime::Mlx, bytes: 22_800_000_000, label: "Qwen3.8-27B · 6-bit", note: "closer to full precision" },
+    Build { id: "8bit", bits: 8, repo: "lmstudio-community/Qwen3.8-27B-MLX-8bit", file: "", runtime: Runtime::Mlx, bytes: 29_530_000_000, label: "Qwen3.8-27B · 8-bit", note: "best quality, needs the most RAM" },
+    // Opt-in uncensored / abliterated builds. The MLX ones serve through mlx_vlm.server like the defaults,
+    // so every fix applies (vision, prefix cache, KV-quant, speculative). The GGUF is served by llama-server.
+    Build { id: "abliterated-mxfp4", bits: 0, repo: "Shiftedx/Qwen3.8-27B-Abliterated-MLX-MXFP4", file: "", runtime: Runtime::Mlx, bytes: 15_500_000_000, label: "Qwen3.8-27B Abliterated · MLX MXFP4", note: "uncensored · ~4-bit size · all MLX features" },
+    Build { id: "abliterated-6bit", bits: 0, repo: "npario/Qwen3.8-27B-Abliterated-MLX-6bit", file: "", runtime: Runtime::Mlx, bytes: 22_800_000_000, label: "Qwen3.8-27B Abliterated · MLX 6-bit", note: "uncensored · higher quality · more RAM" },
+    Build { id: "heretic-gguf", bits: 0, repo: "0bserverx/Qwen3.8-27B-Heretic-Abliterated-Uncensored-GGUF", file: "RVN-IQ3_M.gguf", runtime: Runtime::Gguf, bytes: 12_600_000_000, label: "Qwen3.8-27B Heretic · GGUF IQ3_M (llama-server)", note: "uncensored · ~12.6GB, lighter on RAM · llama.cpp" },
 ];
 
 #[derive(Debug, Clone, Copy)]
 pub struct Build {
+    /// Stable selector for `/localmodel <id>` and config (`local_model.build`). Also 4/6/8 via `bits`.
+    pub id: &'static str,
+    /// 4 | 6 | 8 for the core MLX builds; 0 for the opt-in extras (select them by id).
     pub bits: u8,
     pub repo: &'static str,
+    /// For a GGUF build, the single weight file to download and serve; "" for an MLX build (whole repo).
+    pub file: &'static str,
+    pub runtime: Runtime,
     pub bytes: u64,
+    pub label: &'static str,
     pub note: &'static str,
 }
 
 impl Build {
-    /// "Qwen3.8-27B-MLX-4bit"
+    /// "Qwen3.8-27B-MLX-4bit" — the on-disk directory name (repo basename).
     pub fn name(&self) -> &'static str { self.repo.rsplit('/').next().unwrap_or(self.repo) }
     pub fn dir(&self) -> PathBuf { models_dir().join(self.name()) }
+    /// The GGUF weight file on disk (Gguf builds only).
+    pub fn gguf_path(&self) -> PathBuf { self.dir().join(self.file) }
+    pub fn is_gguf(&self) -> bool { self.runtime == Runtime::Gguf }
+    /// True for the opt-in uncensored/abliterated builds (shown separately in the picker).
+    pub fn is_extra(&self) -> bool { self.bits == 0 }
     /// Roughly how much RAM the weights want resident; the picker warns when the machine has less.
     pub fn ram_gb(&self) -> u64 { self.bytes / 1_000_000_000 + 4 }
 }
 
-pub fn by_bits(bits: u8) -> Option<&'static Build> { BUILDS.iter().find(|b| b.bits == bits) }
-pub fn by_name(name: &str) -> Option<&'static Build> { BUILDS.iter().find(|b| b.name() == name || b.repo == name) }
+pub fn by_bits(bits: u8) -> Option<&'static Build> { (bits != 0).then(|| BUILDS.iter().find(|b| b.bits == bits && b.runtime == Runtime::Mlx)).flatten() }
+pub fn by_name(name: &str) -> Option<&'static Build> {
+    BUILDS.iter().find(|b| b.name() == name || b.repo == name || b.id == name)
+        .or_else(|| name.parse::<u8>().ok().and_then(by_bits))
+}
 
 pub fn models_dir() -> PathBuf { crate::setup::config_dir().join("models") }
 pub fn runtime_dir() -> PathBuf { crate::setup::config_dir().join("runtime") }
@@ -55,6 +81,16 @@ pub fn mlx_python() -> Option<PathBuf> {
 pub fn state_of(build: &Build) -> ModelState {
     let dir = build.dir();
     if !dir.is_dir() { return ModelState::Missing; }
+    // A GGUF build is one file: ready when that file is present at (about) its full size and not mid-download.
+    if build.is_gguf() {
+        let f = build.gguf_path();
+        if dir.join(format!("{}.harness-dl.json", build.file)).is_file() { return ModelState::Partial { bytes: std::fs::metadata(&f).map(|m| m.len()).unwrap_or(0) }; }
+        return match std::fs::metadata(&f) {
+            Ok(m) if m.len() + m.len() / 20 >= build.bytes => ModelState::Ready { bytes: m.len() },
+            Ok(m) => ModelState::Partial { bytes: m.len() },
+            Err(_) => ModelState::Missing,
+        };
+    }
     let partial = std::fs::read_dir(&dir).map(|rd| rd.flatten().any(|e| e.file_name().to_string_lossy().ends_with(".harness-dl.json"))).unwrap_or(false);
     let weights: u64 = std::fs::read_dir(&dir).map(|rd| rd.flatten().filter_map(|e| e.metadata().ok()).map(|m| m.len()).sum()).unwrap_or(0);
     let index = dir.join("config.json").is_file();
@@ -121,7 +157,12 @@ pub async fn fetch(build: &Build, segments: usize, on_progress: Arc<dyn Fn(Progr
         .user_agent(concat!("harness/", env!("HARNESS_VERSION")))
         .redirect(reqwest::redirect::Policy::limited(10))
         .build()?;
-    let files = list_repo(&http, build.repo).await?;
+    // A GGUF build is a single file; an MLX build is the whole repo.
+    let files = if build.is_gguf() {
+        vec![RepoFile { name: build.file.to_string(), bytes: build.bytes }]
+    } else {
+        list_repo(&http, build.repo).await?
+    };
     let total: u64 = files.iter().map(|f| f.bytes).sum();
     let files_total = files.len();
 
@@ -328,6 +369,65 @@ async fn serve_with(model_dir: &Path, port: u16, module: &'static str, opts: &Se
     bail!("{module} did not answer on {base_url} within 5 minutes — see {}", log_dir.join("mlx-server.log").display())
 }
 
+/// Serve a build, dispatching on its runtime: MLX → mlx_vlm/mlx_lm (with the drafter + KV-quant opts),
+/// GGUF → llama.cpp's llama-server.
+pub async fn serve_build(build: &Build, port: u16, kind: &str, opts: &ServeOpts) -> Result<Server> {
+    if build.is_gguf() { serve_gguf(build, port).await } else { serve_spec(&build.dir(), port, kind, opts).await }
+}
+
+/// Is llama-server (llama.cpp) installed? Path if so.
+pub fn llama_server_bin() -> Option<PathBuf> {
+    crate::setup::which("llama-server").or_else(|| { let p = PathBuf::from("/opt/homebrew/bin/llama-server"); p.is_file().then_some(p) })
+}
+
+/// Serve a downloaded GGUF build with llama-server on 127.0.0.1 (OpenAI-compatible). Detached (setsid) and
+/// warmed like the MLX path; llama.cpp does its own KV/prompt caching (--cache-reuse), so no APC knobs here.
+pub async fn serve_gguf(build: &Build, port: u16) -> Result<Server> {
+    let bin = llama_server_bin().context("llama-server (llama.cpp) is not installed — `brew install llama.cpp`, then re-select this model")?;
+    let file = build.gguf_path();
+    if !file.is_file() { bail!("{} is not downloaded yet", build.file); }
+    let log_dir = crate::setup::config_dir().join("logs"); std::fs::create_dir_all(&log_dir).ok();
+    let log = std::fs::OpenOptions::new().create(true).append(true).open(log_dir.join("mlx-server.log"))?;
+    let mut cmd = tokio::process::Command::new(&bin);
+    // -ngl 999: all layers on the Metal GPU. -fa auto: flash attention. --cache-reuse: reuse KV prefixes.
+    // --jinja (default on) uses the model's own chat template. -c 16384: context window.
+    cmd.args(["--host", "127.0.0.1", "--port", &port.to_string(), "-c", "16384", "-ngl", "999", "-fa", "auto", "--cache-reuse", "256", "--jinja", "-m"]).arg(&file);
+    #[cfg(unix)]
+    unsafe { cmd.pre_exec(|| { libc::setsid(); Ok(()) }); }
+    let child = cmd.stdout(log.try_clone()?).stderr(log).stdin(std::process::Stdio::null()).kill_on_drop(false).spawn().context("starting llama-server")?;
+    let base_url = format!("http://127.0.0.1:{port}/v1");
+    let http = reqwest::Client::builder().timeout(Duration::from_secs(3)).build()?;
+    let mut server = Server { base_url: base_url.clone(), model: build.name().to_string(), port, child, module: "llama-server" };
+    for _ in 0..1200 {
+        if let Ok(Some(status)) = server.child.try_wait() { bail!("llama-server exited ({status}) — see {}", log_dir.join("mlx-server.log").display()); }
+        if let Ok(r) = http.get(format!("{base_url}/models")).send().await {
+            if r.status().is_success() {
+                if let Ok(v) = r.json::<serde_json::Value>().await {
+                    if let Some(id) = v.get("data").and_then(|d| d.as_array()).and_then(|a| a.first()).and_then(|m| m.get("id")).and_then(|i| i.as_str()) { server.model = id.to_string(); }
+                }
+                warm(&http, &base_url, &server.model).await;
+                return Ok(server);
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    let _ = server.child.kill().await;
+    bail!("llama-server did not answer on {base_url} in time — see {}", log_dir.join("mlx-server.log").display())
+}
+
+/// Reuse a warm server already on `port` if it matches the build's runtime (mlx server for MLX builds,
+/// llama-server for GGUF). Returns the model id it serves.
+pub async fn running_build(build: &Build, port: u16, kind: &str) -> Option<String> {
+    let module = server_kind(&format!("http://127.0.0.1:{port}/v1")).await?;
+    let ok = if build.is_gguf() { module == "llama-server" } else { server_plan(kind).contains(&module) };
+    if !ok { return None; }
+    let http = reqwest::Client::builder().timeout(Duration::from_secs(2)).build().ok()?;
+    let v: serde_json::Value = http.get(format!("http://127.0.0.1:{port}/v1/models")).send().await.ok()?.json().await.ok()?;
+    let ids: Vec<String> = v.get("data").and_then(|d| d.as_array()).map(|a| a.iter().filter_map(|m| m.get("id").and_then(|i| i.as_str()).map(String::from)).collect()).unwrap_or_default();
+    let ours = models_dir().display().to_string();
+    ids.iter().find(|i| i.starts_with(&ours)).or_else(|| ids.first()).cloned()
+}
+
 /// One tiny generation so the weights are touched and the compute graph compiled before the user's first
 /// turn — otherwise that first token pays a one-off cold cost on top of the load.
 async fn warm(http: &reqwest::Client, base_url: &str, model: &str) {
@@ -363,6 +463,7 @@ pub fn pick_model_id(models: &serde_json::Value, model_dir: &Path) -> Option<Str
 pub async fn server_kind(base_url: &str) -> Option<&'static str> {
     let port = port_of(base_url)?;
     for module in ["mlx_vlm.server", "mlx_lm.server"] { if !pids_of(module, port).is_empty() { return Some(module); } }
+    if !pids_of("llama-server", port).is_empty() { return Some("llama-server"); }
     None
 }
 
@@ -377,7 +478,7 @@ fn pids_of(module: &str, port: u16) -> Vec<u32> {
 /// PIDs of *our* MLX server processes bound to `port` (matched on the command line, so LM Studio or a
 /// llama-server on the same port are never touched).
 pub fn pids_on_port(port: u16) -> Vec<u32> {
-    let mut v = pids_of("mlx_vlm.server", port); v.extend(pids_of("mlx_lm.server", port)); v
+    let mut v = pids_of("mlx_vlm.server", port); v.extend(pids_of("mlx_lm.server", port)); v.extend(pids_of("llama-server", port)); v
 }
 
 /// Stop the MLX server we (or a previous harness) started on `port`; true if one was running.
@@ -453,7 +554,7 @@ mod tests {
 
     #[test]
     fn builds_are_the_three_quants() {
-        assert_eq!(BUILDS.len(), 3);
+        assert_eq!(BUILDS.iter().filter(|b| b.bits != 0).count(), 3, "three core MLX quants");
         assert_eq!(by_bits(4).unwrap().name(), "Qwen3.8-27B-MLX-4bit");
         assert_eq!(by_bits(8).unwrap().bits, 8);
         assert!(by_bits(5).is_none());
@@ -498,6 +599,22 @@ mod tests {
         assert_eq!(pick_model_id(&v, Path::new("/elsewhere/Qwen3.8-27B-MLX-4bit")).as_deref(), Some("Qwen3.8-27B-MLX-4bit"));
         let v: serde_json::Value = serde_json::json!({"data": [{"id": "something-else"}]});
         assert_eq!(pick_model_id(&v, Path::new("/elsewhere/Qwen3.8-27B-MLX-4bit")).as_deref(), Some("something-else"));
+    }
+    #[test]
+    fn catalog_has_mlx_and_gguf_and_resolves() {
+        // core MLX builds selectable by bits and id
+        assert_eq!(by_bits(4).unwrap().id, "4bit");
+        assert!(by_name("4").is_some() && by_name("4bit").is_some());
+        assert_eq!(by_name("4").unwrap().runtime, Runtime::Mlx);
+        // opt-in abliterated MLX + GGUF present
+        let ab = by_name("abliterated-mxfp4").expect("abliterated MLX build");
+        assert!(ab.is_extra() && !ab.is_gguf() && ab.runtime == Runtime::Mlx);
+        let g = by_name("heretic-gguf").expect("gguf build");
+        assert!(g.is_gguf() && g.is_extra() && g.runtime == Runtime::Gguf);
+        assert!(g.file.ends_with(".gguf"));
+        assert!(g.gguf_path().ends_with(g.file));
+        // by_bits never returns a non-MLX build
+        assert!(by_bits(0).is_none());
     }
     #[test]
     fn draft_from_cfg_and_on() {

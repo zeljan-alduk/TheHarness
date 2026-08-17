@@ -72,6 +72,10 @@ under `target/`) are left alone.
   context, ~1.27× at 16k, and less KV memory, for a small quality cost; and **smaller tool outputs**
   (`[agent] max_tool_output_chars` 16000 → 8000) which roughly halves the context of a tool-heavy session
   (27k → 15k tokens) with no cache cost, since it caps each output at creation.
+  Other builds are opt-in in the `/localmodel` picker (or `/localmodel <id>`): **abliterated MLX** builds
+  (`abliterated-mxfp4`, `abliterated-6bit`) serve through the MLX server like the defaults, and an
+  **uncensored GGUF** (`heretic-gguf`, ~12.6GB IQ3_M — lighter on RAM) is served by `llama-server`
+  (llama.cpp, `brew install llama.cpp`). These have safety refusals removed — use responsibly.
 - **Claude Code (subscription)**: `provider = "claude-code"` or `/backend claude [model]` (default `claude-fable-5`).
   The harness runs the official `claude` CLI headlessly (`--print`, stream-json in/out) and exposes its own tools
   to it over an MCP bridge, so permissions, hooks, memory, redaction and the UI all still apply while your

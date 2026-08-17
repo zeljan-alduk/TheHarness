@@ -2489,6 +2489,16 @@ impl App {
                         Some(b) => self.start_model_download(b),
                         None => self.blocks.push(Block::Error("usage: /localmodel 4|6|8".into())),
                     },
+                    // Opt-in build by id (abliterated-mxfp4 | abliterated-6bit | heretic-gguf | …)
+                    _ if lm::by_name(a).map(|b| b.is_extra()).unwrap_or(false) => {
+                        let b = lm::by_name(a).unwrap();
+                        if b.is_gguf() && lm::llama_server_bin().is_none() {
+                            self.blocks.push(Block::Error(format!("{} is a GGUF served by llama-server (llama.cpp), which is not installed — `brew install llama.cpp`, then /localmodel {}", b.label, b.id)));
+                        } else {
+                            if b.is_extra() { self.blocks.push(Block::System(format!("⚠ {} is uncensored/abliterated — safety refusals removed. Your responsibility what you do with it.", b.label))); }
+                            self.start_model_download(b);
+                        }
+                    }
                     "resume" => match lm::by_name(&self.cfg.local_model.build) {
                         Some(b) => self.start_model_download(b),
                         None => self.blocks.push(Block::Error("nothing to resume — /localmodel picks a build".into())),
@@ -3144,7 +3154,8 @@ impl App {
                             ]));
                     } else {
                         self.cfg.llm.model = model.clone(); self.model = model.clone();
-                        self.blocks.push(Block::System(format!("local model ready: {} on {base_url} · {module}{}", model_label(&model), if vision { " (vision: images and video frames work)" } else { " (text-only — /localmodel vision restarts it with the vision tower)" })));
+                        let note = if module == "llama-server" { " (GGUF via llama.cpp)" } else if vision { " (vision: images and video frames work)" } else { " (text-only — /localmodel vision restarts it with the vision tower)" };
+                        self.blocks.push(Block::System(format!("local model ready: {} on {base_url} · {module}{note}", model_label(&model))));
                         tokio::spawn(fetch_ctx_len(base_url, model, self.tx.clone()));
                     }
                 }
@@ -3357,16 +3368,18 @@ impl App {
         let mut items: Vec<PickItem> = lm::BUILDS.iter().map(|b| {
             let gb = b.bytes / 1_000_000_000;
             let tight = ram > 0 && b.ram_gb() > ram;
+            let runtime = if b.is_gguf() { "llama-server (llama.cpp)" } else { "mlx_vlm.server" };
             PickItem {
-                label: format!("Qwen3.8-27B · {}-bit", b.bits),
+                label: b.label.to_string(),
                 desc: format!("{gb} GB download · {}{}", b.note, if tight { " · tight on this machine" } else { "" }),
                 detail: format!(
-                    "{}\n\nDownloads {gb} GB from Hugging Face into ~/.config/harness/models, in {} parallel segments per file, \
-                     resuming where it stopped if anything interrupts it. Wants about {} GB of RAM resident while serving{}.\n\n\
+                    "{}\n\nDownloads {} from Hugging Face into ~/.config/harness/models, resuming where it stopped if \
+                     interrupted. Served by {runtime}. Wants about {} GB of RAM resident{}.{}\n\n\
                      You keep working on Claude meanwhile; when it lands, the harness asks whether to switch.",
-                    b.repo, self.cfg.local_model.download_segments, b.ram_gb(),
-                    if ram > 0 { format!(" (this Mac has {ram} GB)") } else { String::new() }),
-                run: Some(format!("/localmodel {}", b.bits)),
+                    b.repo, if b.is_gguf() { format!("{gb} GB ({})", b.file) } else { format!("{gb} GB") }, b.ram_gb(),
+                    if ram > 0 { format!(" (this Mac has {ram} GB)") } else { String::new() },
+                    if b.is_extra() { "\n\n⚠ Uncensored / abliterated — safety refusals removed. Your responsibility what you do with it." } else { "" }),
+                run: Some(format!("/localmodel {}", b.id)),
             }
         }).collect();
         items.push(PickItem {
@@ -3543,28 +3556,33 @@ impl App {
     fn start_mlx_ex(&mut self, force: bool) {
         use harness::localmodel as lm;
         let Some(build) = lm::by_name(&self.cfg.local_model.build) else { self.set_status("no local build chosen — /localmodel"); return };
-        if lm::mlx_python().is_none() {
+        let gguf = build.is_gguf();
+        if !gguf && lm::mlx_python().is_none() {
             self.blocks.push(Block::Error("no MLX runtime in ~/.config/harness/runtime/mlx — re-run the installer (or NO_MLX=0 sh install.sh)".into()));
             return;
         }
-        let (tx, dir, port, kind) = (self.tx.clone(), build.dir(), self.cfg.local_model.port, self.cfg.local_model.server.clone());
+        if gguf && lm::llama_server_bin().is_none() {
+            self.blocks.push(Block::Error(format!("{} needs llama-server (llama.cpp), which is not installed — `brew install llama.cpp`, then /localmodel serve", build.label)));
+            return;
+        }
+        let (tx, port, kind) = (self.tx.clone(), self.cfg.local_model.port, self.cfg.local_model.server.clone());
         let opts = lm::ServeOpts::from_cfg(&self.cfg.local_model);
         let draft = opts.draft.clone();
         let kv = opts.kv_bits;
-        let first = lm::server_plan(&kind).first().copied().unwrap_or("mlx_lm.server");
-        self.set_status(format!("{} {first} on port {port}{}{}", if force { "restarting" } else { "starting" }, if draft.on() { format!(" · speculative draft {}", draft.model) } else { String::new() }, if kv == 8 || kv == 4 { format!(" · kv {kv}-bit") } else { String::new() }));
+        let server_name = if gguf { "llama-server".to_string() } else { lm::server_plan(&kind).first().copied().unwrap_or("mlx_lm.server").to_string() };
+        self.set_status(format!("{} {server_name} on port {port}{}{}", if force { "restarting" } else { "starting" }, if draft.on() && !gguf { format!(" · speculative draft {}", draft.model) } else { String::new() }, if (kv == 8 || kv == 4) && !gguf { format!(" · kv {kv}-bit") } else { String::new() }));
         tokio::spawn(async move {
-            // Keep it ready: a warm server of the right kind from an earlier session is reused as-is —
-            // no reload of 16–30GB of weights, the prefix cache survives. `force` skips this to restart.
+            // Keep it ready: a warm server of the right runtime from an earlier session is reused as-is —
+            // no reload of the weights, the prefix cache survives. `force` skips this to restart.
             if !force {
-                if let Some(model) = lm::running(port, &kind).await {
-                    let module = lm::server_kind(&format!("http://127.0.0.1:{port}/v1")).await.unwrap_or("mlx_vlm.server");
+                if let Some(model) = lm::running_build(&build, port, &kind).await {
+                    let module = lm::server_kind(&format!("http://127.0.0.1:{port}/v1")).await.unwrap_or(if gguf { "llama-server" } else { "mlx_vlm.server" });
                     let _ = tx.send(Msg::MlxUp(Ok((format!("http://127.0.0.1:{port}/v1"), model, module))));
                     return;
                 }
             }
             // The runtime may predate the vision server (an updated harness on an old venv): fetch it first.
-            if !matches!(kind.as_str(), "mlx-lm" | "mlx_lm" | "text") {
+            if !gguf && !matches!(kind.as_str(), "mlx-lm" | "mlx_lm" | "text") {
                 match lm::ensure_mlx_vlm().await {
                     Ok(Some(note)) => { let _ = tx.send(Msg::Notice(note)); }
                     Ok(None) => {}
@@ -3574,7 +3592,7 @@ impl App {
             // ours from an earlier session (or the other server kind) may still hold the port: replace it
             lm::stop_on_port(port).await;
             let _ = tx.send(Msg::Notice(format!("loading {} GB of weights — a moment", build.bytes / 1_000_000_000)));
-            let msg = match lm::serve_spec(&dir, port, &kind, &opts).await {
+            let msg = match lm::serve_build(&build, port, &kind, &opts).await {
                 Ok(s) => Msg::MlxUp(Ok((s.base_url.clone(), s.model.clone(), s.module))),
                 Err(e) => Msg::MlxUp(Err(format!("{e:#}"))),
             };
