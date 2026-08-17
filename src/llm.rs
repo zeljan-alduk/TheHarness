@@ -422,6 +422,12 @@ impl Client {
     }
 }
 
+static VISION: std::sync::OnceLock<Option<Client>> = std::sync::OnceLock::new();
+/// Register the vision model (`[llm.roles] vision`) so text-only main models can still "see" images:
+/// `view_image` and `screenshot` route the picture through it and hand back a description.
+pub fn set_vision_client(c: Option<Client>) { let _ = VISION.set(c); }
+pub fn vision_client() -> Option<Client> { VISION.get().cloned().flatten() }
+
 /// Detect the loaded context length of `model` from the server. Tries LM Studio (`/api/v0/models`),
 /// llama.cpp server (`/props`), Ollama (`/api/show`). Returns (tokens, source).
 pub async fn detect_context_length(base_url: &str, model: &str) -> Option<(u64, &'static str)> {

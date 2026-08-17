@@ -53,16 +53,38 @@ impl Tool for ViewImage {
     }
     async fn call(&self, args: Value, ctx: &ToolCtx) -> Result<ToolOutput> {
         let path = ctx.resolve(arg_str(&args, "path")?)?;
-        let mime = mime_for(&path).context("unsupported image type (use png/jpg/gif/webp)")?;
+        attach(&path).await
+    }
+}
+
+/// Read an image and turn it into a tool result the model can see (plus a vision-model description
+/// when one is configured). Used by `view_image` and by `screenshot`, which writes outside the workdir.
+pub async fn attach(path: &std::path::Path) -> Result<ToolOutput> {
+    {
+        let mime = mime_for(path).context("unsupported image type (use png/jpg/gif/webp)")?;
         let bytes = tokio::fs::read(&path).await.with_context(|| format!("reading {}", path.display()))?;
         const MAX: usize = 12 * 1024 * 1024;
         if bytes.len() > MAX { bail!("image is {} bytes; max {MAX}. Downscale it first (e.g. `sips -Z 1600 in.png --out small.png`).", bytes.len()); }
         let dims = dimensions(&bytes).map(|(w, h)| format!("{w}x{h}, ")).unwrap_or_default();
         let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
-        Ok(ToolOutput {
-            text: format!("attached {} ({dims}{} KB) — the image follows in the next message.", path.display(), bytes.len() / 1024),
-            images: vec![(mime.to_string(), b64)],
-        })
+        let mut text = format!("attached {} ({dims}{} KB) — the image follows in the next message.", path.display(), bytes.len() / 1024);
+        // text-only backends: a configured vision model describes the picture so the main model still gets it
+        if let Some(desc) = describe(mime, &b64).await { text.push_str(&format!("\n\n[vision model description]\n{desc}")); }
+        Ok(ToolOutput { text, images: vec![(mime.to_string(), b64)] })
+    }
+}
+
+/// Ask the configured vision model what is in the image ([llm.roles] vision). None when unset/failing.
+async fn describe(mime: &str, b64: &str) -> Option<String> {
+    let client = crate::llm::vision_client()?;
+    let parts = vec![
+        crate::llm::Content::text_part("Describe this image for another engineer who cannot see it: what it shows, the layout, and any text transcribed verbatim. Be concise but complete."),
+        crate::llm::Content::image_part(mime, b64),
+    ];
+    let msgs = vec![crate::llm::Message::system("You describe images precisely for a text-only agent."), crate::llm::Message::user_parts(parts)];
+    match client.chat(&msgs, &[]).await {
+        Ok((r, _)) => { let t = r.text().trim().to_string(); (!t.is_empty()).then_some(t) }
+        Err(e) => Some(format!("(vision model unavailable: {e:#})")),
     }
 }
 

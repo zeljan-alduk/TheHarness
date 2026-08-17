@@ -83,6 +83,8 @@ pub async fn prepare(setup: RunSetup) -> Result<Prepared> {
     if let Some(m) = perm_mode { pcfg.mode = m; }
     pcfg.allow.extend(crate::permissions::persisted_rules());
     let policy = Arc::new(Policy::new(pcfg, &workdir));
+    // a configured vision model lets text-only backends still look at images
+    crate::llm::set_vision_client(cfg.llm.roles.contains_key("vision").then(|| client.role("vision")));
     let mut env = SubAgentEnv::new(client.clone(), toolset.registry.clone(), policy.clone(), approver.clone(), sink.clone(), budget, true);
     env.cc_effort = cfg.llm.effort.clone();
     env.max_depth = cfg.agent.max_subagent_depth.max(1);

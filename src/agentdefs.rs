@@ -47,7 +47,19 @@ pub fn dirs(workdir: &Path) -> Vec<(PathBuf, &'static str)> {
     v
 }
 
+const BROWSER_AGENT: &str = "---\nname: browser\ndescription: Drives a real browser (chrome-devtools MCP) to open pages, click, type, read the DOM and take screenshots — use it for anything that has to be seen or clicked.\ntools: mcp__chrome-devtools__*, screenshot, view_image, web_fetch, read_file, bash, glob, grep\nmax-turns: 30\n---\nYou drive a real Chrome through the chrome-devtools MCP tools.\n\n- Start by listing pages / opening the URL you were given, then take a snapshot before acting: act on what is on screen, never on what you assume.\n- Prefer the accessibility snapshot (take_snapshot) for finding elements, and screenshots when the *look* matters.\n- After every action that changes the page, re-snapshot before the next one.\n- Report what you saw and did, with the URLs and the exact text of anything that mattered; attach a screenshot when the answer is visual.\n";
+
+/// Ship a `browser` agent the first time agents are looked up, so the chrome-devtools MCP server is
+/// actually reachable through `spawn_agent {subagent_type: "browser"}` without any setup.
+fn ensure_builtin_agents() {
+    let dir = crate::setup::config_dir().join("agents");
+    let f = dir.join("browser.md");
+    if f.exists() || dir.join(".no-builtins").exists() { return; }
+    if std::fs::create_dir_all(&dir).is_ok() { let _ = std::fs::write(&f, BROWSER_AGENT); }
+}
+
 pub fn discover(workdir: &Path) -> Vec<AgentDef> {
+    ensure_builtin_agents();
     let mut out: Vec<AgentDef> = Vec::new();
     for (dir, source) in dirs(workdir) {
         let Ok(rd) = std::fs::read_dir(&dir) else { continue };

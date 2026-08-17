@@ -21,6 +21,7 @@ pub mod repomap;
 pub mod run_code;
 pub mod run_workflow;
 pub mod schedule;
+pub mod screenshot;
 pub mod search;
 pub mod sessions;
 pub mod skill;
@@ -153,6 +154,7 @@ impl Registry {
             Arc::new(lsp::Lsp),
             Arc::new(notebook::NotebookEdit),
             Arc::new(image::ViewImage),
+            Arc::new(screenshot::Screenshot),
             Arc::new(memory::MemoryTool),
             Arc::new(skill::LoadSkill),
             Arc::new(archive::ReadPdf),

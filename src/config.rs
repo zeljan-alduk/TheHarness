@@ -199,6 +199,16 @@ pub struct NetConfig {
     pub max_fetch_bytes: usize,
     #[serde(default = "d_ua")]
     pub user_agent: String,
+    /// Search backend for web_search: "auto" (default — whichever key is present), brave, tavily,
+    /// exa, searxng, duckduckgo.
+    #[serde(default)]
+    pub search_provider: Option<String>,
+    /// API key for the chosen search provider (else BRAVE_API_KEY / TAVILY_API_KEY / EXA_API_KEY).
+    #[serde(default)]
+    pub search_api_key: Option<String>,
+    /// Base URL of a SearXNG instance (or $SEARXNG_URL).
+    #[serde(default)]
+    pub searxng_url: Option<String>,
     /// Network allow-list proxy for tools and shell commands ([net.proxy]).
     #[serde(default)]
     pub proxy: crate::proxy::ProxyConfig,
@@ -234,7 +244,7 @@ impl Default for EvalConfig {
 }
 impl Default for NetConfig {
     fn default() -> Self {
-        Self { enabled: true, timeout_secs: d_fetch_timeout(), max_fetch_bytes: d_fetch_bytes(), user_agent: d_ua(), proxy: Default::default(), download_segments: d_dl_segments(), download_timeout_secs: d_dl_timeout() }
+        Self { enabled: true, timeout_secs: d_fetch_timeout(), max_fetch_bytes: d_fetch_bytes(), user_agent: d_ua(), search_provider: None, search_api_key: None, searxng_url: None, proxy: Default::default(), download_segments: d_dl_segments(), download_timeout_secs: d_dl_timeout() }
     }
 }
 
@@ -381,6 +391,8 @@ impl Config {
             "agent.max_turns" => self.agent.max_turns = val.parse().context("bad number")?,
             "net.enabled" => self.net.enabled = b(val),
             "net.proxy.enabled" => self.net.proxy.enabled = b(val),
+            "net.search_provider" => self.net.search_provider = (!val.is_empty()).then(|| val.to_string()),
+            "net.searxng_url" => self.net.searxng_url = (!val.is_empty()).then(|| val.to_string()),
             "net.proxy.verbose" => self.net.proxy.verbose = b(val),
             "llm.base_url" => self.llm.base_url = val.into(),
             "llm.api_key" => self.llm.api_key = (!val.is_empty()).then(|| val.to_string()),
