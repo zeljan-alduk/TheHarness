@@ -238,6 +238,20 @@ pub async fn ensure_mlx_vlm() -> Result<Option<String>> {
     Ok(Some("installed mlx-vlm into the MLX runtime (the server with the vision tower, so images and video frames work)".into()))
 }
 
+/// Make sure llama-server (llama.cpp) is installed — needed to serve GGUF builds. Installs it with Homebrew
+/// when it is missing and brew is available (mirrors how the MLX runtime is set up), else returns an error
+/// with the manual command. Ok(None) = already there; Ok(Some(note)) = just installed.
+pub async fn ensure_llama_server() -> Result<Option<String>> {
+    if llama_server_bin().is_some() { return Ok(None); }
+    let brew = crate::setup::which("brew")
+        .or_else(|| ["/opt/homebrew/bin/brew", "/usr/local/bin/brew"].iter().map(PathBuf::from).find(|p| p.is_file()))
+        .context("llama-server (llama.cpp) is not installed and Homebrew was not found — install it yourself: `brew install llama.cpp`, or see https://github.com/ggml-org/llama.cpp")?;
+    let out = tokio::process::Command::new(&brew).args(["install", "llama.cpp"]).output().await.context("running brew install llama.cpp")?;
+    if !out.status.success() { bail!("`brew install llama.cpp` failed: {}", String::from_utf8_lossy(&out.stderr).lines().last().unwrap_or_default()); }
+    if llama_server_bin().is_none() { bail!("brew reported success but llama-server is still not on PATH — open a new shell, or run `brew install llama.cpp` yourself"); }
+    Ok(Some("installed llama.cpp (llama-server) with Homebrew — the runtime for GGUF models".into()))
+}
+
 /// Which server module a `[local_model] server` setting means, and whether a fallback is allowed.
 /// "auto" (default): mlx_vlm.server when the runtime has it, mlx_lm.server otherwise — and mlx_lm as the
 /// fallback if mlx_vlm refuses the build. "mlx-vlm" / "mlx-lm" pin one.

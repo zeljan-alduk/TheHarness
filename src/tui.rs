@@ -2492,12 +2492,11 @@ impl App {
                     // Opt-in build by id (abliterated-mxfp4 | abliterated-6bit | heretic-gguf | …)
                     _ if lm::by_name(a).map(|b| b.is_extra()).unwrap_or(false) => {
                         let b = lm::by_name(a).unwrap();
+                        self.blocks.push(Block::System(format!("⚠ {} is uncensored/abliterated — safety refusals removed. Your responsibility what you do with it.", b.label)));
                         if b.is_gguf() && lm::llama_server_bin().is_none() {
-                            self.blocks.push(Block::Error(format!("{} is a GGUF served by llama-server (llama.cpp), which is not installed — `brew install llama.cpp`, then /localmodel {}", b.label, b.id)));
-                        } else {
-                            if b.is_extra() { self.blocks.push(Block::System(format!("⚠ {} is uncensored/abliterated — safety refusals removed. Your responsibility what you do with it.", b.label))); }
-                            self.start_model_download(b);
+                            self.blocks.push(Block::System("this is a GGUF — the harness will install llama.cpp (llama-server) with Homebrew when it starts serving".into()));
                         }
+                        self.start_model_download(b);
                     }
                     "resume" => match lm::by_name(&self.cfg.local_model.build) {
                         Some(b) => self.start_model_download(b),
@@ -3121,7 +3120,8 @@ impl App {
                 match r {
                     Ok(dir) => {
                         self.dl = None;
-                        self.blocks.push(Block::System(format!("Qwen3.8-27B downloaded → {dir} · starting the MLX server")));
+                        let gguf = self.dl_build.map(|b| b.is_gguf()).unwrap_or(false);
+                        self.blocks.push(Block::System(format!("model downloaded → {dir} · starting {}", if gguf { "llama-server (installing llama.cpp if needed)" } else { "the MLX server" })));
                         self.start_mlx();
                     }
                     Err(e) => {
@@ -3561,10 +3561,6 @@ impl App {
             self.blocks.push(Block::Error("no MLX runtime in ~/.config/harness/runtime/mlx — re-run the installer (or NO_MLX=0 sh install.sh)".into()));
             return;
         }
-        if gguf && lm::llama_server_bin().is_none() {
-            self.blocks.push(Block::Error(format!("{} needs llama-server (llama.cpp), which is not installed — `brew install llama.cpp`, then /localmodel serve", build.label)));
-            return;
-        }
         let (tx, port, kind) = (self.tx.clone(), self.cfg.local_model.port, self.cfg.local_model.server.clone());
         let opts = lm::ServeOpts::from_cfg(&self.cfg.local_model);
         let draft = opts.draft.clone();
@@ -3579,6 +3575,14 @@ impl App {
                     let module = lm::server_kind(&format!("http://127.0.0.1:{port}/v1")).await.unwrap_or(if gguf { "llama-server" } else { "mlx_vlm.server" });
                     let _ = tx.send(Msg::MlxUp(Ok((format!("http://127.0.0.1:{port}/v1"), model, module))));
                     return;
+                }
+            }
+            // GGUF needs llama.cpp — the harness installs it with Homebrew when it is missing.
+            if gguf {
+                match lm::ensure_llama_server().await {
+                    Ok(Some(note)) => { let _ = tx.send(Msg::Notice(note)); }
+                    Ok(None) => {}
+                    Err(e) => { let _ = tx.send(Msg::MlxUp(Err(format!("{e:#}")))); return; }
                 }
             }
             // The runtime may predate the vision server (an updated harness on an old venv): fetch it first.
