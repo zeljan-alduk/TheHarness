@@ -18,7 +18,7 @@
 #
 # Nothing needs sudo; nothing is written outside $HOME. Knobs:
 #   DRY_RUN=1     print every step instead of doing it
-#   NO_KITTY=1  NO_MLX=1  NO_CLAUDE=1  NO_APP=1      skip that step
+#   NO_KITTY=1  NO_MLX=1  NO_CLAUDE=1  NO_APP=1  NO_TOOLS=1   skip that step
 #   WITH_OLLAMA=1                                    also install Ollama (GGUF models, ~150MB)
 #   PREFIX=~/.local                                  where bin/ and kitty.app go
 set -eu
@@ -73,20 +73,36 @@ else
 fi
 
 # ── kitty ─────────────────────────────────────────────────────────────────────
+# Where kitty lands depends on the platform: the vendor installer ships a .dmg on macOS and copies the
+# bundle into /Applications (~/Applications without admin rights), while the Linux path is
+# ~/.local/kitty.app. So look everywhere rather than assume — guessing one path is what broke this before.
+find_kitty() {
+    for k in "$(command -v kitty 2>/dev/null || true)" \
+             /Applications/kitty.app/Contents/MacOS/kitty \
+             "$HOME/Applications/kitty.app/Contents/MacOS/kitty" \
+             "$HOME/.local/kitty.app/Contents/MacOS/kitty"; do
+        [ -n "$k" ] && [ -x "$k" ] && { printf '%s\n' "$k"; return 0; }
+    done
+    return 1
+}
 say "Installing kitty"
-KITTY=""
-for k in "$(command -v kitty 2>/dev/null || true)" "$HOME/.local/kitty.app/Contents/MacOS/kitty" /Applications/kitty.app/Contents/MacOS/kitty; do
-    [ -n "$k" ] && [ -x "$k" ] && { KITTY=$k; break; }
-done
+KITTY=$(find_kitty || true)
 if [ -n "$KITTY" ]; then skip "already installed ($KITTY)"
 elif [ "${NO_KITTY:-0}" = 1 ]; then skip "skipped (NO_KITTY=1)"
 else
     runsh 'curl -fsSL https://sw.kovidgoyal.net/kitty/installer.sh | sh /dev/stdin launch=n'
-    KITTY="$HOME/.local/kitty.app/Contents/MacOS/kitty"
-    [ "$DRY_RUN" = 1 ] || [ -x "$KITTY" ] || die "kitty install failed"
-    run ln -sf "$KITTY" "$BIN/kitty"
-    run ln -sf "$HOME/.local/kitty.app/Contents/MacOS/kitten" "$BIN/kitten"
-    ok "kitty → $KITTY"
+    KITTY=$(find_kitty || true)
+    if [ "$DRY_RUN" = 1 ]; then KITTY=/Applications/kitty.app/Contents/MacOS/kitty; fi
+    if [ -z "$KITTY" ]; then
+        # Not fatal: everything else still installs, and the TUI runs in any terminal — just without
+        # inline images, the graphics protocol and font control.
+        warn "kitty was not found after installing; install it yourself (https://sw.kovidgoyal.net/kitty/binary/) — the rest of this still works"
+    else
+        run ln -sf "$KITTY" "$BIN/kitty"
+        KITTEN="${KITTY%/kitty}/kitten"
+        [ "$DRY_RUN" = 1 ] || [ ! -x "$KITTEN" ] || ln -sf "$KITTEN" "$BIN/kitten"
+        ok "kitty → $KITTY"
+    fi
 fi
 # The TUI changes the font size (ctrl+= / ctrl+-) over kitty's remote control; off by default in kitty.
 KCONF="$HOME/.config/kitty/kitty.conf"
@@ -135,6 +151,53 @@ elif [ "${NO_CLAUDE:-0}" = 1 ]; then skip "skipped (NO_CLAUDE=1)"
 else
     runsh 'curl -fsSL https://claude.ai/install.sh | bash'
     ok "claude installed — it asks you to log in the first time it runs"
+fi
+
+# ── a toolchain to build with, and the harness's own source ────────────────────
+# The harness improves *itself*: `harness self` / `/improve` edits its source on a branch, runs
+# `cargo build --release` and `cargo test`, and only keeps the change if the evals agree. That needs a
+# Rust toolchain, a linker (Xcode command line tools) and a checkout — so a standalone install has all
+# three. Everything else in the harness works without them.
+say "Installing the Rust toolchain"
+if [ "${NO_RUST:-0}" = 1 ]; then skip "skipped (NO_RUST=1)"
+elif command -v cargo >/dev/null; then skip "already installed ($(cargo --version 2>/dev/null | cut -d' ' -f1-2))"
+else
+    runsh "curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs | sh -s -- -y --no-modify-path --default-toolchain stable --profile minimal"
+    run ln -sf "$HOME/.cargo/bin/cargo" "$BIN/cargo"
+    run ln -sf "$HOME/.cargo/bin/rustc" "$BIN/rustc"
+    ok "rustup + stable toolchain → ~/.cargo (linked into $BIN)"
+fi
+if [ "${NO_RUST:-0}" != 1 ] && ! xcode-select -p >/dev/null 2>&1; then
+    warn "no Xcode command line tools — cargo cannot link without them"
+    run xcode-select --install
+    warn "finish the Apple dialog that just opened, then re-run this installer"
+fi
+
+say "Cloning the harness source (for self-improvement)"
+SRC="$HOME_DIR/source"
+if [ "${NO_SOURCE:-0}" = 1 ]; then skip "skipped (NO_SOURCE=1)"
+elif [ -d "$SRC/.git" ]; then
+    run git -C "$SRC" pull --ff-only -q
+    ok "updated $SRC"
+elif command -v git >/dev/null; then
+    run git clone -q "https://github.com/$REPO" "$SRC"
+    ok "source → $SRC (found automatically by \`harness self\` and /improve)"
+else
+    warn "no git, so the source was not cloned; /improve will not work until you clone it to $SRC"
+fi
+
+# ── the tools the agent shells out to ─────────────────────────────────────────
+# The harness's own tools call out to ~20 CLIs (rg, fd, jq, ffmpeg, poppler, macmon, gh, uv, LSP
+# servers…). `harness setup` audits them and links what it finds into ~/.config/harness/bin; with
+# --install it fills the gaps through Homebrew. Everything works without them, with fewer abilities.
+say "Setting up the tools the agent uses"
+if [ "${NO_TOOLS:-0}" = 1 ]; then skip "skipped (NO_TOOLS=1)"
+elif [ "$DRY_RUN" = 1 ]; then printf '%s\n' "  ${D}would run:${N} $BIN/harness setup --install --mcp-defaults"
+elif command -v brew >/dev/null; then
+    "$BIN/harness" setup --install --mcp-defaults 2>&1 | tail -3 || warn "some tools could not be installed — \`harness setup\` shows what is missing"
+else
+    "$BIN/harness" setup --mcp-defaults 2>&1 | tail -2 || true
+    warn "no Homebrew, so optional tools were only audited. Install brew (https://brew.sh) then: harness setup --install"
 fi
 
 # ── config ────────────────────────────────────────────────────────────────────

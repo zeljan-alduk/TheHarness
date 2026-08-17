@@ -27,6 +27,47 @@ pub fn claude_bin() -> Option<PathBuf> {
     crate::setup::which("claude").or_else(|| { let p = crate::setup::home_dir().join(".local/bin/claude"); p.is_file().then_some(p) })
 }
 
+/// Whether this backend can actually run a turn. "Installed" and "logged in" are different questions —
+/// the CLI keeps its credentials in the macOS keychain, so the only honest check is to ask it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Auth {
+    /// No `claude` on the machine.
+    Missing,
+    /// Installed, nobody signed in (or the session expired).
+    LoggedOut,
+    Ready { email: Option<String>, plan: Option<String> },
+}
+
+impl Auth {
+    pub fn ready(&self) -> bool { matches!(self, Auth::Ready { .. }) }
+    /// "aldo@aldo.tech · max", for a one-line report.
+    pub fn who(&self) -> String {
+        match self {
+            Auth::Ready { email, plan } => [email.clone(), plan.clone()].into_iter().flatten().collect::<Vec<_>>().join(" · "),
+            Auth::LoggedOut => "not signed in".into(),
+            Auth::Missing => "not installed".into(),
+        }
+    }
+}
+
+/// The command that signs a user in — offered rather than run behind their back.
+pub const LOGIN_COMMAND: &str = "claude auth login";
+
+/// Ask the CLI who is signed in (`claude auth status`, ~0.2s, JSON on stdout).
+pub async fn auth() -> Auth {
+    let Some(bin) = claude_bin() else { return Auth::Missing };
+    let out = match tokio::time::timeout(std::time::Duration::from_secs(10), tokio::process::Command::new(bin).args(["auth", "status"]).output()).await {
+        Ok(Ok(o)) => o,
+        _ => return Auth::LoggedOut,          // cannot ask ⇒ cannot use it
+    };
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap_or(Value::Null);
+    if v.get("loggedIn").and_then(|b| b.as_bool()) != Some(true) { return Auth::LoggedOut; }
+    Auth::Ready {
+        email: v.get("email").and_then(|e| e.as_str()).map(String::from),
+        plan: v.get("subscriptionType").and_then(|s| s.as_str()).map(String::from),
+    }
+}
+
 impl ClaudeCodeSession {
     /// Start `claude` with our tools bridged in. `system` is our full system prompt.
     pub async fn start(workdir: &Path, model: Option<&str>, system: &str, host: Arc<crate::mcp_bridge::BridgeHost>, resume: Option<&str>) -> Result<Arc<Self>> {

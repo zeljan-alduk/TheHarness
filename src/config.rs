@@ -33,6 +33,33 @@ pub struct Config {
     /// Smart self-improvement loop (`harness improve`, `/improve`).
     #[serde(default, rename = "self")]
     pub selfimprove: SelfConfig,
+    #[serde(default)]
+    pub local_model: LocalModelConfig,
+}
+
+/// The model the harness downloads and serves itself: Qwen3.8-27B on MLX, under `~/.config/harness`.
+/// Written by the first-run flow; edit it to change quant, port or runtime.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct LocalModelConfig {
+    /// Which build is in use — "Qwen3.8-27B-MLX-4bit" (4, 6 or 8 bit). Empty = none chosen yet, which is
+    /// what makes the first run offer the picker.
+    #[serde(default)] pub build: String,
+    /// Loopback port for the MLX server the harness starts.
+    #[serde(default = "d_mlx_port")] pub port: u16,
+    /// "mlx-lm" (default, text) or "mlx-vlm" (adds the vision tower; refuses some builds).
+    #[serde(default = "d_mlx_server")] pub server: String,
+    /// Start the MLX server when the TUI starts and the weights are complete.
+    #[serde(default = "d_true")] pub autostart: bool,
+    /// Parallel range segments per file while downloading the weights.
+    #[serde(default = "d_segments")] pub download_segments: usize,
+    /// Offer the download/backend dialog when there is no local model yet.
+    #[serde(default = "d_true")] pub first_run_prompt: bool,
+}
+fn d_mlx_port() -> u16 { 8890 }
+fn d_mlx_server() -> String { "mlx-lm".into() }
+fn d_segments() -> usize { 8 }
+impl Default for LocalModelConfig {
+    fn default() -> Self { Self { build: String::new(), port: d_mlx_port(), server: d_mlx_server(), autostart: true, download_segments: d_segments(), first_run_prompt: true } }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -400,6 +427,11 @@ impl Config {
             "ui.sound" => self.ui.sound = b(val),
             "ui.font_size" => self.ui.font_size = val.parse().context("bad size")?,
             "ui.prefer_kitty" => self.ui.prefer_kitty = b(val),
+            "local_model.build" => self.local_model.build = val.into(),
+            "local_model.port" => self.local_model.port = val.parse().context("bad port")?,
+            "local_model.server" => self.local_model.server = val.into(),
+            "local_model.autostart" => self.local_model.autostart = b(val),
+            "local_model.first_run_prompt" => self.local_model.first_run_prompt = b(val),
             "permissions.mode" => self.permissions.mode = crate::permissions::Mode::parse(val).context("bad mode")?,
             "llm.compact_at_fraction" => self.llm.compact_at_fraction = val.parse().context("bad fraction")?,
             "llm.effort" => self.llm.effort = if val.is_empty() || val == "default" { None } else { Some(val.into()) },

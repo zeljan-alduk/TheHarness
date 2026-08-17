@@ -164,7 +164,17 @@ fn builtin_pal() -> Pal {
 const SPINNER: [&str; 10] = ["✻", "✼", "✽", "✾", "✿", "❀", "✿", "✾", "✽", "✼"];
 const WORDS: [&str; 12] = ["Thinking", "Pondering", "Working", "Reasoning", "Cooking", "Tinkering", "Brewing", "Mulling", "Crunching", "Percolating", "Noodling", "Computing"];
 
-enum Msg { Toast(String), Title(String), Question(harness::permissions::Question, tokio::sync::oneshot::Sender<harness::permissions::Answer>), SubEnv(Arc<harness::agent::SubAgentEnv>), Policy(Arc<harness::permissions::Policy>), CcSession(Arc<harness::claude_code::ClaudeCodeSession>), CcSid(String), Block(Block), Ask(harness::permissions::ApprovalRequest, tokio::sync::oneshot::Sender<harness::permissions::Approval>), Ev(Event), Done(Result<(String, harness::agent::RunStats), String>), Sys(SysSample), CtxLen(u64), Pasted(Result<PathBuf, String>), Frames(Result<Extracted, String>), Toolset(Arc<Toolset>), Catalog(Result<harness::plugins::Catalog, String>), Notice(String), Improve(harness::selfimprove::Stage), GoalCheck(bool, String), Review(String), AcpSession(Arc<harness::acp_client::AcpSession>), RunTask(String), QueueTask(String), StatusLine(String), Dictated(String) }
+enum Msg { Toast(String), Title(String), Question(harness::permissions::Question, tokio::sync::oneshot::Sender<harness::permissions::Answer>), SubEnv(Arc<harness::agent::SubAgentEnv>), Policy(Arc<harness::permissions::Policy>), CcSession(Arc<harness::claude_code::ClaudeCodeSession>), CcSid(String), Block(Block), Ask(harness::permissions::ApprovalRequest, tokio::sync::oneshot::Sender<harness::permissions::Approval>), Ev(Event), Done(Result<(String, harness::agent::RunStats), String>), Sys(SysSample), CtxLen(u64), Pasted(Result<PathBuf, String>), Frames(Result<Extracted, String>), Toolset(Arc<Toolset>), Catalog(Result<harness::plugins::Catalog, String>), Notice(String), Improve(harness::selfimprove::Stage), GoalCheck(bool, String), Review(String), AcpSession(Arc<harness::acp_client::AcpSession>), RunTask(String), QueueTask(String), StatusLine(String), Dictated(String),
+    /// First-run model bootstrap: is a local server already answering?
+    LocalProbe(bool),
+    /// Weights coming down: aggregate progress across the repo's files.
+    ModelDl(harness::localmodel::Progress),
+    /// The download finished (Ok) or gave up (Err) — a partial download is resumable, not lost.
+    ModelDlDone(Result<String, String>),
+    /// The MLX server answered on this base_url with this model id, or failed to come up.
+    MlxUp(Result<(String, String), String>),
+    /// Whether the Claude Code CLI can run a turn (installed + signed in).
+    ClaudeAuth(harness::claude_code::Auth) }
 
 /// One hunk of the working-tree diff, as `/review-diff` shows it.
 #[derive(Clone, Debug)]
@@ -693,6 +703,13 @@ struct App {
     // geometry from the last draw, for mouse hit-testing
     tr_rect: Rect, panel_rect: Rect, tr_start: usize,
     line_map: Vec<(usize, usize, usize)>, // (first line, last line exclusive, block index)
+    /// First-run model bootstrap: live download progress, which build it is, and the MLX server we own.
+    dl: Option<harness::localmodel::Progress>,
+    dl_build: Option<&'static harness::localmodel::Build>,
+    dl_cancel: Option<tokio::task::JoinHandle<()>>,
+    /// A command that needs the terminal to itself (the Claude sign-in): the loop suspends the UI,
+    /// runs it, and comes back — the same trick as ctrl+g's $EDITOR.
+    run_external: Option<String>,
 }
 
 pub async fn run(cfg: Config, resume: Option<String>) -> Result<()> {
@@ -710,7 +727,7 @@ pub async fn run(cfg: Config, resume: Option<String>) -> Result<()> {
         quit: false, restart: false, improve: None, improve_cancel: Default::default(), restart_at: None, tick: 0, word: 0, models: vec![],
         metrics: Metrics::new(0), panel: None, attachments: vec![], tool_previews: Default::default(),
         picker, images: Default::default(), img_seq: 0,
-        think_scroll: 0, toolset: None, perm_mode: harness::permissions::Mode::Auto, vim: false, vim_normal: false, keymap: Keymap::load(), sel_anchor: None, sel_cur: None, sel_dragging: false, visible_text: vec![], toast: None, tool_view: "summary".into(), tool_groups_open: Default::default(), settings_open: false, settings_cursor: 0, sessions_pick: None, pick: None, title_shown: None, banner_step: 0, live_policy: None, cc_rate: None, extra_roots: vec![], wt_cwd: harness::worktree::new_cell(), cc: None, cc_last_session: None, compact_progress: None, session_meta: harness::sessions::Meta::default(), todos: Default::default(), inbox: Default::default(), event_log: None, pending_ask: None, pending_q: None, subenv: None, attached: None, video: None, strip_rects: vec![], tr_rect: Rect::default(), panel_rect: Rect::default(), tr_start: 0, line_map: vec![],
+        think_scroll: 0, toolset: None, perm_mode: harness::permissions::Mode::Auto, vim: false, vim_normal: false, keymap: Keymap::load(), sel_anchor: None, sel_cur: None, sel_dragging: false, visible_text: vec![], toast: None, tool_view: "summary".into(), tool_groups_open: Default::default(), settings_open: false, settings_cursor: 0, sessions_pick: None, pick: None, title_shown: None, banner_step: 0, live_policy: None, cc_rate: None, extra_roots: vec![], wt_cwd: harness::worktree::new_cell(), cc: None, cc_last_session: None, compact_progress: None, session_meta: harness::sessions::Meta::default(), todos: Default::default(), inbox: Default::default(), event_log: None, pending_ask: None, pending_q: None, subenv: None, attached: None, video: None, strip_rects: vec![], tr_rect: Rect::default(), panel_rect: Rect::default(), tr_start: 0, line_map: vec![], dl: None, dl_build: None, dl_cancel: None, run_external: None,
     };
     app.metrics.ctx_len = app.cfg.llm.context_budget_tokens.unwrap_or(0);
     app.perm_mode = app.cfg.permissions.mode;
@@ -748,6 +765,17 @@ pub async fn run(cfg: Config, resume: Option<String>) -> Result<()> {
     // the input stream is still ours to read (see kitty_remote_control_ok).
     if std::env::var_os("KITTY_WINDOW_ID").is_some() && !kitty_remote_control_ok() { app.blocks.push(Block::System("kitty: remote control is off, so ctrl+= / ctrl+- cannot change the font size — add `allow_remote_control yes` to kitty.conf".into())); }
     if app.cfg.ui.font_size > 0 { let sz = app.cfg.ui.font_size; tokio::spawn(async move { let _ = set_terminal_font_size(sz).await; }); }
+    // First run has no model: ask the local endpoint before offering to download one (see on_local_probe).
+    if app.cfg.llm.provider.is_none() && app.cfg.local_model.first_run_prompt {
+        let (tx2, base) = (tx.clone(), app.cfg.llm.base_url.clone());
+        tokio::spawn(async move {
+            let up = harness::localmodel::reachable(&base).await;
+            // the picker warns when a build wants more RAM than the machine has, and that number comes
+            // from the first sampler tick — wait for it rather than print advice without it
+            tokio::time::sleep(Duration::from_millis(1200)).await;
+            let _ = tx2.send(Msg::LocalProbe(up));
+        });
+    }
     let mut events = EventStream::new();
     let mut ticker = tokio::time::interval(Duration::from_millis(80));
     let res: Result<()> = async {
@@ -783,6 +811,21 @@ pub async fn run(cfg: Config, resume: Option<String>) -> Result<()> {
                 match edited {
                     Ok(t) => { app.input = t; app.cursor = app.input.chars().count(); app.set_status("prompt edited in $EDITOR"); }
                     Err(e) => app.set_status(format!("editor: {e:#}")),
+                }
+            }
+            // A command that wants the raw terminal (claude auth login): step out of the UI, run it, return.
+            if let Some(cmd) = app.run_external.take() {
+                let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableMouseCapture, crossterm::event::DisableBracketedPaste);
+                ratatui::restore();
+                println!("\n· {cmd}\n");
+                let status = tokio::task::block_in_place(|| std::process::Command::new("sh").arg("-c").arg(&cmd).status());
+                terminal = ratatui::init();
+                let _ = crossterm::execute!(std::io::stdout(), crossterm::event::EnableBracketedPaste, crossterm::event::EnableMouseCapture);
+                let _ = terminal.clear();
+                match status {
+                    Ok(st) if st.success() => { app.set_status("checking Claude again"); let tx2 = app.tx.clone(); tokio::spawn(async move { let _ = tx2.send(Msg::ClaudeAuth(harness::claude_code::auth().await)); }); }
+                    Ok(st) => app.blocks.push(Block::Error(format!("`{cmd}` exited with {st} — the harness will use Qwen3.8 once it has downloaded"))),
+                    Err(e) => app.blocks.push(Block::Error(format!("could not run `{cmd}`: {e}"))),
                 }
             }
             if app.quit { break; }
@@ -2352,6 +2395,77 @@ impl App {
                     if self.running.is_none() { self.start_run(format!("Work until this is true: {a}\n\nStart now and keep going until it holds; verify it yourself before claiming success.")); }
                 }
             }
+            "/localmodel" | "/qwen" => {
+                use harness::localmodel::{self as lm, ModelState};
+                let a = arg.trim();
+                match a {
+                    "" => {
+                        if let Some(p) = &self.dl { let line = p.line(); let pct = p.percent(); self.blocks.push(Block::System(format!("downloading {} — {pct:.1}% · {line} · /localmodel cancel stops it (resumable)", self.dl_build.map(|b| b.name()).unwrap_or("model")))); }
+                        else { self.pick = Some(self.model_picker()); }
+                    }
+                    "4" | "6" | "8" => match lm::by_bits(a.parse().unwrap_or(0)) {
+                        Some(b) => self.start_model_download(b),
+                        None => self.blocks.push(Block::Error("usage: /localmodel 4|6|8".into())),
+                    },
+                    "resume" => match lm::by_name(&self.cfg.local_model.build) {
+                        Some(b) => self.start_model_download(b),
+                        None => self.blocks.push(Block::Error("nothing to resume — /localmodel picks a build".into())),
+                    },
+                    "serve" | "start" => self.start_mlx(),
+                    "cancel" | "stop" => {
+                        match self.dl_cancel.take() {
+                            Some(h) => { h.abort(); self.dl = None; self.blocks.push(Block::System("download stopped — the bytes already on disk stay, /localmodel resume continues from there".into())); }
+                            None => self.set_status("no download running"),
+                        }
+                    }
+                    "status" => {
+                        let mut lines = vec![format!("runtime: {}", lm::mlx_python().map(|p| p.display().to_string()).unwrap_or("missing — re-run the installer".into()))];
+                        for b in lm::BUILDS {
+                            let s = match lm::state_of(b) {
+                                ModelState::Ready { bytes } => format!("complete ({})", harness::tools::download::human(bytes)),
+                                ModelState::Partial { bytes } => format!("partial ({} of {}) — /localmodel resume", harness::tools::download::human(bytes), harness::tools::download::human(b.bytes)),
+                                ModelState::Missing => "not downloaded".into(),
+                            };
+                            lines.push(format!("  {}-bit  {s}{}", b.bits, if self.cfg.local_model.build == b.name() { "  ← selected" } else { "" }));
+                        }
+                        lines.push(format!("server: {} on 127.0.0.1:{}", self.cfg.local_model.server, self.cfg.local_model.port));
+                        self.blocks.push(Block::Banner(lines));
+                    }
+                    _ => self.blocks.push(Block::Error("usage: /localmodel [4|6|8|resume|serve|cancel|status]".into())),
+                }
+            }
+            "/delegate" => {
+                // Claude orchestrates, the local model does the delegated work: [llm.roles] subagent.
+                let on = matches!(arg.trim(), "" | "on" | "local" | "qwen");
+                if arg.trim() == "off" || arg.trim() == "none" {
+                    self.cfg.llm.roles.remove("subagent");
+                    self.blocks.push(Block::System("delegation off — sub-agents run on the main model again".into()));
+                } else if on {
+                    let Some(build) = harness::localmodel::by_name(&self.cfg.local_model.build) else {
+                        self.blocks.push(Block::Error("nothing to delegate to yet — /localmodel downloads a local model first".into()));
+                        return;
+                    };
+                    if !matches!(harness::localmodel::state_of(build), harness::localmodel::ModelState::Ready { .. }) {
+                        self.blocks.push(Block::Error(format!("{} is not fully downloaded yet — /localmodel status", build.name())));
+                        return;
+                    }
+                    let model = build.dir().display().to_string();
+                    let base = format!("http://127.0.0.1:{}/v1", self.cfg.local_model.port);
+                    self.cfg.llm.roles.insert("subagent".into(), harness::config::RoleConfig::Full { model: Some(model.clone()), base_url: Some(base.clone()), api_key: None, temperature: None });
+                    self.blocks.push(Block::Banner(vec![
+                        "delegation on — every sub-agent runs on the local model".into(),
+                        format!("  orchestrator: {} · delegate: {} on {}", self.model, build.name(), base),
+                        "  spawn_agent / the team tool now cost nothing but electricity; /delegate off reverts".into(),
+                        "  permanent: put [llm.roles] subagent = { model = \"…\", base_url = \"…\" } in harness.toml".into(),
+                    ]));
+                } else { self.blocks.push(Block::Error("usage: /delegate [on|off]".into())); }
+            }
+            "/claude-login" => {
+                let install = arg.trim() == "install";
+                self.run_external = Some(if install {
+                    "curl -fsSL https://claude.ai/install.sh | bash && claude auth login".into()
+                } else { harness::claude_code::LOGIN_COMMAND.to_string() });
+            }
             "/effort" => {
                 let lvl = arg.trim().to_lowercase();
                 if lvl.is_empty() { self.blocks.push(Block::System(format!("effort: {} (Claude Code backend) — /effort low|medium|high|xhigh|max", self.cfg.llm.effort.clone().unwrap_or("medium (default)".into())))); }
@@ -2822,6 +2936,47 @@ impl App {
             Msg::QueueTask(t) => { self.queued.push(t); self.set_status(format!("queued ({} waiting)", self.queued.len())); }
             Msg::AcpSession(s) => self.acp = Some(s),
             Msg::StatusLine(t) => self.statusline = (!t.trim().is_empty()).then(|| t.trim().to_string()),
+            Msg::LocalProbe(up) => self.on_local_probe(up),
+            Msg::ClaudeAuth(a) => self.on_claude_auth(a),
+            Msg::ModelDl(p) => self.dl = Some(p),
+            Msg::ModelDlDone(r) => {
+                self.dl_cancel = None;
+                match r {
+                    Ok(dir) => {
+                        self.dl = None;
+                        self.blocks.push(Block::System(format!("Qwen3.8-27B downloaded → {dir} · starting the MLX server")));
+                        self.start_mlx();
+                    }
+                    Err(e) => {
+                        // The bytes on disk are kept: /localmodel resumes from exactly here.
+                        self.blocks.push(Block::Error(format!("model download stopped: {e}\nnothing is lost — /localmodel resumes it")));
+                        self.dl = None;
+                    }
+                }
+            }
+            Msg::MlxUp(r) => match r {
+                Ok((base_url, model)) => {
+                    let claude = self.cfg.llm.provider.as_deref() == Some("claude-code");
+                    self.cfg.llm.base_url = base_url.clone();
+                    let _ = harness::config::Config::save_setting("llm.base_url", &base_url);
+                    if claude {
+                        // Working on Claude already: this is the moment to ask, not to switch under them.
+                        self.pick = Some(ListPicker::new(
+                            "Qwen3.8-27B is ready",
+                            "enter chooses · esc keeps things as they are",
+                            vec![
+                                PickItem { label: "Switch to the local model".into(), desc: format!("{model} on {base_url}"), detail: "Everything runs locally from now on: no subscription usage, no network. Claude stays one /backend claude away.".into(), run: Some(format!("/backend local {model}")) },
+                                PickItem { label: "Keep Claude, delegate to Qwen3.8".into(), desc: "Claude orchestrates · the local model does the work".into(), detail: "Claude plans and drives the session while every sub-agent (spawn_agent, /agents) runs on the local model. Cheap parallel work, Claude's judgement on top.".into(), run: Some("/delegate on".into()) },
+                                PickItem { label: "Stay on Claude for now".into(), desc: "the local model is there when you want it".into(), detail: "Nothing changes. /backend local switches whenever you like; the MLX server keeps running.".into(), run: None },
+                            ]));
+                    } else {
+                        self.cfg.llm.model = model.clone(); self.model = model.clone();
+                        self.blocks.push(Block::System(format!("local model ready: {model} on {base_url}")));
+                        tokio::spawn(fetch_ctx_len(base_url, model, self.tx.clone()));
+                    }
+                }
+                Err(e) => self.blocks.push(Block::Error(format!("MLX server: {e}"))),
+            },
             Msg::GoalCheck(met, reason) => {
                 let Some(goal) = self.goal.clone() else { return };
                 if met {
@@ -2948,6 +3103,161 @@ impl App {
             Event::Permission { tool, summary, decision } => { if decision.starts_with("denied") { self.blocks.push(Block::Error(format!("🔒 {tool}({}) {decision}", truncate(&summary, 80)))); } }
         }
     }
+    // ───────────────────────── first run: getting a model at all ─────────────────────────
+
+    /// Nothing is serving locally. Decide between "the weights are here, start the server", "a download
+    /// was interrupted, offer to resume" and "there is no model yet, offer the three builds".
+    fn on_local_probe(&mut self, up: bool) {
+        use harness::localmodel::{self as lm, ModelState};
+        if up { return; }
+        let chosen = lm::by_name(&self.cfg.local_model.build);
+        if let Some(b) = chosen {
+            match lm::state_of(b) {
+                ModelState::Ready { .. } => {
+                    if self.cfg.local_model.autostart { self.blocks.push(Block::System(format!("{} is on disk · starting the MLX server", b.name()))); self.start_mlx(); }
+                    return;
+                }
+                ModelState::Partial { bytes } => {
+                    self.blocks.push(Block::System(format!("{} is {} of the way down — /localmodel resumes it (nothing re-downloads)",
+                        b.name(), harness::tools::download::human(bytes))));
+                    return;
+                }
+                ModelState::Missing => {}
+            }
+        }
+        self.pick = Some(self.model_picker());
+    }
+
+    /// The three Qwen3.8-27B MLX builds, plus the ways to work without one.
+    fn model_picker(&self) -> ListPicker {
+        use harness::localmodel as lm;
+        let ram = self.metrics.last.mem_total / 1_000_000_000;   // 0 until the first sampler tick
+        let mut items: Vec<PickItem> = lm::BUILDS.iter().map(|b| {
+            let gb = b.bytes / 1_000_000_000;
+            let tight = ram > 0 && b.ram_gb() > ram;
+            PickItem {
+                label: format!("Qwen3.8-27B · {}-bit", b.bits),
+                desc: format!("{gb} GB download · {}{}", b.note, if tight { " · tight on this machine" } else { "" }),
+                detail: format!(
+                    "{}\n\nDownloads {gb} GB from Hugging Face into ~/.config/harness/models, in {} parallel segments per file, \
+                     resuming where it stopped if anything interrupts it. Wants about {} GB of RAM resident while serving{}.\n\n\
+                     You keep working on Claude meanwhile; when it lands, the harness asks whether to switch.",
+                    b.repo, self.cfg.local_model.download_segments, b.ram_gb(),
+                    if ram > 0 { format!(" (this Mac has {ram} GB)") } else { String::new() }),
+                run: Some(format!("/localmodel {}", b.bits)),
+            }
+        }).collect();
+        items.push(PickItem {
+            label: "Not now".into(),
+            desc: "no local model · point the harness at any OpenAI-compatible server".into(),
+            detail: "Nothing is downloaded. Set [llm] base_url/model in ~/.config/harness/harness.toml to use LM Studio, \
+                     llama-server or a hosted API, or run /localmodel later to pick a build.".into(),
+            run: None,
+        });
+        ListPicker::new("No local model yet — pick one to download", "enter downloads · esc decides later", items)
+    }
+
+    /// Start the segmented, resumable download of `build` and, if possible, put the user on Claude while
+    /// it runs. This is the only place that begins a download.
+    fn start_model_download(&mut self, build: &'static harness::localmodel::Build) {
+        if self.dl_cancel.is_some() { self.set_status("a model download is already running — /localmodel cancel stops it"); return; }
+        self.cfg.local_model.build = build.name().to_string();
+        let _ = harness::config::Config::save_setting("local_model.build", build.name());
+        self.dl_build = Some(build);
+        self.dl = Some(harness::localmodel::Progress { total: build.bytes, ..Default::default() });
+        self.blocks.push(Block::System(format!("downloading {} ({} GB) in {} segments per file — progress in the panel (⌃P); it resumes if interrupted",
+            build.repo, build.bytes / 1_000_000_000, self.cfg.local_model.download_segments)));
+
+        let (tx, segments) = (self.tx.clone(), self.cfg.local_model.download_segments);
+        let progress_tx = tx.clone();
+        self.dl_cancel = Some(tokio::spawn(async move {
+            let on_progress = std::sync::Arc::new(move |p: harness::localmodel::Progress| { let _ = progress_tx.send(Msg::ModelDl(p)); });
+            let r = harness::localmodel::fetch(build, segments, on_progress).await;
+            let _ = tx.send(Msg::ModelDlDone(r.map(|d| d.display().to_string()).map_err(|e| format!("{e:#}"))));
+        }));
+        self.offer_claude_meanwhile();
+    }
+
+    /// Give the user something to work with while 16–30 GB comes down. Asking the CLI takes ~0.2s, so it
+    /// happens off the UI thread and lands as Msg::ClaudeAuth.
+    fn offer_claude_meanwhile(&mut self) {
+        if self.cfg.llm.provider.is_some() { return; }               // already on some other backend
+        let tx = self.tx.clone();
+        tokio::spawn(async move { let _ = tx.send(Msg::ClaudeAuth(harness::claude_code::auth().await)); });
+    }
+
+    /// Claude if it is signed in; an offer to sign in if it is not; and if there is no usable Claude at
+    /// all — or the user would rather not — say plainly that the harness waits for Qwen3.8.
+    fn on_claude_auth(&mut self, auth: harness::claude_code::Auth) {
+        use harness::claude_code::Auth;
+        let downloading = self.dl.is_some() || self.dl_cancel.is_some();
+        match auth {
+            Auth::Ready { .. } => {
+                let who = auth.who();
+                self.command("/backend claude claude-fable-5 high");
+                self.blocks.push(Block::System(format!(
+                    "working on Claude ({who}) until the local model is ready{}",
+                    if downloading { " — the download keeps running in the background" } else { "" })));
+            }
+            Auth::LoggedOut | Auth::Missing => {
+                let missing = auth == Auth::Missing;
+                let mut items = Vec::new();
+                if missing {
+                    items.push(PickItem {
+                        label: "Install the Claude Code CLI".into(),
+                        desc: "then sign in — the harness suspends while you do".into(),
+                        detail: "Runs `curl -fsSL https://claude.ai/install.sh | bash`, then `claude auth login`. Your Anthropic \
+                                 subscription is used through the official client; the harness bridges its own tools to it over MCP.".into(),
+                        run: Some("/claude-login install".into()),
+                    });
+                } else {
+                    items.push(PickItem {
+                        label: "Sign in to Claude now".into(),
+                        desc: format!("runs `{}` — the harness steps aside, then comes back", harness::claude_code::LOGIN_COMMAND),
+                        detail: "The TUI suspends, the official CLI takes the terminal for the browser sign-in, and the harness \
+                                 resumes on your subscription. Nothing about your account is stored by the harness.".into(),
+                        run: Some("/claude-login".into()),
+                    });
+                }
+                items.push(PickItem {
+                    label: "No Claude — wait for Qwen3.8".into(),
+                    desc: if downloading { "the harness starts working when the weights land".into() } else { "nothing to run until a model exists".into() },
+                    detail: if downloading {
+                        "The download continues; you can watch it in the panel (⌃P). The harness has no model to talk to until it \
+                         finishes, so turns will fail until then — everything else (tools, /commands, files) still works.".into()
+                    } else {
+                        "No backend is configured. /localmodel picks a build to download, or set [llm] base_url in \
+                         ~/.config/harness/harness.toml to use a server you already run.".into()
+                    },
+                    run: None,
+                });
+                self.pick = Some(ListPicker::new(
+                    if missing { "Claude Code is not installed" } else { "Claude Code is installed but not signed in" },
+                    "enter chooses · esc waits for the local model",
+                    items));
+            }
+        }
+    }
+
+    /// Start the MLX server for the configured build and report where it landed.
+    fn start_mlx(&mut self) {
+        use harness::localmodel as lm;
+        let Some(build) = lm::by_name(&self.cfg.local_model.build) else { self.set_status("no local build chosen — /localmodel"); return };
+        if lm::mlx_python().is_none() {
+            self.blocks.push(Block::Error("no MLX runtime in ~/.config/harness/runtime/mlx — re-run the installer (or NO_MLX=0 sh install.sh)".into()));
+            return;
+        }
+        let (tx, dir, port, kind) = (self.tx.clone(), build.dir(), self.cfg.local_model.port, self.cfg.local_model.server.clone());
+        self.set_status(format!("starting {} on port {port} — loading {} GB of weights takes a moment", kind, build.bytes / 1_000_000_000));
+        tokio::spawn(async move {
+            let msg = match lm::serve(&dir, port, &kind).await {
+                Ok(s) => Msg::MlxUp(Ok((s.base_url.clone(), s.model.clone()))),
+                Err(e) => Msg::MlxUp(Err(format!("{e:#}"))),
+            };
+            let _ = tx.send(msg);
+        });
+    }
+
     /// Change the terminal font size (kitty / iTerm2 / Terminal.app), persist it, toast it. delta 0 = reset to 13.
     fn adjust_font(&mut self, delta: i32) {
         let cur = if self.cfg.ui.font_size > 0 { self.cfg.ui.font_size as i32 } else { 13 };
@@ -3121,6 +3431,8 @@ const COMMANDS: &[(&str, &str)] = &[
     ("/resume", "resume a saved session: /resume <n|id|last>"),
     ("/model", "browse the models on this server (enter switches) - /model <name> switches directly"),
     ("/backend", "switch backend: local (LM Studio etc.) | claude [model] [effort] (Claude Code CLI, subscription) | anthropic <model>"),
+    ("/localmodel", "the local Qwen3.8-27B: pick a 4/6/8-bit build to download (resumable), serve it, or see status"),
+    ("/delegate", "Claude orchestrates while the local model runs the delegated work (sub-agents): /delegate on|off"),
     ("/effort", "Claude Code backend reasoning effort: /effort low|medium|high|xhigh|max (default medium)"),
     ("/cd", "change working directory"),
     ("/pwd", "print working directory"),
@@ -3736,15 +4048,32 @@ fn draw_panel(f: &mut Frame, app: &App, area: Rect) {
     let agents: Vec<Arc<harness::agent::SubAgentInfo>> = app.subenv.as_ref().map(|e| e.list()).unwrap_or_default();
     let agents_show: Vec<&Arc<harness::agent::SubAgentInfo>> = agents.iter().filter(|a| a.running() || a.finished.lock().unwrap().map(|f| f.elapsed().as_secs() < 120).unwrap_or(false)).collect();
     let agents_h = if agents_show.is_empty() { 0 } else { (agents_show.len() as u16).min(6) + 1 };
+    let dl_h = if app.dl.is_some() { 3 } else { 0 };     // title + bar + bytes/speed/ETA
     let rows = Layout::vertical([
         Constraint::Length(1), Constraint::Min(6),          // thinking
         Constraint::Length(todo_h),                         // tasks
         Constraint::Length(agents_h),                       // sub-agents
+        Constraint::Length(dl_h),                           // model download
         Constraint::Length(1), Constraint::Length(6),       // tokens
         Constraint::Length(1), Constraint::Length(8),       // speed
         Constraint::Length(1), Constraint::Length(9),       // system
     ]).split(area);
-    let (r_tokens_t, r_tokens, r_speed_t, r_speed, r_sys_t, r_sys) = (rows[4], rows[5], rows[6], rows[7], rows[8], rows[9]);
+    let (r_tokens_t, r_tokens, r_speed_t, r_speed, r_sys_t, r_sys) = (rows[5], rows[6], rows[7], rows[8], rows[9], rows[10]);
+
+    // ── Model download: the one thing a first run is waiting on ──
+    if let Some(p) = &app.dl {
+        let w = (area.width as usize).saturating_sub(2).max(8);
+        let filled = ((p.percent() / 100.0) * w as f64).round() as usize;
+        let name = app.dl_build.map(|b| b.name()).unwrap_or("model");
+        f.render_widget(Paragraph::new(vec![
+            title(&format!("{name} · {:.1}%", p.percent())),
+            Line::from(vec![
+                Span::styled("█".repeat(filled.min(w)), Style::default().fg(pal().orange)),
+                Span::styled("░".repeat(w.saturating_sub(filled)), dim),
+            ]),
+            Line::from(vec![Span::styled(truncate(&p.line(), w), dim)]),
+        ]), rows[4]);
+    }
     if agents_h > 0 {
         let running = agents_show.iter().filter(|a| a.running()).count();
         let mut al: Vec<Line> = vec![title(&format!("Agents · {} running", running))];

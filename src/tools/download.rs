@@ -133,8 +133,87 @@ fn save_state(path: &Path, state: &Arc<Mutex<DlState>>) {
     if let Ok(j) = serde_json::to_vec(&s) { let _ = std::fs::write(path, j); }
 }
 
-fn human(n: u64) -> String {
+pub fn human(n: u64) -> String {
     if n < 1024 { format!("{n} B") } else if n < 1 << 20 { format!("{:.1} KB", n as f64 / 1024.0) } else if n < 1 << 30 { format!("{:.1} MB", n as f64 / 1048576.0) } else { format!("{:.2} GB", n as f64 / 1073741824.0) }
+}
+
+/// The same segmented, checkpointed, resuming download as the `download_file` tool, for callers inside
+/// the harness (the first-run model fetch). `tick(done, total)` is called ~4×/s with the byte counts of
+/// *this* file, so a caller can render progress, speed and an ETA.
+///
+/// The tool's `call` keeps its own copy of this orchestration because it layers extra behaviour on top
+/// (sha256 verification, overwrite, "already complete" reporting, unknown-size streaming); both share
+/// the planning, segment and state-file machinery below.
+pub async fn fetch_resumable(
+    http: &reqwest::Client,
+    url: &str,
+    dest: &Path,
+    nseg: usize,
+    timeout: Duration,
+    tick: Option<Arc<dyn Fn(u64, u64) + Send + Sync>>,
+) -> Result<u64> {
+    if let Some(p) = dest.parent() { tokio::fs::create_dir_all(p).await?; }
+    let sfile = state_path(dest);
+    // A finished file has no state file next to it: nothing to do.
+    let mut prior: Option<DlState> = None;
+    if sfile.is_file() && dest.is_file() {
+        if let Ok(s) = serde_json::from_slice::<DlState>(&std::fs::read(&sfile)?) {
+            if s.url == url && !s.complete() { prior = Some(s); }
+        }
+    }
+    let (probe_size, ranges, final_url) = probe(http, url).await?;
+    let size = probe_size.unwrap_or(0);
+    if prior.is_none() && dest.is_file() && !sfile.is_file() {
+        let have = std::fs::metadata(dest)?.len();
+        if size == 0 || have == size {
+            if let Some(t) = &tick { t(have, have); }
+            return Ok(have);
+        }
+    }
+    let state = match prior {
+        Some(s) => s,
+        None => {
+            let f = std::fs::File::create(dest)?;
+            if size > 0 { f.set_len(size)?; }
+            plan(url, size, ranges, nseg)
+        }
+    };
+    let ranged = state.ranges && state.size > 0;
+    let total = state.size;
+    let file = Arc::new(std::fs::OpenOptions::new().write(true).open(dest)?);
+    let state = Arc::new(Mutex::new(state));
+    save_state(&sfile, &state);
+
+    let n = state.lock().unwrap().segments.len();
+    let mut tasks = tokio::task::JoinSet::new();
+    for idx in 0..n {
+        tasks.spawn(run_segment(http.clone(), final_url.clone(), file.clone(), state.clone(), idx, ranged, sfile.clone()));
+    }
+    // Report from the shared state rather than from the segments, so resumed bytes are included.
+    let watcher = tick.map(|t| {
+        let st = state.clone();
+        tokio::spawn(async move {
+            loop {
+                { let s = st.lock().unwrap(); t(s.downloaded(), s.size); }
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+        })
+    });
+    let all = async { let mut errs = Vec::new(); while let Some(r) = tasks.join_next().await { match r { Ok(Ok(())) => {}, Ok(Err(e)) => errs.push(format!("{e:#}")), Err(e) => errs.push(e.to_string()) } } errs };
+    let outcome = tokio::time::timeout(timeout, all).await;
+    if let Some(w) = watcher { w.abort(); }
+    let errs = match outcome {
+        Ok(errs) => errs,
+        Err(_) => { save_state(&sfile, &state); bail!("timed out after {}s ({} of {})", timeout.as_secs(), human(state.lock().unwrap().downloaded()), human(total)); }
+    };
+    let downloaded = state.lock().unwrap().downloaded();
+    if !errs.is_empty() || (total > 0 && downloaded < total) {
+        save_state(&sfile, &state);
+        bail!("incomplete ({} of {}){}{}", human(downloaded), human(total), if errs.is_empty() { "" } else { ": " }, errs.join("; "));
+    }
+    let _ = std::fs::remove_file(&sfile);   // no state file = complete
+    let got = std::fs::metadata(dest)?.len();
+    Ok(got)
 }
 
 #[async_trait]

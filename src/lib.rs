@@ -23,6 +23,7 @@ pub mod import;
 pub mod inbox;
 pub mod instructions;
 pub mod llm;
+pub mod localmodel;
 pub mod lsp;
 pub mod mailbox;
 pub mod mcp;

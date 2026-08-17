@@ -182,6 +182,11 @@ impl Client {
     pub fn acp_command(&self) -> Option<String> { (self.provider == Provider::Acp).then(|| self.acp_command.clone().unwrap_or_else(|| self.model.clone())) }
     /// True when a separate (usually smaller/faster) aux model is configured.
     pub fn has_aux(&self) -> bool { self.aux_model.is_some() || self.roles.contains_key("aux") }
+
+    /// Is this role configured *by name*? `role()` deliberately falls back to `aux`, which is wrong for
+    /// delegation: "no [llm.roles] subagent" must mean "sub-agents run on the main model", not "on the
+    /// small auxiliary one".
+    pub fn has_role(&self, role: &str) -> bool { self.roles.contains_key(role) }
     /// Client for auxiliary calls (reflection, compaction): the configured aux model, or this one.
     pub fn aux(&self) -> Client { self.role("aux") }
 

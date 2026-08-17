@@ -77,8 +77,13 @@ impl Tool for SpawnAgent {
         let mut extra = match &def { Some(d) => format!("{base_extra}\n\n# Your role: {}\n{}", d.name, d.prompt), None => base_extra.to_string() };
         if fork { extra.push_str("\n\nYou are a FORK of the parent agent: the conversation so far is your context. Continue from it."); }
         let system = crate::agent::system_prompt_with_memory(&workdir.display().to_string(), &registry.names(), Some(&extra), ctx.memory.as_ref());
+        // Explicit `model` wins, then the agent definition's own model, then `[llm.roles] subagent` if it
+        // is configured by name — that last one is how Claude orchestrates while a local model does the
+        // delegated work. Without it, sub-agents stay on the parent's model.
         let client = match args.get("model").and_then(|v| v.as_str()).map(|s| s.to_string()).or_else(|| def.as_ref().and_then(|d| d.model.clone())) {
-            Some(m) => env.client.with_model(&m), None => env.client.clone(),
+            Some(m) => env.client.with_model(&m),
+            None if env.client.has_role("subagent") => env.client.role("subagent"),
+            None => env.client.clone(),
         };
         // `fork` starts from a copy of the parent's transcript instead of an empty one
         let prior: Vec<crate::llm::Message> = if fork { env.forked_transcript() } else { Vec::new() };

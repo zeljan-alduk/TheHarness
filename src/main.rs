@@ -854,8 +854,13 @@ fn repo_root() -> Result<PathBuf> {
     let mut cands = vec![std::env::current_dir()?];
     let exe = std::env::var_os("HARNESS_ORIG_EXE").map(PathBuf::from).or_else(|| std::env::current_exe().ok());
     if let Some(exe) = exe { if let Some(r) = exe.ancestors().nth(3) { cands.push(r.to_path_buf()); } }
+    // Installed from the one-line installer there is no repo above the binary, so the checkout the
+    // installer makes for exactly this purpose is the last candidate: it is what lets `harness self` and
+    // /improve work on a machine that never cloned anything by hand.
+    if let Ok(p) = std::env::var("HARNESS_SOURCE") { cands.push(PathBuf::from(p)); }
+    cands.push(harness::setup::config_dir().join("source"));
     for c in cands { if c.join("Cargo.toml").is_file() && c.join("harness.toml").is_file() { return Ok(c.canonicalize()?); } }
-    bail!("could not locate the harness repo (Cargo.toml + harness.toml); run from the repo root")
+    bail!("could not locate the harness repo (Cargo.toml + harness.toml). Run from the repo root, set HARNESS_SOURCE, or clone it: git clone https://github.com/zeljan-alduk/TheHarness ~/.config/harness/source")
 }
 
 fn slug(s: &str) -> String {
