@@ -99,7 +99,7 @@ const TOOL_ALIASES: &[(&str, &str)] = &[("bash", "bash"), ("shell", "bash"), ("r
 
 const PLAN_OK: &[&str] = &["git status", "git log", "git diff", "git show", "git branch", "git blame", "ls", "cat ", "head ", "tail ", "grep ", "rg ", "find ", "fd ", "wc ", "tree", "pwd", "echo ", "which ", "file ", "stat ", "du ", "df ", "env", "printenv", "cargo check", "cargo metadata", "cargo tree", "python3 -c \"import", "node -e", "jq ", "sed -n", "awk ", "sort", "uniq", "diff "];
 /// Tools that are not read-only per the registry but never touch files/state outside the harness itself.
-const BENIGN: &[&str] = &["todo", "ask_user", "notify"];
+const BENIGN: &[&str] = &["todo", "ask_user", "notify", "report_findings", "memory"];
 /// Tools whose primary argument is a shell command (RISKY-pattern checked in auto mode).
 const SHELL_TOOLS: &[&str] = &["bash", "monitor", "run_workflow", "terminal", "run_code"];
 
@@ -219,9 +219,9 @@ impl Policy {
         match self.effective_mode() {
             Mode::Bypass => Decision::Allow,
             Mode::Plan => {
-                if read_only_tool || tool == "load_skill" || tool == "web_search" || tool == "web_fetch" { return Decision::Allow; }
+                // read-only work, plus the tools that only write the agent's own notes (findings, todos, memory)
+                if read_only_tool || BENIGN.contains(&tool) || tool == "load_skill" || tool == "web_search" || tool == "web_fetch" { return Decision::Allow; }
                 if tool == "bash" { if plan_safe_shell(&arg) { return Decision::Allow; } return Decision::Ask("plan mode: shell command that may modify state".into()); }
-                if tool == "memory" { return Decision::Allow; }
                 Decision::Deny("plan mode is read-only; switch with /permissions auto".into())
             }
             Mode::Ask => { if read_only_tool || !mutating { Decision::Allow } else { Decision::Ask("ask mode".into()) } }
@@ -359,6 +359,8 @@ mod tests {
         assert!(matches!(p.check("bash", &json!({"cmd":"cargo install foo"}), false), Decision::Allow)); // allow rule wins over risky
         assert!(matches!(p.check("write_file", &json!({"path":"/etc/hosts"}), false), Decision::Ask(_)));
         let plan = pol(Mode::Plan);
+        assert!(matches!(plan.check("report_findings", &json!({"findings":[]}), false), Decision::Allow), "a review in plan mode must still be able to report findings");
+        assert!(matches!(plan.check("todo", &json!({"action":"set"}), false), Decision::Allow));
         assert!(matches!(plan.check("write_file", &json!({"path":"a"}), false), Decision::Deny(_)));
         assert!(matches!(plan.check("bash", &json!({"cmd":"git status"}), false), Decision::Allow));
         assert!(matches!(plan.check("bash", &json!({"cmd":"touch x"}), false), Decision::Ask(_)));

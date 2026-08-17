@@ -85,6 +85,25 @@ enum Cmd {
         #[arg(short, long)]
         out: Option<PathBuf>,
     },
+    /// Review a pull request (or the working branch): structured findings, optionally posted or fixed
+    Review {
+        #[arg(short = 'C', long)]
+        dir: Option<PathBuf>,
+        /// Pull request number or URL (uses `gh`); omit to review this branch against its base
+        #[arg(long)]
+        pr: Option<String>,
+        /// Base branch to diff against (default: origin's HEAD, else main)
+        #[arg(long)]
+        base: Option<String>,
+        /// Post the findings to the pull request as a comment
+        #[arg(long)]
+        comment: bool,
+        /// After reviewing, let the agent fix what it found
+        #[arg(long)]
+        fix: bool,
+        #[arg(long, default_value_t = 30)]
+        max_turns: usize,
+    },
     /// Import Terminal-Bench / Harbor tasks into evals/tasks (instruction → prompt, tests → check)
     #[command(name = "eval-import")]
     EvalImport {
@@ -607,6 +626,13 @@ async fn main() -> Result<()> {
                 report.total_prompt_tokens, report.total_completion_tokens, report.total_wall_secs, out.display());
             println!("{}", serde_json::to_string(&serde_json::json!({"passed": report.passed, "total": report.total, "score": report.score}))?);
             if report.passed < report.total { std::process::exit(1); }
+        }
+        Cmd::Review { dir, pr, base, comment, fix, max_turns } => {
+            let workdir = dir.unwrap_or(std::env::current_dir()?).canonicalize().context("workdir does not exist")?;
+            let opts = harness::review::Options { pr, base, comment, fix, max_turns, yes: cli.yes };
+            let (findings, markdown) = harness::review::run(&cfg, &workdir, opts).await?;
+            if cli.json { println!("{}", serde_json::json!({"findings": findings})); } else { println!("\n{markdown}"); }
+            if findings.iter().any(|f| matches!(f["severity"].as_str(), Some("critical") | Some("high"))) { std::process::exit(2); }
         }
         Cmd::EvalImport { path, out, include_docker, limit } => {
             let dest = out.unwrap_or_else(|| PathBuf::from(&cfg.eval.tasks_dir));

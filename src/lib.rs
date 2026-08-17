@@ -33,6 +33,7 @@ pub mod pricing;
 pub mod procs;
 pub mod proxy;
 pub mod repomap;
+pub mod review;
 pub mod runner;
 pub mod sandbox;
 pub mod selfimprove;
