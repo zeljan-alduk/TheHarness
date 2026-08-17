@@ -349,15 +349,37 @@ fn load_attachment(path: &std::path::Path) -> Result<Attachment, String> {
     Ok(Attachment { path: path.to_path_buf(), mime: mime.into(), b64: base64::engine::general_purpose::STANDARD.encode(&bytes), dims, img, label: None })
 }
 
-/// Drive the terminal's font size. Kitty via remote control (needs allow_remote_control; we set KITTY_LISTEN_ON when
-/// we launch it), iTerm2 and Terminal.app via AppleScript. Returns the terminal name on success.
+/// Send one kitty remote-control command on our own terminal — the same DCS packet `kitten @` writes,
+/// which needs no socket (a fixed `--listen-on` path is unlinked by the next kitty that binds it, which
+/// is how this broke) and no `kitten` binary. `no_response` keeps kitty quiet on success; a *refusal* is
+/// answered anyway, which is why kitty_remote_control_ok() below asks the question once, up front.
+fn kitty_cmd(json: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut o = std::io::stdout();
+    o.write_all(format!("\x1bP@kitty-cmd{{\"version\":[0,26,0],\"no_response\":true,{json}}}\x1b\\").as_bytes())?;
+    o.flush()
+}
+static KITTY_RC: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0); // 0 unknown, 1 allowed, 2 refused
+/// Is remote control allowed on this terminal? Ask with a no-op (font size × 1) and listen: silence means
+/// yes, an error packet means no. The reply would otherwise be decoded as key presses and typed into the
+/// prompt, so this runs once at start-up — in raw mode, before the event loop owns the input stream.
+fn kitty_remote_control_ok() -> bool {
+    use crossterm::event::{poll, read};
+    while poll(Duration::ZERO).unwrap_or(false) { let _ = read(); } // leftovers from earlier terminal queries
+    if kitty_cmd("\"cmd\":\"set-font-size\",\"payload\":{\"size\":1,\"increment_op\":\"*\"}").is_err() { return false; }
+    let refused = poll(Duration::from_millis(150)).unwrap_or(false);
+    while poll(Duration::ZERO).unwrap_or(false) { let _ = read(); } // swallow the refusal, whatever it was
+    KITTY_RC.store(if refused { 2 } else { 1 }, std::sync::atomic::Ordering::Relaxed);
+    !refused
+}
+
+/// Drive the terminal's font size. Inside kitty we speak its remote-control protocol ourselves, on our
+/// own terminal; iTerm2 and Terminal.app go through AppleScript. Returns the terminal name on success.
 async fn set_terminal_font_size(pt: u32) -> Result<&'static str, String> {
     if std::env::var_os("KITTY_WINDOW_ID").is_some() {
-        let mut c = tokio::process::Command::new(crate_kitten());
-        c.arg("@");
-        if let Ok(to) = std::env::var("KITTY_LISTEN_ON") { c.arg("--to").arg(to); }
-        let o = c.args(["set-font-size", &pt.to_string()]).output().await.map_err(|e| e.to_string())?;
-        return if o.status.success() { Ok("kitty") } else { Err(format!("kitty: {} (start kitty with allow_remote_control=yes)", String::from_utf8_lossy(&o.stderr).trim())) };
+        if KITTY_RC.load(std::sync::atomic::Ordering::Relaxed) == 2 { return Err("kitty: remote control is off — add `allow_remote_control yes` to kitty.conf and restart kitty".into()); }
+        kitty_cmd(&format!("\"cmd\":\"set-font-size\",\"payload\":{{\"size\":{pt}}}")).map_err(|e| e.to_string())?;
+        return Ok("kitty");
     }
     let prog = std::env::var("TERM_PROGRAM").unwrap_or_default();
     if prog == "iTerm.app" {
@@ -373,8 +395,6 @@ async fn set_terminal_font_size(pt: u32) -> Result<&'static str, String> {
     if prog == "WezTerm" { return Err("WezTerm: use its own ctrl+= / ctrl+- (no remote font control)".into()); }
     Err("this terminal cannot be resized from the app (kitty, iTerm2, Terminal.app supported)".into())
 }
-fn crate_kitten() -> String { if let Ok(exe) = std::env::var("KITTY_INSTALLATION_DIR") { let p = std::path::Path::new(&exe).join("../MacOS/kitten"); if p.exists() { return p.display().to_string(); } } for c in ["/Applications/kitty.app/Contents/MacOS/kitten", "/opt/homebrew/bin/kitten", "/usr/local/bin/kitten"] { if std::path::Path::new(c).exists() { return c.into(); } } "kitten".into() }
-
 /// Terminals that implement an inline-image protocol (and answer capability queries).
 fn graphics_terminal() -> bool {
     if let Ok(v) = std::env::var("HARNESS_GRAPHICS") { return v != "0" && v != "off"; }
@@ -724,6 +744,9 @@ pub async fn run(cfg: Config, resume: Option<String>) -> Result<()> {
     let _ = crossterm::execute!(std::io::stdout(), crossterm::event::EnableBracketedPaste, crossterm::event::EnableMouseCapture);
     let kbd_enh = crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false);
     if kbd_enh { let _ = crossterm::execute!(std::io::stdout(), crossterm::event::PushKeyboardEnhancementFlags(crossterm::event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)); }
+    // ctrl+= / ctrl+- drive kitty's font size over remote control: settle now whether it is allowed, while
+    // the input stream is still ours to read (see kitty_remote_control_ok).
+    if std::env::var_os("KITTY_WINDOW_ID").is_some() && !kitty_remote_control_ok() { app.blocks.push(Block::System("kitty: remote control is off, so ctrl+= / ctrl+- cannot change the font size — add `allow_remote_control yes` to kitty.conf".into())); }
     if app.cfg.ui.font_size > 0 { let sz = app.cfg.ui.font_size; tokio::spawn(async move { let _ = set_terminal_font_size(sz).await; }); }
     let mut events = EventStream::new();
     let mut ticker = tokio::time::interval(Duration::from_millis(80));
