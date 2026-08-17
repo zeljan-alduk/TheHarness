@@ -2501,11 +2501,24 @@ impl App {
                         self.blocks.push(Block::System(format!("local_model.server → {kind} · restarting the MLX server ({}{})", lm::server_plan(kind).first().copied().unwrap_or("?"), if a == "vision" || a == "auto" { " — the same weights with the vision tower, so images and video frames work" } else { " — text-only" })));
                         self.start_mlx_ex(true);
                     }
-                    "cancel" | "stop" => {
-                        match self.dl_cancel.take() {
-                            Some(h) => { h.abort(); self.dl = None; self.blocks.push(Block::System("download stopped — the bytes already on disk stay, /localmodel resume continues from there".into())); }
-                            None => self.set_status("no download running"),
+                    "cancel" | "stop" | "unload" | "kill" => {
+                        // `stop`/`cancel` cancel a running download first; otherwise (and always for
+                        // `unload`/`kill`) they shut the MLX server down and reclaim its ~16–30GB of RAM.
+                        if a != "unload" && a != "kill" {
+                            if let Some(h) = self.dl_cancel.take() { h.abort(); self.dl = None; self.blocks.push(Block::System("download stopped — the bytes already on disk stay, /localmodel resume continues from there".into())); return; }
                         }
+                        let (tx, port) = (self.tx.clone(), self.cfg.local_model.port);
+                        self.set_status(format!("stopping the MLX server on port {port}"));
+                        tokio::spawn(async move {
+                            let stopped = harness::localmodel::stop_on_port(port).await;
+                            let _ = tx.send(Msg::Notice(if stopped {
+                                format!("MLX server stopped — memory reclaimed. It will not autostart again this session; /localmodel serve starts it, or set [local_model] autostart = false to keep it off (port {port})")
+                            } else {
+                                "no MLX server of ours was running on that port".into()
+                            }));
+                        });
+                        // don't let this session immediately re-launch it
+                        self.cfg.local_model.autostart = false;
                     }
                     "status" => {
                         let mut lines = vec![format!("runtime: {} · vision server (mlx-vlm): {}", lm::mlx_python().map(|p| p.display().to_string()).unwrap_or("missing — re-run the installer".into()), if lm::has_mlx_vlm() { "installed" } else { "missing — installed automatically on the next /localmodel serve" })];
@@ -3739,7 +3752,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ("/resume", "resume a saved session: /resume <n|id|last>"),
     ("/model", "browse every model you can switch to — Claude, the downloaded MLX build, and this server (enter switches backend + model); /model <name> switches directly"),
     ("/backend", "switch backend: local (LM Studio etc.) | claude [model] [effort] (Claude Code CLI, subscription) | anthropic <model>"),
-    ("/localmodel", "the local Qwen3.8-27B: pick a 4/6/8-bit build to download (resumable) · serve · status · vision|text (which MLX server: mlx_vlm sees images, mlx_lm is text-only)"),
+    ("/localmodel", "the local Qwen3.8-27B: download 4/6/8-bit (resumable) · serve · stop (shut the MLX server, reclaim RAM) · restart · status · vision|text (mlx_vlm sees images, mlx_lm is text-only)"),
     ("/delegate", "Claude orchestrates while the local model runs the delegated work (sub-agents): /delegate on|off"),
     ("/effort", "Claude Code backend reasoning effort: /effort low|medium|high|xhigh|max (default medium)"),
     ("/cd", "change working directory"),
