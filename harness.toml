@@ -48,6 +48,9 @@ max_tool_output_chars = 16000
 # tool_history_max_chars = 4000     # 0 = off
 # Optional wall-clock cap per task in the interactive UI (0 = unlimited); queued tasks continue afterwards
 max_task_secs = 0
+# Which tool catalogue the model sees: "core" (default — the ~13 everyday coding tools listed; the other
+# ~27 discoverable on demand via tool_search, saving ~5k tokens of prefill every first turn) | "full".
+# tool_catalog = "core"
 
 [eval]
 tasks_dir = "evals/tasks"

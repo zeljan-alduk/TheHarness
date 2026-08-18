@@ -302,12 +302,37 @@ impl Registry {
 /// alive as long as the returned handles are kept.
 pub struct Toolset { pub registry: Registry, pub notes: Vec<String>, pub servers: Vec<std::sync::Arc<tokio::sync::Mutex<crate::mcp::McpServer>>>, pub prompt_extra: String }
 
+/// The tools every coding turn actually needs, kept in the model's tool list. Everything else is deferred
+/// behind `tool_search` (still directly callable — `Registry::call` ignores deferral — just not listed, so
+/// the tool catalogue costs ~2k tokens instead of ~7.5k on every prefill). This set must cover every tool
+/// the base system prompt mentions by name, or the model would be told about tools it cannot see.
+pub const CORE_TOOLS: &[&str] = &[
+    "bash", "read_file", "write_file", "edit_file", "apply_patch", "list_dir", "grep", "glob",
+    "repo_map", "todo", "spawn_agent", "memory", "view_image",
+];
+
 pub async fn build_toolset(net_enabled: bool, workdir: &Path, with_mcp: bool) -> Toolset {
+    build_toolset_catalog(net_enabled, workdir, with_mcp, "core").await
+}
+
+/// `catalog`: "core" (default — CORE_TOOLS listed, the rest behind tool_search) or "full" (everything listed).
+pub async fn build_toolset_catalog(net_enabled: bool, workdir: &Path, with_mcp: bool, catalog: &str) -> Toolset {
     let mut registry = Registry::defaults(net_enabled);
     let mut notes = Vec::new();
     let mut servers = Vec::new();
     let mut prompt_extra = String::new();
     let plugins = crate::plugins::Plugins::open().ok();
+    let mut deferred: Vec<String> = Vec::new();
+    // Built-ins beyond the core set are deferred: the full catalogue is ~30k chars of JSON schema (~7.5k
+    // tokens) prefilled on every first turn; the core is ~9k chars. tool_search surfaces the rest on demand.
+    if catalog != "full" {
+        let extras: Vec<String> = registry.names().into_iter().filter(|n| !CORE_TOOLS.contains(n)).map(String::from).collect();
+        if !extras.is_empty() {
+            notes.push(format!("tools: {} built-in(s) deferred behind tool_search (core catalogue; [agent] tool_catalog = \"full\" lists all)", extras.len()));
+            prompt_extra.push_str("\n\n# More tools via tool_search\nOnly the core tools are listed above. Many more exist — web_search/web_fetch, terminal (interactive PTY), screenshot, read_pdf/pdf_edit, download_file, run_code, notebook_edit, extract_archive, diagnostics, lsp, worktree, schedule/monitor, sessions/team/send_message, plan_mode, run_workflow, load_skill, report_findings, notify, agents, ask_user, process, mcp_resources. When a task needs one, call tool_search {query} first; matching tools become callable.\n");
+            deferred.extend(extras);
+        }
+    }
     if with_mcp {
         let extra = plugins.as_ref().map(|p| p.mcp_files()).unwrap_or_default();
         let (tools, errs, srv) = crate::mcp::start_all(workdir, &extra).await;
@@ -318,14 +343,17 @@ pub async fn build_toolset(net_enabled: bool, workdir: &Path, with_mcp: bool) ->
         // a large MCP catalogue costs more context than most conversations: hand it over on demand
         let threshold: usize = std::env::var("HARNESS_TOOL_SEARCH_AT").ok().and_then(|v| v.parse().ok()).unwrap_or(25);
         if mcp_names.len() > threshold {
-            registry.defer(mcp_names.clone());
-            let shared = std::sync::Arc::new(std::sync::Mutex::new(None));
-            registry.extend(vec![std::sync::Arc::new(tool_search::ToolSearch { registry: shared.clone() }) as std::sync::Arc<dyn Tool>]);
-            *shared.lock().unwrap() = Some(registry.clone());
             notes.push(format!("MCP: {} tool(s) deferred behind tool_search (over {threshold})", mcp_names.len()));
-            prompt_extra.push_str(&format!("\n\n# Deferred tools\n{} MCP tools are not listed above to save context. When you need one — browser control, an issue tracker, a database, anything a server might provide — call tool_search {{query}} first; matching tools become callable.\n", mcp_names.len()));
+            prompt_extra.push_str(&format!("\n\n# Deferred MCP tools\n{} MCP tools are also not listed. Browser control, issue trackers, databases — call tool_search {{query}} to surface them.\n", mcp_names.len()));
+            deferred.extend(mcp_names);
         }
         servers = srv;
+    }
+    if !deferred.is_empty() {
+        registry.defer(deferred);
+        let shared = std::sync::Arc::new(std::sync::Mutex::new(None));
+        registry.extend(vec![std::sync::Arc::new(tool_search::ToolSearch { registry: shared.clone() }) as std::sync::Arc<dyn Tool>]);
+        *shared.lock().unwrap() = Some(registry.clone());
     }
     Toolset { registry, notes, servers, prompt_extra }
 }

@@ -536,7 +536,7 @@ async fn main() -> Result<()> {
                 let workdir = dir.unwrap_or(std::env::current_dir()?).canonicalize()?;
                 let wf = harness::workflow::find(&name, &workdir)?;
                 let sink: std::sync::Arc<dyn events::Sink> = if cli.json { std::sync::Arc::new(events::JsonlSink) } else { std::sync::Arc::new(events::StderrSink { verbose: cli.verbose }) };
-                let ts = tools::build_toolset(cfg.net.enabled, &workdir, true).await;
+                let ts = tools::build_toolset_catalog(cfg.net.enabled, &workdir, true, &cfg.agent.tool_catalog).await;
                 let budget = cfg.llm.effective_budget(llm::detect_context_length(&cfg.llm.base_url, &cfg.llm.model).await.map(|d| d.0));
                 let mut pcfg = cfg.permissions.clone(); pcfg.allow.extend(harness::permissions::persisted_rules());
                 let policy = std::sync::Arc::new(harness::permissions::Policy::new(pcfg, &workdir));
@@ -616,7 +616,7 @@ async fn main() -> Result<()> {
             let workdir = dir.unwrap_or(std::env::current_dir()?).canonicalize().context("workdir does not exist")?;
             let store = if cfg.memory.enabled { harness::memory::MemoryStore::open(&cfg.memory).ok() } else { None };
             let ctx = tools::ToolCtx { workdir: workdir.clone(), timeout: Duration::from_secs(cfg.agent.tool_timeout_secs), max_output: cfg.agent.max_tool_output_chars, net: cfg.net.clone(), memory: store, subagent: None, redact_secrets: cfg.security.redact_secrets, injection_scan: cfg.security.injection_scan, hooks: cfg.hooks.clone(), todos: Default::default(), lsp_servers: cfg.lsp.servers.clone(), format: cfg.format.clone(), extra_roots: vec![], approver: None, inbox: Default::default(), cancel: None, cwd: None, session_id: session };
-            let ts = tools::build_toolset(cfg.net.enabled, &workdir, name.starts_with("mcp__")).await;
+            let ts = tools::build_toolset_catalog(cfg.net.enabled, &workdir, name.starts_with("mcp__"), "full").await;
             let out = ts.registry.call(&name, args.as_deref().unwrap_or("{}"), &ctx).await;
             println!("{}", out.text);
             if !out.images.is_empty() { eprintln!("({} image(s) attached)", out.images.len()); }
@@ -662,7 +662,7 @@ async fn main() -> Result<()> {
             let servers = harness::mcp::discover(&workdir, &extra);
             println!("configured servers: {}", servers.len());
             for (n, c, f) in &servers { println!("  {:<18} {} {}   ← {}", n, if c.command.is_empty() { c.url.clone().unwrap_or_default() } else { c.command.clone() }, c.args.join(" "), f.display()); }
-            let ts = tools::build_toolset(cfg.net.enabled, &workdir, true).await;
+            let ts = tools::build_toolset_catalog(cfg.net.enabled, &workdir, true, &cfg.agent.tool_catalog).await;
             for n in &ts.notes { println!("· {n}"); }
             for d in ts.registry.defs().into_iter().filter(|d| d.function.name.starts_with("mcp__")) { println!("  {:<40} {}", d.function.name, llm::truncate_for_log(&d.function.description, 90)); }
         }
@@ -787,7 +787,7 @@ async fn run_agent(cfg: &config::Config, client: &llm::Client, workdir: &std::pa
     let store = if cfg.memory.enabled { harness::memory::MemoryStore::open(&cfg.memory).ok() } else { None };
     if let Some(m) = &store { let _ = m.touch_project(workdir); }
     let ctx = tools::ToolCtx { memory: store.clone(), ..ctx };
-    let toolset = tools::build_toolset(cfg.net.enabled, workdir, true).await;
+    let toolset = tools::build_toolset_catalog(cfg.net.enabled, workdir, true, &cfg.agent.tool_catalog).await;
     for n in &toolset.notes { eprintln!("· {n}"); }
     let registry = &toolset.registry;
     let extra_all = format!("{}{}", extra.unwrap_or(""), toolset.prompt_extra);

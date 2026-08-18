@@ -80,7 +80,7 @@ pub async fn prepare(setup: RunSetup) -> Result<Prepared> {
     let client = Client::new(&cfg.llm)?;
     let store = if cfg.memory.enabled { crate::memory::MemoryStore::open(&cfg.memory).ok() } else { None };
     if let Some(m) = &store { let _ = m.touch_project(&workdir); }
-    let toolset = match toolset { Some(ts) => ts, None => Arc::new(crate::tools::build_toolset(cfg.net.enabled, &workdir, true).await) };
+    let toolset = match toolset { Some(ts) => ts, None => Arc::new(crate::tools::build_toolset_catalog(cfg.net.enabled, &workdir, true, &cfg.agent.tool_catalog).await) };
     let ctx_len = match context_length { Some(n) => Some(n), None => crate::llm::detect_context_length(&cfg.llm.base_url, &cfg.llm.model).await.map(|d| d.0) };
     let budget = cfg.llm.effective_budget(ctx_len);
     let mut pcfg = cfg.permissions.clone();

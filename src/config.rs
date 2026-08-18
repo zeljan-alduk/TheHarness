@@ -252,7 +252,13 @@ pub struct AgentConfig {
     /// The head+tail size an aged-out tool output is trimmed to (chars). 0 = off (keep full history).
     #[serde(default)]
     pub tool_history_max_chars: usize,
+    /// Which tool catalogue the model sees: "core" (default — the ~13 everyday coding tools listed, the
+    /// other ~27 discoverable via tool_search, saving ~5.5k tokens of prefill on every first turn) or
+    /// "full" (every built-in listed).
+    #[serde(default = "d_catalog")]
+    pub tool_catalog: String,
 }
+fn d_catalog() -> String { "core".into() }
 fn d_hist_keep() -> usize { 4 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -498,6 +504,7 @@ impl Config {
             "agent.max_subagent_depth" => self.agent.max_subagent_depth = val.parse().context("bad number")?,
             "agent.tool_history_keep" => self.agent.tool_history_keep = val.parse().context("bad number")?,
             "agent.tool_history_max_chars" => self.agent.tool_history_max_chars = val.parse().context("bad number")?,
+            "agent.tool_catalog" => self.agent.tool_catalog = val.into(),
             "eval.tasks_dir" => self.eval.tasks_dir = val.into(),
             "eval.runs_dir" => self.eval.runs_dir = val.into(),
             "eval.task_timeout_secs" => self.eval.task_timeout_secs = val.parse().context("bad number")?,

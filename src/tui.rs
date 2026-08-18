@@ -1008,9 +1008,9 @@ impl App {
 
     /// (Re)build tools: built-ins + MCP servers from global/project/plugin configs. Async; swaps in when ready.
     fn reload_toolset(&mut self) {
-        let tx = self.tx.clone(); let net = self.net; let wd = self.workdir.clone();
+        let tx = self.tx.clone(); let net = self.net; let wd = self.workdir.clone(); let catalog = self.cfg.agent.tool_catalog.clone();
         tokio::spawn(async move {
-            let ts = harness::tools::build_toolset(net, &wd, true).await;
+            let ts = harness::tools::build_toolset_catalog(net, &wd, true, &catalog).await;
             for n in &ts.notes { let _ = tx.send(Msg::Notice(n.clone())); }
             let _ = tx.send(Msg::Toolset(Arc::new(ts)));
         });
@@ -2734,8 +2734,8 @@ impl App {
                     }
                 });
                 // reload after a short delay so MCP servers from the plugin start
-                let tx2 = self.tx.clone(); let net = self.net; let wd = self.workdir.clone();
-                tokio::spawn(async move { tokio::time::sleep(Duration::from_secs(8)).await; let ts = harness::tools::build_toolset(net, &wd, true).await; let _ = tx2.send(Msg::Toolset(Arc::new(ts))); });
+                let tx2 = self.tx.clone(); let net = self.net; let wd = self.workdir.clone(); let catalog = self.cfg.agent.tool_catalog.clone();
+                tokio::spawn(async move { tokio::time::sleep(Duration::from_secs(8)).await; let ts = harness::tools::build_toolset_catalog(net, &wd, true, &catalog).await; let _ = tx2.send(Msg::Toolset(Arc::new(ts))); });
             }
             "update" if rest == "all" || rest == "--all" => { let tx = self.tx.clone(); tokio::spawn(async move { if let Ok(p) = harness::plugins::Plugins::open() { for (n, r) in p.update_all().await { let _ = tx.send(Msg::Notice(format!("plugin {n}: {}", match r { Ok(m) => m, Err(e) => format!("failed: {e:#}") }))); } } }); }
             "enable" | "disable" | "remove" | "rm" | "update" => {
