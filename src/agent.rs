@@ -256,14 +256,30 @@ pub fn identity_line(id: &str, provider: crate::llm::Provider) -> String {
 /// The complete system prompt a turn sends — `system_prompt_with_memory` plus the identity line, assembled
 /// exactly as `run_turn_message` does — so the caller can pre-fill it into the model's prefix cache.
 pub fn full_system_prompt(workdir: &str, tools: &[&str], extra: Option<&str>, memory: Option<&crate::memory::MemoryStore>, model: &str, provider: crate::llm::Provider) -> String {
-    let base = system_prompt_with_memory(workdir, tools, extra, memory);
+    full_system_prompt_opt(workdir, tools, extra, memory, model, provider, false)
+}
+pub fn full_system_prompt_opt(workdir: &str, tools: &[&str], extra: Option<&str>, memory: Option<&crate::memory::MemoryStore>, model: &str, provider: crate::llm::Provider, lean: bool) -> String {
+    let base = system_prompt_opt(workdir, tools, extra, memory, lean);
     format!("{}\n{}", base.trim_end(), identity_line(model, provider))
 }
 
 pub fn system_prompt_with_memory(workdir: &str, tools: &[&str], extra: Option<&str>, memory: Option<&crate::memory::MemoryStore>) -> String {
+    system_prompt_opt(workdir, tools, extra, memory, false)
+}
+
+/// `lean = true` is the minimal prompt: base rules + tool list + the deferred-tools note, with memory,
+/// project docs and skills replaced by one-line pointers (the model reads them on demand with the memory /
+/// read_file / load_skill tools). Cuts the injected prompt from ~11k chars to ~2k, so a cold prefill is
+/// seconds, not a minute — at the cost of the model not knowing your BRAIN.md lessons unless it looks.
+pub fn system_prompt_opt(workdir: &str, tools: &[&str], extra: Option<&str>, memory: Option<&crate::memory::MemoryStore>, lean: bool) -> String {
     let mut s = base_prompt_template().replace("{workdir}", workdir).replace("{tools}", &tools.join(", "));
 
     if let Some(e) = extra { s.push_str("\n\n"); s.push_str(e); }
+    if lean {
+        let mem_dir = memory.map(|m| m.dir.display().to_string()).unwrap_or_else(|| crate::setup::config_dir().display().to_string());
+        s.push_str(&format!("\n\n# On-demand context (lean prompt)\nPersistent memory (MEMORY.md, BRAIN.md lessons, WORKFLOWS.md) lives in {mem_dir} — call `memory show` (or read_file) when past lessons or preferences could matter, and record durable facts with the memory tool. Project instruction files (AGENTS.md/CLAUDE.md/HARNESS.md) may exist in the working directory — read them before non-trivial work. `load_skill` lists and loads skills. Pasted images/files land under {mem_dir}/pastes.\n"));
+        return s;
+    }
     s.push_str("\n\n"); s.push_str(&crate::setup::summary_line());
     if let Some(m) = memory { s.push_str(&m.prompt_block(std::path::Path::new(workdir))); }
     let dir = std::path::Path::new(workdir);

@@ -257,8 +257,15 @@ pub struct AgentConfig {
     /// "full" (every built-in listed).
     #[serde(default = "d_catalog")]
     pub tool_catalog: String,
+    /// System prompt size: "full" (default — memory files, project docs and skills injected) or "lean"
+    /// (~2k chars: base rules + tool list, with memory/docs/skills fetched on demand by the model). Lean
+    /// makes a cold prefill seconds instead of a minute on a local model; the trade-off is the model must
+    /// think to consult BRAIN.md / AGENTS.md rather than having them in front of it.
+    #[serde(default = "d_prompt_mode")]
+    pub prompt_mode: String,
 }
 fn d_catalog() -> String { "core".into() }
+fn d_prompt_mode() -> String { "full".into() }
 fn d_hist_keep() -> usize { 4 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -505,6 +512,7 @@ impl Config {
             "agent.tool_history_keep" => self.agent.tool_history_keep = val.parse().context("bad number")?,
             "agent.tool_history_max_chars" => self.agent.tool_history_max_chars = val.parse().context("bad number")?,
             "agent.tool_catalog" => self.agent.tool_catalog = val.into(),
+            "agent.prompt_mode" => self.agent.prompt_mode = val.into(),
             "eval.tasks_dir" => self.eval.tasks_dir = val.into(),
             "eval.runs_dir" => self.eval.runs_dir = val.into(),
             "eval.task_timeout_secs" => self.eval.task_timeout_secs = val.parse().context("bad number")?,

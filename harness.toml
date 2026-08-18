@@ -51,6 +51,10 @@ max_task_secs = 0
 # Which tool catalogue the model sees: "core" (default — the ~13 everyday coding tools listed; the other
 # ~27 discoverable on demand via tool_search, saving ~5k tokens of prefill every first turn) | "full".
 # tool_catalog = "core"
+# System prompt size: "full" (default — memory, project docs, skills injected) | "lean" (~2k chars; the
+# model fetches memory/docs/skills on demand). lean + core tools ≈ 3.4k-token first turn vs 10.8k, and the
+# TUI pre-warms it into the server's prefix cache at start, so the first message answers in ~1s.
+# prompt_mode = "full"
 
 [eval]
 tasks_dir = "evals/tasks"

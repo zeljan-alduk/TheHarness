@@ -665,6 +665,8 @@ struct App {
     quit: bool,
     /// /restart: after quitting, exec the (possibly rebuilt) harness binary with `--resume <this session>`
     restart: bool,
+    /// "base_url|model" already prefix-prewarmed this session (avoid duplicate big prefills).
+    prewarmed: String,
     /// /improve: background self-improvement job + its cancel flag
     improve: Option<tokio::task::JoinHandle<()>>,
     improve_cancel: Arc<std::sync::atomic::AtomicBool>,
@@ -752,7 +754,7 @@ pub async fn run(cfg: Config, resume: Option<String>, update_note: Option<String
         scroll_up: 0, running: None, run_started: Instant::now(), queued: vec![], goal: None, goal_rounds: 0, hist_search: None, sugg_idx: None, edit_external: false, review: None, acp: None, statusline: None, expand_tools: false, show_thinking: false,
         session: Arc::new(tokio::sync::Mutex::new(Vec::new())), tx: tx.clone(),
         total_prompt: 0, total_completion: 0, last_prompt_tokens: 0, turn_tokens: 0, last_ctrl_c: None, status_msg: None,
-        quit: false, restart: false, improve: None, improve_cancel: Default::default(), restart_at: None, tick: 0, word: 0, models: vec![],
+        quit: false, restart: false, improve: None, prewarmed: String::new(), improve_cancel: Default::default(), restart_at: None, tick: 0, word: 0, models: vec![],
         metrics: Metrics::new(0), panel: None, attachments: vec![], tool_previews: Default::default(),
         picker, images: Default::default(), img_seq: 0,
         think_scroll: 0, toolset: None, perm_mode: harness::permissions::Mode::Auto, vim: false, vim_normal: false, keymap: Keymap::load(), sel_anchor: None, sel_cur: None, sel_dragging: false, visible_text: vec![], toast: None, tool_view: "summary".into(), tool_groups_open: Default::default(), settings_open: false, settings_cursor: 0, sessions_pick: None, pick: None, title_shown: None, banner_step: 0, live_policy: None, cc_rate: None, extra_roots: vec![], wt_cwd: harness::worktree::new_cell(), cc: None, cc_last_session: None, compact_progress: None, session_meta: harness::sessions::Meta::default(), todos: Default::default(), inbox: Default::default(), event_log: None, pending_ask: None, pending_q: None, subenv: None, attached: None, video: None, strip_rects: vec![], tr_rect: Rect::default(), panel_rect: Rect::default(), tr_start: 0, line_map: vec![], dl: None, dl_build: None, dl_cancel: None, no_model: false, claude_asked: false, first_run_pending: false, said_waiting: false, run_external: None,
@@ -1949,7 +1951,7 @@ impl App {
                                     let approver: Arc<dyn harness::permissions::Approver> = Arc::new(TuiApprover(tx.clone()));
                                     let env = Arc::new(harness::agent::SubAgentEnv::new(client.clone(), registry.clone(), policy.clone(), approver.clone(), sink.clone(), budget, true));
                                     let ctx = ToolCtx { memory: store.clone(), subagent: Some(env.clone()), redact_secrets: cfg.security.redact_secrets, injection_scan: cfg.security.injection_scan, hooks: cfg.hooks.clone(), lsp_servers: cfg.lsp.servers.clone(), todos, timeout: Duration::from_secs(cfg.agent.tool_timeout_secs), max_output: cfg.agent.max_tool_output_chars, net: cfg.net.clone(), ..ToolCtx::basic(workdir.clone()) };
-                                    let base_system = harness::agent::system_prompt_with_memory(&workdir.display().to_string(), &registry.names(), Some(&extra_prompt), store.as_ref());
+                                    let base_system = harness::agent::system_prompt_opt(&workdir.display().to_string(), &registry.names(), Some(&extra_prompt), store.as_ref(), cfg.agent.prompt_mode == "lean");
                                     let wenv = harness::workflow::WorkflowEnv { env, ctx, sink: sink.clone(), base_system };
                                     let out = harness::workflow::run(&wf, &wargs, &wenv).await.map_err(|e| format!("{e:#}"))?;
                                     sink.emit(&Event::Assistant { text: format!("Workflow `{}` finished.\n\n{out}", wf.name) });
@@ -2845,7 +2847,7 @@ impl App {
                 let ctx = ToolCtx { workdir: workdir.clone(), timeout: Duration::from_secs(cfg.agent.tool_timeout_secs), max_output: cfg.agent.max_tool_output_chars, net: cfg.net.clone(), memory: store.clone(), subagent: Some(env), redact_secrets: cfg.security.redact_secrets, injection_scan: cfg.security.injection_scan, hooks: cfg.hooks.clone(), todos: todos.clone(), lsp_servers: cfg.lsp.servers.clone(), format: cfg.format.clone(), extra_roots: extra_roots.clone(), approver: Some(approver.clone()), inbox: inbox.clone(), cancel: None, cwd: Some(cwd.clone()), session_id: Some(session_id.clone()) };
                 let agent = Agent { client: &client, registry, ctx: &ctx, max_turns: cfg.agent.max_turns, context_budget: budget, sink: sink.as_ref(), stream: true, policy: &policy, tool_history_keep: cfg.agent.tool_history_keep, tool_history_chars: cfg.agent.tool_history_max_chars, approver: approver.as_ref() };
                 let extra = format!("You are in an interactive session: the user can see everything and will reply; keep final answers concise.{extra_prompt}");
-                let system = harness::agent::system_prompt_with_memory(&workdir.display().to_string(), &registry.names(), Some(&extra), store.as_ref());
+                let system = harness::agent::system_prompt_opt(&workdir.display().to_string(), &registry.names(), Some(&extra), store.as_ref(), cfg.agent.prompt_mode == "lean");
                 // provider = "acp:<cmd>": another agent runs the turn; we stream its updates
                 if let Some(cmd) = client.acp_command() {
                     let mut msgs = session.lock().await;
@@ -3096,7 +3098,13 @@ impl App {
             Msg::Ev(e) => self.on_event(e),
             Msg::Sys(s) => self.metrics.on_sys(s),
             Msg::CtxLen(n) => { self.metrics.ctx_len = n; self.blocks.push(Block::System(format!("auto-compaction at {} tokens ({}% of context); /compact to force", fmt_k(self.cfg.llm.effective_budget(Some(n))), (self.cfg.llm.compact_at_fraction * 100.0) as u64))); }
-            Msg::Toolset(ts) => { let n = ts.registry.len(); self.toolset = Some(ts); self.set_status(format!("tools ready: {n}")); }
+            Msg::Toolset(ts) => {
+                let n = ts.registry.len(); self.toolset = Some(ts); self.set_status(format!("tools ready: {n}"));
+                // The system prompt depends on the toolset, so this is the earliest moment a prewarm can
+                // match the real turn byte-for-byte. Covers ANY ready endpoint (LM Studio, llama-server, …),
+                // not just our own MLX server.
+                if !self.no_model && self.cfg.llm.provider.is_none() { let (b, m) = (self.cfg.llm.base_url.clone(), self.cfg.llm.model.clone()); self.prewarm_prefix(&b, &m); }
+            }
             Msg::Notice(t) => self.blocks.push(Block::System(t)),
             Msg::Catalog(Ok(c)) => self.show_catalog(&c),
             Msg::Catalog(Err(e)) => self.blocks.push(Block::Error(format!("plugin catalog: {e}"))),
@@ -3314,6 +3322,7 @@ impl App {
                     self.blocks.push(Block::System(format!("{} is loaded on {} — using it", model_label(model), self.cfg.llm.base_url)));
                     self.cfg.llm.model = model.clone(); self.model = model.clone();
                 }
+                if self.toolset.is_some() { let (b, m) = (self.cfg.llm.base_url.clone(), self.cfg.llm.model.clone()); self.prewarm_prefix(&b, &m); }
                 // Our own port, our own weights, but the text-only server (left over from an older harness or
                 // an earlier session)? Then images would fail — swap it for the vision server now, while idle.
                 let ours = self.cfg.llm.base_url.contains(&format!(":{}/", self.cfg.local_model.port)) || self.cfg.llm.base_url.ends_with(&format!(":{}", self.cfg.local_model.port));
@@ -3555,8 +3564,12 @@ impl App {
     /// first turn is a fast cache hit instead of a ~1–2 minute cold prefill of the 7–13k-token prompt.
     /// (Warming the model with a bare "hi" — as the server does — doesn't touch this big prefix, which is
     /// why the first response felt as slow as a reload.) Best-effort and off the UI thread.
-    fn prewarm_prefix(&self, base_url: &str, model: &str) {
+    fn prewarm_prefix(&mut self, base_url: &str, model: &str) {
         if self.cfg.llm.provider.as_deref() == Some("claude-code") { return; }
+        // once per (endpoint, model): prewarming again would waste a prefill the server already cached
+        let key = format!("{base_url}|{model}");
+        if self.prewarmed == key { return; }
+        self.prewarmed = key;
         let (base_url, model) = (base_url.to_string(), model.to_string());
         let workdir = self.workdir.display().to_string();
         let store = if self.cfg.memory.enabled { harness::memory::MemoryStore::open(&self.cfg.memory).ok() } else { None };
@@ -3565,10 +3578,11 @@ impl App {
             None => (vec![], String::new()),
         };
         let prov = match self.cfg.llm.provider.as_deref() { Some("anthropic") => harness::llm::Provider::Anthropic, Some("claude-code") => harness::llm::Provider::ClaudeCode, _ => harness::llm::Provider::OpenAi };
+        let lean = self.cfg.agent.prompt_mode == "lean";
         let tx = self.tx.clone();
         tokio::spawn(async move {
             let name_refs: Vec<&str> = names.iter().map(String::as_str).collect();
-            let system = harness::agent::full_system_prompt(&workdir, &name_refs, Some(&extra), store.as_ref(), &model, prov);
+            let system = harness::agent::full_system_prompt_opt(&workdir, &name_refs, Some(&extra), store.as_ref(), &model, prov, lean);
             let http = match reqwest::Client::builder().timeout(Duration::from_secs(300)).build() { Ok(c) => c, Err(_) => return };
             let body = serde_json::json!({"model": model, "messages": [{"role":"system","content": system}, {"role":"user","content":"Ready."}], "max_tokens": 1, "temperature": 0});
             let t = Instant::now();

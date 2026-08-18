@@ -544,7 +544,7 @@ async fn main() -> Result<()> {
                 let env = std::sync::Arc::new(agent::SubAgentEnv::new(client.clone(), ts.registry.clone(), policy.clone(), approver, sink.clone(), budget, true));
                 let store = if cfg.memory.enabled { harness::memory::MemoryStore::open(&cfg.memory).ok() } else { None };
                 let ctx = tools::ToolCtx { memory: store.clone(), subagent: Some(env.clone()), redact_secrets: cfg.security.redact_secrets, injection_scan: cfg.security.injection_scan, hooks: cfg.hooks.clone(), lsp_servers: cfg.lsp.servers.clone(), timeout: Duration::from_secs(cfg.agent.tool_timeout_secs), max_output: cfg.agent.max_tool_output_chars, net: cfg.net.clone(), ..tools::ToolCtx::basic(workdir.clone()) };
-                let base_system = agent::system_prompt_with_memory(&workdir.display().to_string(), &ts.registry.names(), Some(&ts.prompt_extra), store.as_ref());
+                let base_system = agent::system_prompt_opt(&workdir.display().to_string(), &ts.registry.names(), Some(&ts.prompt_extra), store.as_ref(), cfg.agent.prompt_mode == "lean");
                 let wenv = harness::workflow::WorkflowEnv { env, ctx, sink, base_system };
                 let out = harness::workflow::run(&wf, &args.join(" "), &wenv).await?;
                 println!("\n{out}");
@@ -791,7 +791,7 @@ async fn run_agent(cfg: &config::Config, client: &llm::Client, workdir: &std::pa
     for n in &toolset.notes { eprintln!("· {n}"); }
     let registry = &toolset.registry;
     let extra_all = format!("{}{}", extra.unwrap_or(""), toolset.prompt_extra);
-    let system = agent::system_prompt_with_memory(&workdir.display().to_string(), &registry.names(), Some(&extra_all), store.as_ref());
+    let system = agent::system_prompt_opt(&workdir.display().to_string(), &registry.names(), Some(&extra_all), store.as_ref(), cfg.agent.prompt_mode == "lean");
     let detected = llm::detect_context_length(&cfg.llm.base_url, &cfg.llm.model).await;
     let budget = cfg.llm.effective_budget(detected.map(|d| d.0));
     if let Some((n, src)) = detected { eprintln!("· context {} tokens ({src}) · auto-compact at {}", n, budget); } else { eprintln!("· context length unknown · auto-compact at {budget}"); }
